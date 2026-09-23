@@ -1,0 +1,8 @@
+.DS_Store
+*.xcuserstate
+xcuserdata/
+build/
+releases/
+default.profraw
+.claude/
+coding-plans/

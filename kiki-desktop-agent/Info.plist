@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>LSUIElement</key>
+	<true/>
+	<key>VoiceTranscriptionProvider</key>
+	<string>apple</string>
+	<key>AppleTTSVoiceIdentifier</key>
+	<string>com.apple.voice.premium.zh-CN.Yue</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Kiki 需要麦克风权限才能听到你说话。</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Kiki 需要屏幕录制权限才能看到你的屏幕并帮你操作。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Kiki 需要语音识别权限才能把你说的话转成文字。</string>
+</dict>
+</plist>
