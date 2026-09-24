@@ -81,11 +81,14 @@ scrollup、scrolldown、scrollleft 和 scrollright 也是同一族，只是动�
 用来把看不见的那部分内容挪到眼前：
 
     kiki scrolldown -t 消息列表          把消息列表往下滚一屏
+    kiki scrolldown -t 消息列表 -b 0.5   往下滚半屏
     kiki scrolldown -t 消息列表 -b 3     往下滚三屏
     kiki scrollright -x 720 -y 450       在坐标 (720, 450) 往右滚一屏
 
--b 是滚多远，单位是「几屏」，1 到 20，默认 1。一屏按那块屏幕的八成算，滚完还看得见刚才
-那一段，不会一下跳到完全陌生的地方；左右按屏幕的宽算。
+-b 是滚多远，单位是「几屏」，0.5 到 20，默认 1，可以带 .5。一屏按那块屏幕的八成算，滚完还
+看得见刚才那一段，不会一下跳到完全陌生的地方；左右按屏幕的宽算。-b 0.5 是半屏：一屏滚下去，
+刚才在看的那几行就出了画面，而要找的东西常常正好落在滚过去的那一半里，所以一边滚一边找的时候
+用半屏，真要翻过去才用整屏。
 
 drag 是这一族里唯一一个动作发生在两点之间的：它在起点按下鼠标，把东西一路搬到终点，到了
 再松开。搬文件、搬图标、拉滑块、把窗口挪开都是它。
@@ -114,7 +117,8 @@ stdout 是回复，连这句话也走 stderr。
 退出码是 2，脚本照旧分得清。
 
 滚动、三击和拖拽还各多一条：正在运行的那个 Kiki 得认识这个手势。它不认识时会直接说明并以 2
-退出，而不是把这次动作做成别的。刚重新构建完但没重启 app 时会碰上。
+退出，而不是把这次动作做成别的。刚重新构建完但没重启 app 时会碰上。-b 带小数（比如 0.5）也是
+一样：只认整屏的旧 Kiki 读不懂这个数，与其让它一声不吭地等下去，不如这里直接说明并以 2 退出。
 """
 
 /// How long to wait for the app to answer the first time, which on a cold launch includes
@@ -429,10 +433,10 @@ private func clickRequestFromArguments(
         failWithUsage("要说点哪儿：给坐标 -x -y，或者给要点的文字 -t。")
     }
 
-    var screenfuls: Int?
+    var screenfuls: Double?
     if let rawScreenfuls = valueByFlag["-b"] {
-        guard let parsedScreenfuls = Int(rawScreenfuls), (1...20).contains(parsedScreenfuls) else {
-            failWithUsage("-b 要是 1 到 20 的整数：滚几屏。")
+        guard let parsedScreenfuls = Double(rawScreenfuls), (0.5...20).contains(parsedScreenfuls) else {
+            failWithUsage("-b 要是 0.5 到 20 之间的数：滚几屏，半屏写 0.5。")
         }
         screenfuls = parsedScreenfuls
     }
@@ -537,6 +541,23 @@ private func gestureTheRunningKikiDoesNotKnow(
     }
 }
 
+/// The distance the running app would be unable to read, or nil when it can read this one.
+///
+/// A separate question from `gestureTheRunningKikiDoesNotKnow`, because the fault is not the gesture
+/// and the sentence is not the same: an app that scrolls at all reads the distance as a whole number,
+/// and a fractional one makes the *whole request* undecodable — the app says nothing whatever, and
+/// this end sits out its timeout, which is indistinguishable from Kiki having gone away. Only a
+/// distance that is not whole is asked about, since such an app still reads `-b 3` correctly.
+private func screenfulsTheRunningKikiCannotRead(
+    _ clickRequest: KikiClickRequest,
+    in readinessEvent: KikiCommandEvent
+) -> Double? {
+    guard let screenfuls = clickRequest.screenfuls, screenfuls != screenfuls.rounded() else {
+        return nil
+    }
+    return readinessEvent.understandsFractionalScreenfuls == true ? nil : screenfuls
+}
+
 /// Asks the app to act where this terminal says, with the gesture the subcommand that got here
 /// named, and reports what came of it. Everything else about the nine is the same.
 private func runActionSubcommand(
@@ -571,6 +592,17 @@ private func runActionSubcommand(
     ) {
         fail(
             "正在运行的这个 Kiki 是旧版本，还不认识\(unknownGesture)。把菜单栏里的 Kiki 退出再重新启动一次就能用。",
+            code: .cannotRunCommand
+        )
+    }
+
+    if let screenfulsTheRunningKikiCannotRead = screenfulsTheRunningKikiCannotRead(
+        clickRequest,
+        in: readinessEvent
+    ) {
+        fail(
+            "正在运行的这个 Kiki 是旧版本，只认整屏的滚动，\(screenfulsTheRunningKikiCannotRead) 屏它读不了。"
+                + "把菜单栏里的 Kiki 退出再重新启动一次就能用。",
             code: .cannotRunCommand
         )
     }

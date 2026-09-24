@@ -118,6 +118,15 @@ nonisolated struct KikiCommandReadiness: Codable {
     /// knowing it: two destination fields a pre-drag app decodes and ignores would turn a drag into
     /// a press at the starting point.
     let understandsDragging: Bool?
+
+    /// And again for a scroll shorter than a whole screenful.
+    ///
+    /// Not answered by `understandsScrolling`, which is about the gesture and not about how far it
+    /// goes: an app that scrolls reads the distance as a whole number, so a fractional one fails to
+    /// decode the *whole* request — the terminal is answered with silence and a wait that runs out,
+    /// rather than with a scroll of the wrong length. Only a distance that is not whole is asked
+    /// about, because such an app still reads `-b 3` correctly.
+    let understandsFractionalScreenfuls: Bool?
 }
 
 /// Where a terminal wants a mouse action performed, in one of the two ways it can say: a point, or
@@ -157,10 +166,15 @@ nonisolated struct KikiClickRequest: Codable {
     /// How far a scroll should go, counted in screenfuls of the display it lands on. Absent is read
     /// as 1, and only the scrolling gestures read it.
     ///
+    /// Fractional, in steps of half a screenful: a whole screen moves everything the user was
+    /// following off the display, so half is what a scroll made in order to read is asked for. An app
+    /// built before this was fractional refuses the request by failing to decode it, which is what
+    /// `KikiCommandReadiness.understandsFractionalScreenfuls` exists to catch first.
+    ///
     /// Screenfuls rather than points because the app knows how tall the display is and the terminal
     /// does not have to: a distance in points would be derived from a screen size the caller guessed
     /// at, and the app would then scale that guess again.
-    var screenfuls: Int?
+    var screenfuls: Double?
 
     /// Where a drag lets go, in the same space `globalScreenX`/`globalScreenY` are given in. Both
     /// or neither, and read only by `Gesture.drag`.
@@ -216,6 +230,7 @@ nonisolated struct KikiCommandEvent: Codable {
     var understandsScrolling: Bool?
     var understandsTripleClick: Bool?
     var understandsDragging: Bool?
+    var understandsFractionalScreenfuls: Bool?
 
     /// Whether a `failed` was the app declining to act rather than trying and not managing it.
     ///
@@ -231,7 +246,8 @@ nonisolated struct KikiCommandEvent: Codable {
             problems: readiness.problems,
             understandsScrolling: readiness.understandsScrolling,
             understandsTripleClick: readiness.understandsTripleClick,
-            understandsDragging: readiness.understandsDragging
+            understandsDragging: readiness.understandsDragging,
+            understandsFractionalScreenfuls: readiness.understandsFractionalScreenfuls
         )
     }
 

@@ -58,6 +58,44 @@ enum RecordedActionsPhase: Equatable {
     case replayingWhatTheUserDid
 }
 
+/// Where the task in progress stands, as the settings panel reads it out.
+///
+/// One value rather than four numbers written separately, for the reason the pointing flight is one
+/// value: the panel re-draws on every chunk of the reply, so four properties written one at a time
+/// would let it draw a round count from one moment beside a context figure from another — a task
+/// that never existed.
+struct TaskProgress: Equatable {
+    /// How many rounds the task has taken, a round being one thing the user asked for and everything
+    /// Kiki did about it, however many steps that ran to.
+    let roundCount: Int
+    /// How many steps the task has taken. A round that never acted on the screen is one step.
+    let stepCount: Int
+    /// Whether a round is being answered right now.
+    let isRunning: Bool
+    /// Which step of the round in progress this is, counting from one. Zero when nothing is running.
+    let stepInTheRoundInProgress: Int
+    /// What the context costs as it stands, by the same estimate the compression trigger reads.
+    let estimatedTokenCountOfTheContext: Int
+    /// The cost at which the oldest steps are compressed into a summary and the context is reclaimed.
+    let tokenCountThatStartsCompression: Int
+
+    /// The task on the record at all — asked about, whether or not Kiki is still working on it.
+    var hasATask: Bool {
+        roundCount > 0 || isRunning
+    }
+
+    /// How much of the room before the compression the context has used.
+    ///
+    /// Measured against the trigger rather than against the model's whole window, because "how far
+    /// from being reclaimed" is the question the readout answers and the trigger is where that
+    /// distance reaches zero. Clamped, because the estimate can read past the trigger during the
+    /// step that is about to cause the compression.
+    var fractionOfTheRoomBeforeCompressionUsed: Double {
+        guard tokenCountThatStartsCompression > 0 else { return 0 }
+        return min(1, Double(estimatedTokenCountOfTheContext) / Double(tokenCountThatStartsCompression))
+    }
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -96,15 +134,26 @@ final class CompanionManager: ObservableObject {
     /// `isNotTakingInputBecauseOfTheStatusItemIcon` to close every way into the app.
     @Published private(set) var statusItemIconPhase: StatusItemIconPhase = .notInTheIcon
 
-    /// The reply being spoken, cut into the pieces the voice is handed one at a time.
+    /// The turn being spoken, cut into the pieces the voice is handed one at a time.
     ///
     /// A segment runs to the end of the first sentence that names a tour stop, or of a sentence the
     /// model terminated where a sentence names nothing. That boundary is what lets the words wait
     /// for the cursor, by never handing over the next segment.
-    private var speechSegments: [CompanionSpeechSegment] = []
-    /// How many of `speechSegments` are beyond revision. The last one is the segment the
-    /// model may still be writing, held back because the voice cannot take words back.
+    ///
+    /// This is the **turn's** list and not a step's: a step appends its own segments and leaves the
+    /// ones already behind the voice alone, so the narration runs on from one step into the next
+    /// without a seam. A step's indices are offset by `speechSegmentCountBeforeTheStepNowStreaming`
+    /// into this one, which is also the numbering `AppleTTSClient` files its prepared audio under.
+    private var speechSegmentsOfTheTurnBeingSpoken: [CompanionSpeechSegment] = []
+    /// How many of `speechSegmentsOfTheTurnBeingSpoken` are beyond revision. The last one is the
+    /// segment the model may still be writing, held back because the voice cannot take words back.
     private var finalizedSpeechSegmentCount = 0
+    /// How many segments the steps before the one now streaming contributed.
+    ///
+    /// A step cuts its own reply from zero, and this is what turns one of its indices into a
+    /// position in the turn's list — the same conversion the prepared audio is filed under, so a
+    /// step's first segment cannot collide with a step's before it.
+    private var speechSegmentCountBeforeTheStepNowStreaming = 0
     /// Whether the reply has stopped arriving. The voice reaching the end of the finalised segments
     /// is not the end of the reply — the next one may not be written yet — so without this the rest
     /// would never be heard.
@@ -112,7 +161,10 @@ final class CompanionManager: ObservableObject {
     /// Cuts the reply into segments as it arrives and resolves each tag the moment it
     /// closes. Nil outside a streamed reply — the onboarding demo has none.
     private var streamingReplySegmenter: StreamingReplySegmenter?
-    /// Index into `speechSegments` of the segment being spoken.
+    /// Index into `speechSegmentsOfTheTurnBeingSpoken` of the segment being spoken.
+    ///
+    /// The turn's numbering, so it is not reset at a step boundary: the step before this one may
+    /// still be being spoken, and this is what walks from its last segment into this one's first.
     private var currentSpeechSegmentIndex = 0
     /// Whether the voice has reported the segment being spoken as spoken through.
     private var hasCurrentSpeechSegmentFinishedSpeaking = false
@@ -158,7 +210,12 @@ final class CompanionManager: ObservableObject {
         let startOffsetInSpokenText: Int
         /// The tour stops whose elements this segment talks about, as a range into
         /// `resolvedPointingTourStops`. Empty for a segment that names nothing.
-        let stopIndexRange: Range<Int>
+        ///
+        /// Written as well as read: a segment outlives the step that cut it, and
+        /// `resolvedPointingTourStops` is replaced by each step's own stops — so a segment cut for
+        /// a step that has ended has its range emptied, because the positions in it now name
+        /// elements of a reply this segment is not talking about.
+        var stopIndexRange: Range<Int>
     }
 
     // MARK: - Pointing Tour State
@@ -242,8 +299,19 @@ final class CompanionManager: ObservableObject {
 
     /// A tour stop with its screenshot coordinate already converted into a screen location.
     private struct ResolvedPointingTourStop {
-        /// The coordinate the model read off the screenshot, kept for the `🎯` log line.
+        /// Where the cursor will be sent, in the screenshot's own pixel space: the centre of the text box
+        /// the label matched, or the model's own estimate when the label matched nothing.
         let screenshotCoordinate: CGPoint
+        /// The coordinate the model itself wrote, kept for the `🎯` log line.
+        ///
+        /// It is the only way to see a match that landed on the wrong occurrence: the two numbers are
+        /// thrown apart by a label that occurs more than once on the screen.
+        let modelScreenshotCoordinate: CGPoint
+        /// Whether the label was found on screen at all.
+        ///
+        /// A label that is not verbatim matches nothing and the coordinate silently falls back to the
+        /// model's estimate, so a wrong click reads identically to a right one unless this is printed.
+        let didTheLabelMatchTextOnScreen: Bool
         /// Where the element is in global AppKit screen coordinates.
         let screenLocation: CGPoint
         /// The display frame (global AppKit coords) of the screen the element is on.
@@ -349,21 +417,110 @@ final class CompanionManager: ObservableObject {
                     problems: ["Kiki 正在关闭。"],
                     understandsScrolling: true,
                     understandsTripleClick: true,
-                    understandsDragging: true
+                    understandsDragging: true,
+                    understandsFractionalScreenfuls: true
                 )
         }
     )
 
     /// Conversation history, so the model remembers prior exchanges within a session.
-    private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
+    ///
+    /// Carries the turn each entry belongs to, because a turn is entered on the record once per
+    /// step rather than once: trimming on the entry count alone would let one long search push out
+    /// the question it is searching for, and the earlier conversation along with it.
+    private var conversationHistory: [(turnIdentifier: UUID,
+                                       userTranscript: String,
+                                       assistantResponse: String)] = []
+
+    /// What the steps the context no longer carries whole were compressed into, and how many of
+    /// `conversationHistory`'s entries it stands in for.
+    ///
+    /// The two are one fact and are written together: a summary whose count did not move with it
+    /// would either drop steps it never saw or send steps it already covers. The count runs from
+    /// the front of the history, so the context is the summary followed by the history from that
+    /// index on — a window over the history and the compressed image of what falls outside it,
+    /// rather than a second copy of the conversation that can drift from the first.
+    private var summaryOfTheStepsCompressedOutOfTheContext: String?
+    private var numberOfHistoryEntriesTheSummaryStandsInFor = 0
 
     /// What the user said in the turn being answered now. Held rather than passed along
     /// because the history is written from three call stacks that are not the same one.
     private var transcriptOfTheTurnBeingAnswered = ""
 
+    /// Which turn the entries being appended to the history belong to, so that trimming can drop
+    /// whole turns rather than the tail of one. Stamped where a turn begins, never per step.
+    private var turnIdentifierOfTheTurnBeingAnswered = UUID()
+
     /// Whether the reply being spoken has already gone into `conversationHistory`. Every path
     /// that writes it can run more than once for the same turn.
     private var hasWrittenTheCurrentTurnIntoHistory = false
+
+    /// What the settings panel shows about the task in progress: how many rounds and steps it has
+    /// taken, whether Kiki is still working on it, and how close the context is to being compressed.
+    ///
+    /// Refreshed at the points where one of those four answers changes rather than computed where it
+    /// is read. The estimate walks every character of the history, and the panel re-draws on every
+    /// chunk of the reply — so a read-through computation would put that walk on the main actor
+    /// hundreds of times per reply, on the same thread the overlay is animating on.
+    @Published private(set) var taskProgress = TaskProgress(
+        roundCount: 0,
+        stepCount: 0,
+        isRunning: false,
+        stepInTheRoundInProgress: 0,
+        estimatedTokenCountOfTheContext: 0,
+        tokenCountThatStartsCompression: CompanionManager.tokenCountThatStartsCompression
+    )
+
+    // MARK: - The Turn As A Run Of Steps
+
+    /// One step of the turn being answered: the reply the model wrote, and what the actions it asked
+    /// for then did.
+    ///
+    /// The actions are counted rather than flagged, because "this step's batch is over" is a join of
+    /// two ends that finish at different times — the tour running out of stops, and the last press
+    /// reporting back — and the arrival that starts an action is not the call that finishes it.
+    private struct StepOfTheTurnBeingAnswered {
+        var numberOfActionsAskedFor = 0
+        var numberOfActionsThatHaveReportedBack = 0
+        /// What each action did, in the order the model asked for them, as the sentences the next
+        /// step is told. Empty while the step is still running.
+        var sentencesSayingWhatTheActionDid: [String] = []
+        /// Whether any of them reached the screen. A step whose actions were all refused has left
+        /// the screen exactly as the screenshot the model is already looking at.
+        var didAnyActionReachTheScreen = false
+        /// Whether this step has been closed out, so the several things that can finish a step do
+        /// not report it more than once.
+        var hasBeenClosedOut = false
+    }
+
+    private var stepInProgress = StepOfTheTurnBeingAnswered()
+
+    /// How many steps of the turn being answered have been asked for, counting the one in progress.
+    /// One for a turn that never acts, which is most of them.
+    private var numberOfStepsStartedInTheTurnBeingAnswered = 0
+
+    /// How many steps one turn may take before Kiki stops taking them.
+    ///
+    /// A model that answers every look with another [LOOK] would otherwise hold the turn open
+    /// indefinitely, one screenshot and one request at a time. Twenty is what a search costs: a
+    /// folder takes two steps to look inside, one to open it and one to come back out, so a reply
+    /// that means to go through the folders on screen needs room for about ten of them. The prompt
+    /// reads the number off this constant rather than restating it.
+    private static let maximumStepsInTheTurnBeingAnswered = 20
+
+    /// Whether the model's latest reply asked to see the screen again after acting — the `[LOOK]`
+    /// marker, which is the whole of what makes this a loop rather than one reply.
+    private var hasTheModelAskedToLookAgain = false
+
+    /// What the voice has already read out for the steps before the one in progress.
+    ///
+    /// Kept because the terminal is handed absolute snapshots rather than deltas: without it, the
+    /// second step's snapshot would take the place of the first step's instead of following it, and
+    /// a terminal watching a two-step turn would see the reply shrink.
+    private var spokenTextOfTheStepsBeforeTheOneInProgress = ""
+
+    /// Whether the terminal watching this turn has already been told it is over.
+    private var hasClosedOutTheTurnBeingAnswered = false
 
     /// Which turn the reply currently being streamed belongs to.
     ///
@@ -439,14 +596,51 @@ final class CompanionManager: ObservableObject {
     /// nothing does not pay for the parse that would work out the same answer.
     private var rawReplyUTF16CountLastSentToTerminal = -1
 
-    /// When the user last started a turn, which decides whether the next one continues this
-    /// conversation or starts a new one.
-    private var lastUserTurnStartDate: Date?
+    /// When the conversation last moved — the user speaking or Kiki working — which decides
+    /// whether the next turn continues it or starts a new one.
+    ///
+    /// Advanced by every step as well as by every turn, because the gap that starts a new
+    /// conversation is a gap in the conversation rather than a gap in what the user typed. A
+    /// search that runs for a quarter of an hour is the conversation still going: measured from
+    /// the question alone, the follow-up asked the moment it ended would read as the user having
+    /// been away, and would drop the history the search had just been building — the question it
+    /// was answering along with it.
+    private var dateOfTheLastActivityInTheConversation: Date?
 
-    /// How many exchanges are carried into the next request.
-    private static let maximumExchangeCountCarriedInHistory = 15
+    /// How many exchanges the history holds before its oldest are dropped. A soft bound: the turn
+    /// in progress is never trimmed, so a turn of more steps than this keeps all of them.
+    ///
+    /// For a session that never ends rather than as a working limit — what a request actually
+    /// carries is bounded separately, by the summary the context compresses its oldest steps into.
+    private static let maximumExchangeCountCarriedInHistory = 5000
 
-    /// How long the user can be away before their next turn counts as a new conversation.
+    /// The context window of the model the settings panel offers, in tokens.
+    private static let contextTokenCountOfTheModel = 1_000_000
+
+    /// How full the context may get before the steps behind it are compressed into a summary.
+    ///
+    /// Well under half, because the trigger is checked before the screenshot is taken and the
+    /// reply is written: what the compression leaves has to hold a screenshot of every display,
+    /// the prompt, and everything the model is about to say back.
+    private static let fractionOfTheContextThatStartsCompression = 0.45
+
+    /// The cost at which that happens, in tokens. The one place those two numbers are combined, so
+    /// the trigger the compression fires on and the trigger the panel counts down to are the same
+    /// figure rather than two roundings of it.
+    private static let tokenCountThatStartsCompression = Int(
+        Double(contextTokenCountOfTheModel) * fractionOfTheContextThatStartsCompression)
+
+    /// How many of the newest steps the context always carries whole, whatever the compression
+    /// does — the ones the question just asked actually refers to.
+    private static let numberOfNewestStepsAlwaysCarriedWhole = 5
+
+    /// What one screenshot is taken to cost the context.
+    ///
+    /// Vision input is counted by the image rather than by its bytes, and there is no tokenizer in
+    /// the process to ask, so the trigger is worked out against a fixed estimate per display.
+    private static let estimatedTokenCountOfOneScreenshot = 5_000
+
+    /// How long the conversation can be idle before the next turn counts as a new one.
     private static let maximumGapBetweenTurnsInTheSameConversationSeconds: TimeInterval = 10 * 60
 
     init() {
@@ -653,7 +847,8 @@ final class CompanionManager: ObservableObject {
             problems: problems,
             understandsScrolling: true,
             understandsTripleClick: true,
-            understandsDragging: true
+            understandsDragging: true,
+            understandsFractionalScreenfuls: true
         )
     }
 
@@ -828,13 +1023,13 @@ final class CompanionManager: ObservableObject {
         case KikiCommandProtocol.Gesture.tripleClick: return .press(.tripleClick)
         case KikiCommandProtocol.Gesture.rightClick: return .press(.rightClick)
         case KikiCommandProtocol.Gesture.scrollUp:
-            return .scroll(.up, distance: .screenfuls(clickRequest.screenfuls ?? 1))
+            return .scroll(.up, distance: .screenfuls(CGFloat(clickRequest.screenfuls ?? 1)))
         case KikiCommandProtocol.Gesture.scrollDown:
-            return .scroll(.down, distance: .screenfuls(clickRequest.screenfuls ?? 1))
+            return .scroll(.down, distance: .screenfuls(CGFloat(clickRequest.screenfuls ?? 1)))
         case KikiCommandProtocol.Gesture.scrollLeft:
-            return .scroll(.left, distance: .screenfuls(clickRequest.screenfuls ?? 1))
+            return .scroll(.left, distance: .screenfuls(CGFloat(clickRequest.screenfuls ?? 1)))
         case KikiCommandProtocol.Gesture.scrollRight:
-            return .scroll(.right, distance: .screenfuls(clickRequest.screenfuls ?? 1))
+            return .scroll(.right, distance: .screenfuls(CGFloat(clickRequest.screenfuls ?? 1)))
         case KikiCommandProtocol.Gesture.drag: return .drag
         default: return nil
         }
@@ -1393,7 +1588,8 @@ final class CompanionManager: ObservableObject {
         case .right: directionWord = "右"
         }
         switch distance {
-        case .screenfuls(let screenfuls): return "往\(directionWord)滚 \(screenfuls) 屏"
+        case .screenfuls(let screenfuls):
+            return "往\(directionWord)滚 \(ElementScrollDistance.screenfulsAsText(screenfuls)) 屏"
         case .points(let points): return "往\(directionWord)滚 \(Int(points.rounded())) 点"
         }
     }
@@ -2319,19 +2515,31 @@ final class CompanionManager: ObservableObject {
 
     write [CLICK:x,y:label] instead when the user wants that element actually operated — opened, pressed, switched on — and you are doing it for them. this tag is not just wording: once the cursor lands on the element, kiki clicks it, once. so write it only where you mean the thing to happen now, and never for anything the user cannot take back — deleting, clearing, uninstalling, formatting, resetting, quitting, shutting down, paying, sending — those stay [POINT:x,y:label] and the user makes that click themselves. keep [POINT:x,y:label] when you are only locating something for them, which is the usual case: someone who asked where a setting lives has not asked to click it. if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
-    write [DOUBLECLICK:x,y:label] when the element takes two clicks to do what was asked — opening a file, folder or icon on the desktop or in finder, selecting a word in a piece of text, dropping into a cell so it can be edited. a single click on any of those only selects it, so [CLICK:x,y:label] leaves the user looking at a file that never opened. everything above about [CLICK:x,y:label] holds here as well: kiki is doing it for the user, so write it only where you mean it to happen now, and never on anything the user cannot take back. but do not reach for it just because the element matters or because clicking it feels decisive — a button, a menu item, a toolbar control, a switch and a link all take exactly one click, and two on those is a different action than the one the user asked for, or nothing at all. when in doubt, [CLICK:x,y:label].
+    write [DOUBLECLICK:x,y:label] when the element takes two clicks to do what was asked — opening a file, folder or icon on the desktop or in finder, selecting a word in a piece of text, dropping into a cell so it can be edited. a single click on any of those only selects it, so [CLICK:x,y:label] leaves the user looking at a file that never opened. everything above about [CLICK:x,y:label] holds here as well: kiki is doing it for the user, so write it only where you mean it to happen now, and never on anything the user cannot take back. but do not reach for it just because the element matters or because clicking it feels decisive — a button, a menu item, a toolbar control, a switch, a link and a favourite tile on a browser's start page all take exactly one click, and two on those is a different action than the one the user asked for, or nothing at all. when in doubt, [CLICK:x,y:label].
 
     write [TRIPLECLICK:x,y:label] when what the user wants is a whole paragraph selected — three clicks is the one thing macOS reserves for that, and a double click only takes the word under the pointer. everything above about [CLICK:x,y:label] holds here as well: kiki is doing it, so write it only where you mean it to happen now, and never on anything the user cannot take back. but of all the click tags this is the narrowest and the one that goes wrong most quietly: a button, a menu item, a toolbar control, a switch and a link take exactly one click, and three on any of them is that one action happening three times over, which is not what the user asked for. on prose and nothing else. when in doubt, [CLICK:x,y:label] or [DOUBLECLICK:x,y:label].
 
     write [RIGHTCLICK:x,y:label] when what the user needs is the element's context menu — the menu that opens on a right click. kiki presses the right button on the element once the cursor lands, so that menu really opens on their screen, with the pointer left sitting on it ready for them to pick from. this is the shape for "how do i compress this file", "how do i rename this folder", "what else can i do with this photo" — the item that does it is in that menu, and no left click gets them there. everything above about [CLICK:x,y:label] holds here as well: kiki is doing it, so write it only where you mean it to happen now, and never on anything the user cannot take back. but do not reach for it over an ordinary button, link, menu item or toolbar control — a right click on those opens a menu nobody asked for instead of the one press they wanted. when in doubt, [POINT:x,y:label].
 
-    one thing to know about it: the menu your own right click opens is not in your screenshot, because you are looking at the screen as it was before your reply started. so never tag anything inside a menu you just opened — say in words what the menu will offer and let the user choose.
+    one thing to know about it: the menu your own right click opens is not in your screenshot, because you are looking at the screen as it was before your reply started. so never tag anything inside a menu you just opened — say in words what the menu will offer and let the user choose. what you can do instead is write [LOOK] at the end of the reply, which brings you back for a second look at the menu that is now really open.
 
-    write [SCROLLUP:x,y:label], [SCROLLDOWN:x,y:label], [SCROLLLEFT:x,y:label] or [SCROLLRIGHT:x,y:label] when what the user needs is past the edge of what is on screen — the rest of a long list, a page that continues below, a column cut off to the left. kiki scrolls at the element once the cursor lands, so point it at the thing that should move: the list, the text pane, the document. it rolls one screenful by default; for more, append :xN after the label and before any :screenN — [SCROLLDOWN:640,400:消息列表:x3] rolls that list down three screenfuls, and N runs from 1 to 20. always with the x: everything after the second colon is read as the element's name, so a bare 「:3」 is swallowed into the label and the scroll never happens.
+    write [SCROLLUP:x,y:label], [SCROLLDOWN:x,y:label], [SCROLLLEFT:x,y:label] or [SCROLLRIGHT:x,y:label] when what the user needs is past the edge of what is on screen — the rest of a long list, a page that continues below, a column cut off to the left. kiki scrolls at the element once the cursor lands, so point it at the thing that should move: the list, the text pane, the document. it rolls one screenful by default; append :xN after the label and before any :screenN to say how far — [SCROLLDOWN:640,400:消息列表:x3] rolls that list down three screenfuls, [SCROLLDOWN:640,400:消息列表:x0.5] rolls it half a screen, and N runs from 0.5 to 20 in steps of half a screenful. prefer half a screen when you are scrolling in order to read — following a list, hunting for one entry — because a whole screen carries the lines the user was on off the display, and what they were looking for is as likely to be in the part that just went past as in the part that arrived; save a whole screen or more for when you mean to travel. always with the x: everything after the second colon is read as the element's name, so a bare 「:3」 is swallowed into the label and the scroll never happens.
 
-    two things to know about scrolling. the first is the same one that applies to a menu your own right click opens: your screenshot is the screen as it was when your reply started, so whatever a scroll brings into view is not in front of you — say in words what is down there, and never tag anything you could only see by scrolling, because that coordinate is one you do not have. the second is order: a scroll moves everything the tags after it were reading, so a scroll tag goes at the very end of your reply, once every element you meant to point at has been pointed at.
+    two things to know about scrolling. the first is the same one that applies to a menu your own right click opens: your screenshot is the screen as it was when your reply started, so whatever a scroll brings into view is not in front of you — say in words what is down there, and never tag anything you could only see by scrolling, because that coordinate is one you do not have. if what the scroll turns up is something you need to work with, write [LOOK] after it and you will be asked again with the list scrolled. the second is order: a scroll moves everything the tags after it were reading, so a scroll tag goes at the very end of your reply, once every element you meant to point at has been pointed at.
 
     write [DRAG:x,y:label>X,Y] when what the user wants is something carried from one place to another — a file into a folder, an icon onto the desktop, a slider dragged to the other end, a window moved out of the way. this is the only tag with two points: x,y is the element, which is where the drag starts, and X,Y after the > is where it is let go. kiki presses on the element once the cursor lands, carries it across and releases it there, so the whole movement happens on their screen. tag the thing being moved, never the place it is going — the element is still what the label names and what your coordinate has to be in the neighbourhood of. the drop point is a point and nothing else: there is no text there for kiki to find it by, so unlike the element's coordinate it has to be measured properly rather than estimated. it is read off the same screenshot the element is, so both points are on one screen; if that screen is not the cursor's, the :screenN goes after the label and before the >, as in [DRAG:420,330:季度报告:screen2>1100,600]. the label must never contain a >, and nothing but the label goes before it: everything up to the > is read as the element's name and everything after it as the point, so a :screenN written on the wrong side of the > is swallowed into the label, finds nothing on screen, and leaves the drag with nowhere to go.
+
+    write [LOOK] on its own, at the very end of your reply, when you need to see the screen again after doing what you tagged. everything you tagged happens first, in the order you wrote it, and only then does kiki take a fresh screenshot and ask you again with the result — so [LOOK] is how you find out what your own actions actually did, and how you keep looking when the user has sent you searching for something. it is the one tag that names no element; it is never read aloud and never left in what the user hears.
+
+    reach for it where you would otherwise be guessing: a menu you just right-clicked open, a dialog a click brought up, a page that has to load, a folder you just opened, a list a scroll moved. say what you are doing, write [LOOK], and your next reply can read what is really on screen and name the item to press. all of this is written the same way as any other reply — it is still spoken to the user, so talk to them and not to this machinery.
+
+    an action you tagged is a press and not a result. what comes back to you afterwards names the element kiki pressed and says nothing about what the screen did with it, so a click having landed is not the thing happening: a page you were asked to open is open when your next screenshot shows it open, not when you have clicked the link. open it, write [LOOK], and read what is really there — if the page came up, say what is on it; if it did not, say what you see instead and what you are trying next. never tell the user something is done on the strength of having asked for it.
+
+    when the user has sent you looking for something — a file, a folder, a setting, a page — and you cannot see it on screen, looking again is how you search, and the closed folders in front of you are the first place to look. open one, read what is inside it, and if it is not there, come back out and open the next; keep going until you find it or you have been through all of them, and then say plainly that it is in none of them. "it is not in these folders" reached by reading their names is not an answer to what they asked, only a guess at it. and the first step has to act: a reply that only points at the folders moves nothing on screen, so the turn ends there with nothing opened and nothing found.
+
+    a reply that means to press something has to carry the tag that presses it. the sentence saying you will open a menu opens nothing — the tag is the pressing — and a [LOOK] at the end of a reply that tagged no action asks to look again at a screen nothing has touched, so the turn simply ends there and the user is left holding a promise nothing followed. write the gesture on the element you mean and [LOOK] after it; and if there is nothing left to press, say what you found and stop.
+
+    do not write it when the screen will look the same either way. if you have answered the question and there is nothing left to look for, say what you have to say and stop, and the same goes for a reply that only located something with [POINT:x,y:label] — but that is the end of an errand, not of a search, so while you are still looking, having only pointed so far is not your answer: open the next thing in the same reply, and [LOOK] after it. and never write it after an action that was refused or failed, because nothing moved: you would be shown the same picture and reach the same reply. one turn may look again at most \(CompanionManager.maximumStepsInTheTurnBeingAnswered - 1) times.
 
     you can tag up to fifteen elements in one reply, and the cursor visits them in the order you write them. write them in the order you talk about them, each one sitting in the sentence that names it — the narration waits on an element until the cursor has arrived and stood on it, so a tag written somewhere other than where you mention the element makes the pointing feel out of step. if you want to mention more than fifteen things, pick the fifteen that matter most.
 
@@ -2344,6 +2552,11 @@ final class CompanionManager: ObservableObject {
     - user asks you to open a file sitting on their desktop: "桌面上那个 [DOUBLECLICK:420,330:季度报告] 季度报告双击就打开了，单击它只是选中，不会打开。"
     - user asks to replace a whole paragraph of a document: "在第二段开头那行 [TRIPLECLICK:520,318:本项目自去年立项以来] 本项目自去年立项以来连点三下，整段就选中了，直接打新的就行。"
     - user asks how to compress a file sitting on their desktop: "在那个 [RIGHTCLICK:420,330:季度报告] 季度报告上点右键，菜单里选「压缩」就行。"
+    - the same request, but the user asks you to do it rather than show them — the menu is not in your screenshot, so the first reply opens it and looks: "我先在 [RIGHTCLICK:420,330:季度报告] 季度报告上点右键。 [LOOK]"
+      and then, with the menu really open in front of you: "菜单出来了，我点 [CLICK:470,395:压缩] 压缩，压缩包会生成在旁边。"
+    - user asks you to make a new folder on their desktop, and where that lives is inside a menu you cannot see into: "好，我先在 [CLICK:512,11:文件] 文件菜单里找新建文件夹。 [LOOK]" and then "在菜单第三项，[CLICK:556,120:新建文件夹] 新建文件夹，你在弹出的框里打个名字就行。"
+    - user asks you to open a page or a site for them, and what you say about it has to be what is really on screen: "我点开 [CLICK:400,213:新华网] 新华网。 [LOOK]" and then, with the page in front of you: "开了，头条是……" — and if it did not open: "点了没反应，还停在原来那页，我再点一次。 [LOOK]"
+    - user asks which of the folders on their desktop holds last quarter's reports, and no folder name says — so you open them and look, one at a time: "我挨个翻，先开 [DOUBLECLICK:420,330:归档] 归档。 [LOOK]" and then "这个里面只有去年的周报，不是。我退回去看下一个，[CLICK:96,52:back button] 返回。 [LOOK]" and then, from the folder list again, the next one: "[DOUBLECLICK:420,362:项目] 项目我再看一眼。 [LOOK]" — and when they run out: "六个都翻过了，没有放季度报告的那个。它是放在别的地方，还是名字跟这些不一样？"
     - user asks where to start in an unfamiliar app, worth two tags: "先看左上角那个 [POINT:210,64:search field] 搜索框，想找什么直接敲就行。要是找不到，右下角还有个 [POINT:1180,690:filter button] 筛选按钮，点开能按类型和时间筛。"
     - user asks what's in a list, worth several tags — every name is said out loud, not just tagged: "带上「新闻」两个字的从上到下就这几条：最上面是 [POINT:400,213:新华网] 新华网，接着是 [POINT:400,246:央视新闻] 央视新闻，再往下是 [POINT:400,279:腾讯新闻] 腾讯新闻。"
     - the same list, but the user asks you to open them rather than tell them what's there — now it is [CLICK:x,y:label], and the names are still said out loud: "好，我挨个给你打开：先是 [CLICK:400,213:新华网] 新华网，接着是 [CLICK:400,246:央视新闻] 央视新闻，最后是 [CLICK:400,279:腾讯新闻] 腾讯新闻。"
@@ -2360,18 +2573,225 @@ final class CompanionManager: ObservableObject {
     /// `Date()` rather than a monotonic clock on purpose: a laptop closed overnight should read as a
     /// long gap, while a monotonic clock stops counting while the machine sleeps.
     private func startNewConversationIfTheUserHasBeenAway() {
-        let thisTurnStartDate = Date()
-
-        if let lastUserTurnStartDate {
-            let gapSinceTheLastTurnSeconds = thisTurnStartDate.timeIntervalSince(lastUserTurnStartDate)
-            if gapSinceTheLastTurnSeconds > Self.maximumGapBetweenTurnsInTheSameConversationSeconds {
-                print("🧠 New conversation — \(Int(gapSinceTheLastTurnSeconds))s since the last turn, "
-                      + "dropping \(conversationHistory.count) exchange(s)")
+        if let dateOfTheLastActivityInTheConversation {
+            let gapSinceTheLastActivitySeconds = Date().timeIntervalSince(dateOfTheLastActivityInTheConversation)
+            if gapSinceTheLastActivitySeconds > Self.maximumGapBetweenTurnsInTheSameConversationSeconds {
+                print("🧠 New conversation — \(Int(gapSinceTheLastActivitySeconds))s since the last "
+                      + "activity, dropping \(conversationHistory.count) exchange(s)")
+                // The two histories are two faces of one task and are emptied together. A summary
+                // left behind would be read as the record of a task the user has since walked away
+                // from, and the questions it answers are no longer being asked.
                 conversationHistory.removeAll()
+                summaryOfTheStepsCompressedOutOfTheContext = nil
+                numberOfHistoryEntriesTheSummaryStandsInFor = 0
+                // The task both histories were the two faces of is over, so the panel says so.
+                refreshTaskProgress(includingThePrompt: "")
             }
         }
 
-        lastUserTurnStartDate = thisTurnStartDate
+        dateOfTheLastActivityInTheConversation = Date()
+    }
+
+    /// The exchanges the next request carries as they were written, which are the ones the summary
+    /// does not stand in for.
+    private func historyToSendWithTheNextRequest() -> [(userPlaceholder: String, assistantResponse: String)] {
+        conversationHistory
+            .dropFirst(numberOfHistoryEntriesTheSummaryStandsInFor)
+            .map { (userPlaceholder: $0.userTranscript, assistantResponse: $0.assistantResponse) }
+    }
+
+    /// The system prompt, with the summary of the steps the context no longer carries whole
+    /// appended when there is one.
+    ///
+    /// Appended to the system prompt rather than sent as a message of its own, because the
+    /// conversation has to stay an unbroken run of user and assistant turns: a summary standing
+    /// among them would either put two messages of the same role side by side or start the
+    /// conversation on an assistant turn, and the API is entitled to refuse either.
+    private func systemPromptForThisStep() -> String {
+        guard let summaryOfTheStepsCompressedOutOfTheContext,
+              !summaryOfTheStepsCompressedOutOfTheContext.isEmpty else {
+            return Self.companionVoiceResponseSystemPrompt
+        }
+
+        return Self.companionVoiceResponseSystemPrompt + """
+
+
+        The steps of this task from before the ones you can see have been compressed, because the \
+        conversation outgrew the room there is for it. This is what they held. It is a record of \
+        your own work rather than anything the user has just said, and the parts of it that record \
+        an error, a refusal or a dead end are there so that you do not walk into them again:
+
+        \(summaryOfTheStepsCompressedOutOfTheContext)
+        """
+    }
+
+    /// What a stretch of the conversation is taken to cost the context, in tokens.
+    ///
+    /// There is no tokenizer in the process, so this is an estimate, and it is deliberately a
+    /// little high: an over-estimate compresses a step early, an under-estimate sends a request
+    /// the model rejects. A Chinese character is about a token and a Latin one about a quarter of
+    /// one, so the Latin rate is rounded up.
+    private static func estimatedTokenCount(of text: String) -> Int {
+        var estimatedTokenCount = 0.0
+        for scalar in text.unicodeScalars {
+            estimatedTokenCount += scalar.properties.isIdeographic ? 1.0 : 0.3
+        }
+        return Int(estimatedTokenCount)
+    }
+
+    /// What the next request would cost, as it stands.
+    ///
+    /// The screenshots are counted at the estimate per display rather than left out: they are the
+    /// reason the compression triggers below half, and a trigger that could not see them would
+    /// spend exactly the room they need.
+    private func estimatedTokenCountOfTheContextAsItStands(includingThePrompt prompt: String) -> Int {
+        var tokenCount = Self.estimatedTokenCount(of: Self.companionVoiceResponseSystemPrompt)
+            + Self.estimatedTokenCount(of: summaryOfTheStepsCompressedOutOfTheContext ?? "")
+
+        for entry in conversationHistory.dropFirst(numberOfHistoryEntriesTheSummaryStandsInFor) {
+            tokenCount += Self.estimatedTokenCount(of: entry.userTranscript)
+                + Self.estimatedTokenCount(of: entry.assistantResponse)
+        }
+
+        return tokenCount
+            + Self.estimatedTokenCount(of: prompt)
+            + NSScreen.screens.count * Self.estimatedTokenCountOfOneScreenshot
+    }
+
+    /// What the settings panel shows about the task, read off the history as it stands.
+    ///
+    /// The step being asked about is counted apart from the ones on the record, because its prompt
+    /// is not in the history yet — that is the same reason `estimatedTokenCountOfTheContextAsItStands`
+    /// is given the prompt rather than reading it off the last entry.
+    private func taskProgressAsItStands(includingThePrompt prompt: String) -> TaskProgress {
+        let isRunningARound = numberOfStepsStartedInTheTurnBeingAnswered > 0 && !hasClosedOutTheTurnBeingAnswered
+
+        // A round enters the history once per step, so its steps are consecutive entries sharing one
+        // identifier and the rounds are the run changes. The running round's steps are counted in
+        // the same pass, because both questions are asked of the same array.
+        var roundCount = 0
+        var numberOfStepsOfTheRunningRoundAlreadyOnTheRecord = 0
+        var previousRoundIdentifier: UUID?
+        for entry in conversationHistory {
+            if entry.turnIdentifier != previousRoundIdentifier {
+                roundCount += 1
+                previousRoundIdentifier = entry.turnIdentifier
+            }
+            if isRunningARound, entry.turnIdentifier == turnIdentifierOfTheTurnBeingAnswered {
+                numberOfStepsOfTheRunningRoundAlreadyOnTheRecord += 1
+            }
+        }
+
+        // The running round joins the count only while its own first step has not been written yet:
+        // from that write on, the walk above has already counted it.
+        if isRunningARound, numberOfStepsOfTheRunningRoundAlreadyOnTheRecord == 0 {
+            roundCount += 1
+        }
+
+        // The steps before the one in progress are on the record, so what the count is short by is
+        // exactly the difference between what has been started and what has been written.
+        let numberOfStepsOfTheRunningRoundNotYetOnTheRecord = isRunningARound
+            ? max(0, numberOfStepsStartedInTheTurnBeingAnswered - numberOfStepsOfTheRunningRoundAlreadyOnTheRecord)
+            : 0
+
+        return TaskProgress(
+            roundCount: roundCount,
+            stepCount: conversationHistory.count + numberOfStepsOfTheRunningRoundNotYetOnTheRecord,
+            isRunning: isRunningARound,
+            stepInTheRoundInProgress: isRunningARound ? numberOfStepsStartedInTheTurnBeingAnswered : 0,
+            estimatedTokenCountOfTheContext: estimatedTokenCountOfTheContextAsItStands(includingThePrompt: prompt),
+            tokenCountThatStartsCompression: Self.tokenCountThatStartsCompression
+        )
+    }
+
+    /// Takes the panel's reading of the task again, for the callers that have just changed one of
+    /// the four answers in it: a step starting, a compression landing, a round closing out, and the
+    /// idle gap emptying both histories.
+    ///
+    /// Guarded like `settleVoiceState`, and for the same reason: this is written whenever a step
+    /// starts and the panel re-draws on an unchanged `@Published` write as readily as on a changed
+    /// one, so an unguarded write would invalidate every view reading it for nothing.
+    private func refreshTaskProgress(includingThePrompt prompt: String) {
+        let progress = taskProgressAsItStands(includingThePrompt: prompt)
+        guard progress != taskProgress else { return }
+        taskProgress = progress
+    }
+
+    /// Where the context would stop carrying the history whole: everything before this index goes
+    /// into the summary, everything from it on goes out as it was written. Nil when there is
+    /// nothing left to compress.
+    ///
+    /// Walked back to the first step of a turn. A step that is not the first of its turn opens
+    /// with a report of what the previous step's actions did, so a context beginning at one would
+    /// open with a report of an action the model never saw itself ask for — a result whose call
+    /// has been cut away, which is what the pairing rule guards against in a tree that speaks in
+    /// tool calls rather than in tags.
+    private func indexWhereTheContextWouldStartCarryingTheHistoryWhole() -> Int? {
+        guard conversationHistory.count > Self.numberOfNewestStepsAlwaysCarriedWhole else { return nil }
+
+        var indexTheContextWouldStartAt = conversationHistory.count
+            - Self.numberOfNewestStepsAlwaysCarriedWhole
+
+        while indexTheContextWouldStartAt > numberOfHistoryEntriesTheSummaryStandsInFor,
+              conversationHistory[indexTheContextWouldStartAt].turnIdentifier
+                == conversationHistory[indexTheContextWouldStartAt - 1].turnIdentifier {
+            indexTheContextWouldStartAt -= 1
+        }
+
+        // Backing up this far means every step the context could drop is already inside the
+        // summary, so the compression would spend a call to write down what it already says.
+        guard indexTheContextWouldStartAt > numberOfHistoryEntriesTheSummaryStandsInFor else { return nil }
+        return indexTheContextWouldStartAt
+    }
+
+    /// Compresses the steps the context has outgrown into the summary, if it has outgrown them.
+    ///
+    /// Run before the request is built rather than after one is rejected: the rejection says only
+    /// that something was too long, and by then the step has already paid for a capture and a
+    /// round trip. A compression that fails is not fatal to the turn — the context is then simply
+    /// over its own budget, and the request goes out as it would have.
+    private func compressTheContextIfItHasOutgrownItsRoom(includingThePrompt prompt: String) async {
+        let tokenCountOfTheContextAsItStands = estimatedTokenCountOfTheContextAsItStands(includingThePrompt: prompt)
+        guard tokenCountOfTheContextAsItStands > Self.tokenCountThatStartsCompression else { return }
+
+        guard let indexWhereTheContextWouldStartAt = indexWhereTheContextWouldStartCarryingTheHistoryWhole()
+        else { return }
+
+        // Copied out before the await: the encoding and the request both suspend, and the history
+        // is written on the main actor by the steps that are still arriving.
+        let stepsToCompress = Array(conversationHistory[numberOfHistoryEntriesTheSummaryStandsInFor
+                                                         ..< indexWhereTheContextWouldStartAt])
+        let recordOfTheStepsToCompress = stepsToCompress
+            .map { "用户：\($0.userTranscript)\n助手：\($0.assistantResponse)" }
+            .joined(separator: "\n\n")
+
+        print("🗜️ Context at \(tokenCountOfTheContextAsItStands) tokens — compressing "
+              + "\(stepsToCompress.count) step(s)")
+
+        do {
+            let summary = try await deepSeekAPI.summarizeConversation(
+                compressing: recordOfTheStepsToCompress,
+                foldingIn: summaryOfTheStepsCompressedOutOfTheContext
+            )
+
+            // The summary belongs to the conversation that asked for it, and one that came back
+            // after the question was replaced would be filed against the next conversation's
+            // history — which may be shorter, and may be about something else entirely.
+            guard !Task.isCancelled else { return }
+
+            summaryOfTheStepsCompressedOutOfTheContext = summary
+            numberOfHistoryEntriesTheSummaryStandsInFor = indexWhereTheContextWouldStartAt
+            print("🗜️ Compressed into \(summary.count) 字, steps 0..<\(indexWhereTheContextWouldStartAt) now "
+                  + "stand on the summary")
+
+            // The panel has been counting down to this moment, and the count has just gone back up:
+            // the steps that were weighing on the context are now one paragraph of it.
+            refreshTaskProgress(includingThePrompt: prompt)
+        } catch {
+            // Not fatal: the request goes out over its own budget, which is what it would have done
+            // anyway. The next step tries again with more of the conversation behind it.
+            print("⚠️ Context compression failed: \(error)")
+        }
     }
 
     /// Captures a screenshot, sends it with the transcript to DeepSeek, and plays the response
@@ -2405,23 +2825,85 @@ final class CompanionManager: ObservableObject {
         writeTheCurrentTurnIntoHistory(interruption: .theUserStartedANewQuestion)
         abandonSpeakingReply()
 
-        // Deliberately after the line above: what that read is the *previous* turn's question.
-        transcriptOfTheTurnBeingAnswered = transcript
+        // A fresh turn: no step behind it, nothing to report to the model, and nothing left over
+        // from the last turn's loop for the terminal to be handed twice. After the history write
+        // above rather than before it, because what that write reads is the previous turn's prompt.
+        numberOfStepsStartedInTheTurnBeingAnswered = 0
+        spokenTextOfTheStepsBeforeTheOneInProgress = ""
+        hasClosedOutTheTurnBeingAnswered = false
+        // After the history write above, which files the previous turn's reply under the identifier
+        // of the turn it actually belonged to.
+        turnIdentifierOfTheTurnBeingAnswered = UUID()
+
+        askTheModelForTheNextStepOfTheTurn(prompt: transcript)
+    }
+
+    /// Asks the model for one step of the turn: a look at the screen as it is now, and the reply
+    /// that follows it.
+    ///
+    /// A turn is one call of this or several, and the several are what makes it a loop: a reply that
+    /// acts on the screen and ends with [LOOK] changes the screen out from under itself, so the next
+    /// step is the same question asked of a picture nothing else in the app has seen yet. Between
+    /// steps the machine is in exactly the state a new turn leaves it in, which is why everything
+    /// below is the same code for the first step and for the fifth.
+    ///
+    /// - Parameter prompt: What the model is told. The user's own transcript for the first step, and
+    ///   the sentence describing what its last actions did for every step after it.
+    private func askTheModelForTheNextStepOfTheTurn(prompt: String) {
+        transcriptOfTheTurnBeingAnswered = prompt
+        // A step is the conversation still going, so it counts as activity against the idle gap
+        // that would otherwise start a new one behind the user's back.
+        dateOfTheLastActivityInTheConversation = Date()
+        // Read before the count moves: the turn's first step is the one asked for out of the user's
+        // own speech, and the last thing to touch the screen before it was the user.
+        let isTheFirstStepOfTheTurn = numberOfStepsStartedInTheTurnBeingAnswered == 0
+        numberOfStepsStartedInTheTurnBeingAnswered += 1
+        stepInProgress = StepOfTheTurnBeingAnswered()
+        hasTheModelAskedToLookAgain = false
+
+        // The step's prompt is not in the history yet, so it is the prompt that is counted beside it
+        // — the same way the compression's own trigger counts the request it is about to send.
+        refreshTaskProgress(includingThePrompt: prompt)
 
         // Stamped synchronously, before the task below exists, so a chunk still on its way from
         // the reply being replaced is already recognisable as stale when it lands.
         let thisTurnIdentifier = UUID()
         turnIdentifierOfTheReplyBeingStreamed = thisTurnIdentifier
 
-        // Nothing will ever be heard in a silent turn, so the flag that says a reply is in progress
-        // and not yet audible would never be cleared by the sound it is waiting for.
-        isWaitingForTheFirstSoundOfTheReply = isReadingTheReplyAloud
+        // Armed here and not where the request goes out, because the step before this one may still
+        // be being spoken and the compression and the capture below take time. Left as the last
+        // step's facts, the narration would read that gap as the turn being over and end itself
+        // under the user's ear.
+        isReplyStreamComplete = false
+        // A silent turn will never hear anything, so the flag that says a reply is in progress and
+        // not yet audible would never be cleared by the sound it is waiting for. Nor is it armed
+        // over a step that is still being spoken: that sound is the one this flag waits for.
+        if !isSpeakingReply {
+            isWaitingForTheFirstSoundOfTheReply = isReadingTheReplyAloud
+        }
         isProducingAReply = true
 
         currentResponseTask = Task {
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                // Before the capture, not after it: the compression is triggered by the room the
+                // screenshots are about to take, and a step that compressed afterwards would have
+                // already spent the round trip and the capture it was meant to save.
+                await compressTheContextIfItHasOutgrownItsRoom(includingThePrompt: prompt)
+
+                guard !Task.isCancelled else { return }
+
+                // Capture all connected screens so the AI has full context, once the screen has
+                // stopped reacting to whatever the step before this one did to it. A turn's first
+                // step waits for nothing: it is asked for out of the user's own speech, so the last
+                // thing to touch the screen was the user — already seconds ago — and the wait would
+                // buy nothing at the one moment the user is sitting waiting on kiki.
+                let screenCaptures: [CompanionScreenCapture]
+                if isTheFirstStepOfTheTurn {
+                    screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                } else {
+                    screenCaptures = try await CompanionScreenCaptureUtility
+                        .captureAllScreensAsJPEGOnceTheScreenHasSettled()
+                }
 
                 guard !Task.isCancelled else { return }
 
@@ -2446,9 +2928,7 @@ final class CompanionManager: ObservableObject {
                 }
 
                 // Pass conversation history so the model remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
+                let historyForAPI = historyToSendWithTheNextRequest()
 
                 // The reply's state has to be clear of the last one's before the first chunk.
                 beginStreamingReply(
@@ -2458,9 +2938,9 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await deepSeekAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: systemPromptForThisStep(),
                     conversationHistory: historyForAPI,
-                    userPrompt: transcript,
+                    userPrompt: prompt,
                     onTextChunk: { [weak self] accumulatedRawText in
                         // Awaited rather than fired and forgotten: the segmenter has to know which
                         // sentence each new tag sits in before it can cut the reply around it, and
@@ -2501,6 +2981,11 @@ final class CompanionManager: ObservableObject {
             }
 
             if !Task.isCancelled {
+                // A step that has already been followed by another one is not the owner of the
+                // state below: the next step armed it while this task was finishing, and clearing
+                // it here would put the spinner out in the pause between two steps of one turn.
+                guard thisTurnIdentifier == turnIdentifierOfTheReplyBeingStreamed else { return }
+
                 // The `await` above returns in the middle of the narration, not after it: the
                 // reply has finished arriving while its segments are still being spoken. The turn
                 // is not over until the voice is, so the state is left to the last segment —
@@ -2758,6 +3243,10 @@ final class CompanionManager: ObservableObject {
         /// Every element the model tagged, in the order it described them, capped at
         /// `maximumPointingTourStopCount`. Empty when the model wrote [POINT:none] or no tag.
         let tourStops: [PointingTourStop]
+        /// Whether the reply carried the [LOOK] marker, which asks to see the screen again once
+        /// everything it tagged has been acted on. Stripped from `spokenText` like every other tag,
+        /// so the voice never says it and the history never holds it.
+        let hasAskedToLookAgain: Bool
     }
 
     /// One element on a pointing tour, with the point in the spoken text at which the cursor
@@ -2818,12 +3307,20 @@ final class CompanionManager: ObservableObject {
         // 4 and `:screen(\d+)` is group 5, so inserting the destination before either of them would
         // have `screenfuls(fromTagMatch:)` reading a destination's y as a distance. It sits after
         // them and is read as groups 6 and 7, which nothing else looks at.
-        let pattern = #"\[(?i:POINT|CLICK|DOUBLECLICK|TRIPLECLICK|RIGHTCLICK|SCROLLUP|SCROLLDOWN|SCROLLLEFT|SCROLLRIGHT|DRAG):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]\s][^\]]*?))?(?::x(\d+))?(?::screen(\d+))?(?:\s*>\s*(\d+)\s*,\s*(\d+))?)\]"#
+        // The distance's fraction is a non-capturing group, so `:x0.5` is still one group and group
+        // 4 still holds the whole number — written as a capturing one it would shift `:screenN` and
+        // the destination along by one and have them read each other's values.
+        // `LOOK` is the one alternative that names no element and has no colon: it is not a gesture
+        // but a request for another step, written on its own. Its capture groups are none, so it
+        // leaves every group number below it untouched — and it is stripped from the spoken text
+        // like any other tag, which the loop over the matches does before anything reads them.
+        let pattern = #"\[(?i:POINT|CLICK|DOUBLECLICK|TRIPLECLICK|RIGHTCLICK|SCROLLUP|SCROLLDOWN|SCROLLLEFT|SCROLLRIGHT|DRAG):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]\s][^\]]*?))?(?::x(\d+(?:\.\d+)?))?(?::screen(\d+))?(?:\s*>\s*(\d+)\s*,\s*(\d+))?)\]|\[(?i:LOOK)\]"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil, tourStops: [])
+            return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil, tourStops: [], hasAskedToLookAgain: false)
         }
         let allTagMatches = regex.matches(in: responseText, range: NSRange(responseText.startIndex..., in: responseText))
+        let hasAskedToLookAgain = allTagMatches.contains { Self.isTheLookMarker($0, in: responseText) }
 
         guard let lastTagMatch = allTagMatches.last else {
             // No tag at all — the opening stretch of most replies — and it goes through the same tidy
@@ -2836,7 +3333,8 @@ final class CompanionManager: ObservableObject {
                 coordinate: nil,
                 elementLabel: nil,
                 screenNumber: nil,
-                tourStops: []
+                tourStops: [],
+                hasAskedToLookAgain: hasAskedToLookAgain
             )
         }
 
@@ -2900,7 +3398,7 @@ final class CompanionManager: ObservableObject {
 
 
         guard let lastScreenshotCoordinate = Self.screenshotCoordinate(fromTagMatch: lastTagMatch, in: responseText) else {
-            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil, tourStops: tourStops)
+            return PointingParseResult(spokenText: spokenText, coordinate: nil, elementLabel: "none", screenNumber: nil, tourStops: tourStops, hasAskedToLookAgain: hasAskedToLookAgain)
         }
 
         return PointingParseResult(
@@ -2908,8 +3406,19 @@ final class CompanionManager: ObservableObject {
             coordinate: lastScreenshotCoordinate,
             elementLabel: Self.elementLabel(fromTagMatch: lastTagMatch, in: responseText),
             screenNumber: Self.screenNumber(fromTagMatch: lastTagMatch, in: responseText),
-            tourStops: tourStops
+            tourStops: tourStops,
+            hasAskedToLookAgain: hasAskedToLookAgain
         )
+    }
+
+    /// Whether one match of the tag pattern is the [LOOK] marker rather than a tag naming an element.
+    ///
+    /// Read off the matched text rather than off a capture group, because the marker is the one
+    /// alternative that captures nothing — which is what keeps the group numbers every other tag is
+    /// read by exactly where they were.
+    private static func isTheLookMarker(_ tagMatch: NSTextCheckingResult, in responseText: String) -> Bool {
+        guard let tagRange = Range(tagMatch.range, in: responseText) else { return false }
+        return responseText[tagRange].uppercased() == "[LOOK]"
     }
 
     /// The coordinate inside a [POINT:...] tag, in the screenshot's own pixel space, or nil
@@ -3026,15 +3535,16 @@ final class CompanionManager: ObservableObject {
     ///
     /// Clamped here rather than where the events are built, because both ends of the range are
     /// meaningless rather than merely large: `:x0` is a tag that names a gesture doing nothing, and
-    /// past the ceiling the count stops describing a distance anyone means. The prompt asks for one
-    /// to three; this is what makes a model that writes `:x40` scroll rather than sit there.
-    private static func screenfuls(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> Int {
+    /// past the ceiling the count stops describing a distance anyone means. The prompt asks for half
+    /// a screen to three; this is what makes a model that writes `:x40` scroll rather than sit there.
+    private static func screenfuls(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> CGFloat {
         guard tagMatch.numberOfRanges >= 5,
               let screenfulsRange = Range(tagMatch.range(at: 4), in: responseText),
-              let screenfuls = Int(responseText[screenfulsRange]) else {
+              let screenfuls = Double(responseText[screenfulsRange]) else {
             return 1
         }
-        return min(max(screenfuls, 1), ElementScroller.mostScreenfulsInOneRequest)
+        return min(max(CGFloat(screenfuls), ElementScroller.smallestScreenfulsInOneRequest),
+                   CGFloat(ElementScroller.mostScreenfulsInOneRequest))
     }
 
     /// Finds where the sentence that mentions the element begins, looking back from the tag.
@@ -3348,16 +3858,27 @@ final class CompanionManager: ObservableObject {
         recognizedTextLinesTasks: [Task<[RecognizedTextLine], Never>]
     ) {
         endPointingTour()
-        // `false` because this runs inside the new turn, not at the end of the old one: the
-        // caller has already armed this turn's facts.
-        abandonSpeakingReply(settlingTheVoiceState: false)
+
+        // The step before this one may still be being spoken — a step whose screen work is done is
+        // handed to the model at once rather than waiting for the voice, and its audio queues behind
+        // whatever is still playing. So the narration is written off here only when nothing is left
+        // of it: writing it off unconditionally would drop audio still owed and cut the last
+        // sentence of the step before this one short. Nothing else discards it either, for the same
+        // reason — the prepared audio is one queue for the whole turn.
+        if !isSpeakingReply, !isWaitingForTheFirstSoundOfTheReply {
+            // `false` because this runs inside the new turn, not at the end of the old one: the
+            // caller has already armed this turn's facts.
+            abandonSpeakingReply(settlingTheVoiceState: false)
+        }
+
+        // Whatever was said up to here belongs to the steps before this one. The list is the turn's,
+        // and this is the offset that reads this step's own indices at the right place in it.
+        speechSegmentCountBeforeTheStepNowStreaming = speechSegmentsOfTheTurnBeingSpoken.count
 
         streamingReplySegmenter = StreamingReplySegmenter(
             screenCaptures: screenCaptures,
             recognizedTextLinesTasks: recognizedTextLinesTasks
         )
-        isReplyStreamComplete = false
-        finalizedSpeechSegmentCount = 0
         isPointingTourActive = false
         // The turn that just ended has been written into the history by whoever ended it; this
         // is where the next turn's own record starts.
@@ -3411,17 +3932,124 @@ final class CompanionManager: ObservableObject {
         guard let streamingReplySegmenter else { return }
 
         isReplyStreamComplete = true
-        applyStreamedReplyIngest(await streamingReplySegmenter.conclude(accumulatedRawText: fullRawText))
+        let ingest = await streamingReplySegmenter.conclude(accumulatedRawText: fullRawText)
 
         // Cannot be left to the teardown that runs when the next question arrives: that teardown reads
         // the history before the reply it replaces could have been added, so every reply would reach the
         // model one turn late.
+        //
+        // And it goes before the ingest is applied rather than after, because applying it is one of the
+        // things that can finish the step — and a step that has moved on has already replaced the record
+        // of which question is being answered, so a write after it would file this reply under the next
+        // step's prompt, or drop it for being empty against a segmenter that has just been reset.
         writeTheCurrentTurnIntoHistory(interruption: nil)
 
-        // After the history write, so the terminal is told the turn is over at the same moment the
-        // record of it becomes complete. `conclude` has already recorded the full text, so this is
-        // the finished reply and not one chunk short of it.
-        commandSocketServer.send(.done(spokenText: streamingReplySegmenter.spokenTextAsItStands()))
+        applyStreamedReplyIngest(ingest)
+
+        // The end of the stream is one of the four things that can finish a step, and for a reply that
+        // asked for nothing and pointed at nothing it is the only one: no action will report back and
+        // no tour will run out of stops.
+        finishTheStepIfEverythingItAskedForIsDone()
+    }
+
+    /// The whole of what one step asked for is done, so the turn either takes another step or ends.
+    ///
+    /// Three things finish a step and they finish at different times: the reply stops arriving, the
+    /// cursor runs out of stops to visit, and the last action reports what it did. Any of the three
+    /// can be the last, so all three call this — and the voice is deliberately not one of them: it
+    /// stops speaking long after the screen work is done, and a step that waited for it would sit
+    /// idle through its whole last sentence before asking the model anything.
+    ///
+    /// A step with no actions at all satisfies the count trivially, which is the common case: most
+    /// replies act on nothing, and those close out on the first call.
+    private func finishTheStepIfEverythingItAskedForIsDone() {
+        guard !stepInProgress.hasBeenClosedOut else { return }
+        guard isReplyStreamComplete,
+              nextPointingTourStop == nil,
+              stepInProgress.numberOfActionsAskedFor == stepInProgress.numberOfActionsThatHaveReportedBack
+        else { return }
+
+        guard shouldTheTurnTakeAnotherStep else {
+            stepInProgress.hasBeenClosedOut = true
+            closeOutTheTurnBeingAnswered()
+            return
+        }
+
+        // The next step is asked for even while the step before it is still being spoken, so the
+        // narration of the two runs as one: this step's segments are appended to the turn's list,
+        // which is what lets the voice finish its last sentence and go straight on into this step's
+        // first one. Nothing is cut and nothing waits for anything but the audio itself.
+        if isSpeakingReply, !isWaitingForTheFirstSoundOfTheReply {
+            print("⏩ Step \(numberOfStepsStartedInTheTurnBeingAnswered) starts with \(speechSegmentsOfTheTurnBeingSpoken.count - currentSpeechSegmentIndex) segment(s) of narration still owed")
+        }
+
+        stepInProgress.hasBeenClosedOut = true
+
+        // A blank line between two steps of one turn, because the terminal renders what it is sent as
+        // they arrive: without one, a step's last sentence and the next step's first run together into
+        // a paragraph nobody wrote. The separator rides on the step that ended rather than on the one
+        // that follows, so the last step of a turn is not left with a trailing gap.
+        let spokenTextOfTheStepThatJustEnded = spokenTextOfTheStepInProgress
+        if !spokenTextOfTheStepThatJustEnded.isEmpty {
+            spokenTextOfTheStepsBeforeTheOneInProgress += spokenTextOfTheStepThatJustEnded + "\n\n"
+        }
+
+        askTheModelForTheNextStepOfTheTurn(
+            prompt: Self.promptForTheStepAfterTheModelsOwnActions(
+                sentencesSayingWhatTheyDid: stepInProgress.sentencesSayingWhatTheActionDid
+            )
+        )
+    }
+
+    /// What the step in progress has been heard to say, read freshly rather than off a stored copy.
+    ///
+    /// `spokenText` is only as fresh as the last full pass, and the passes that were skipped are
+    /// exactly the chunks the early-out bought — so anything assembling the turn's text asks the
+    /// segmenter, the same way the history write does.
+    private var spokenTextOfTheStepInProgress: String {
+        streamingReplySegmenter?.spokenTextAsItStands() ?? ""
+    }
+
+    /// Whether the model asked for another look and there is something new for it to see.
+    private var shouldTheTurnTakeAnotherStep: Bool {
+        guard hasTheModelAskedToLookAgain else { return false }
+
+        // A step whose every action was refused or failed has left the screen exactly as the
+        // screenshot that reply was written against, so another look would come back with the same
+        // picture and earn the same reply — a loop with nothing moving in it.
+        guard stepInProgress.didAnyActionReachTheScreen else {
+            print("🔁 Step asked to look again but nothing on the screen changed — the turn ends here.")
+            return false
+        }
+
+        guard numberOfStepsStartedInTheTurnBeingAnswered < Self.maximumStepsInTheTurnBeingAnswered else {
+            print("🔁 Turn stopped after \(numberOfStepsStartedInTheTurnBeingAnswered) steps.")
+            return false
+        }
+
+        return true
+    }
+
+    /// Ends the turn as far as the terminal watching it is concerned.
+    ///
+    /// Deferred to here rather than sent when the stream stops, because the turn is not over when the
+    /// model stops writing — it is over when the cursor has finished acting on what it wrote. The
+    /// snapshot is the whole turn's text, every step of it, so what the terminal has been reading
+    /// only ever grows.
+    private func closeOutTheTurnBeingAnswered() {
+        guard !hasClosedOutTheTurnBeingAnswered else { return }
+        hasClosedOutTheTurnBeingAnswered = true
+
+        // The round stops running here, and its last step is already on the record — so the prompt
+        // is nothing, because there is no longer a request this reading is being taken ahead of.
+        refreshTaskProgress(includingThePrompt: "")
+
+        let spokenTextOfTheWholeTurn = spokenTextOfTheStepsBeforeTheOneInProgress + spokenTextOfTheStepInProgress
+
+        print("🔁 Turn closed out after \(numberOfStepsStartedInTheTurnBeingAnswered) step(s), "
+              + "\(spokenTextOfTheWholeTurn.count) 字")
+
+        commandSocketServer.send(.done(spokenText: spokenTextOfTheWholeTurn))
     }
 
     /// Hands a terminal watching the reply the text as it stands, so far.
@@ -3429,19 +4057,51 @@ final class CompanionManager: ObservableObject {
     /// Skipped while the raw text has not moved, which is most chunks: the answer costs a whole
     /// re-parse of the reply, and the total arrives only ever growing, so an unchanged length
     /// means an unchanged answer.
+    ///
+    /// Each snapshot is the whole turn's text and not the current step's, because that is what the
+    /// terminal is promised: an absolute snapshot rather than a delta. A step of a turn is not a turn,
+    /// so a snapshot of the step alone would *shrink* at every step boundary — the text the terminal
+    /// already had would be taken back off the screen.
     private func sendTheReplyAsItStandsToTheTerminal(accumulatedRawText: String) {
         let accumulatedRawTextUTF16Count = accumulatedRawText.utf16.count
         guard accumulatedRawTextUTF16Count != rawReplyUTF16CountLastSentToTerminal else { return }
         rawReplyUTF16CountLastSentToTerminal = accumulatedRawTextUTF16Count
 
-        guard let streamingReplySegmenter else { return }
-        commandSocketServer.send(.text(spokenTextSoFar: streamingReplySegmenter.spokenTextAsItStands()))
+        // No segmenter is no reply in progress, and an empty snapshot is worse than none at all: it
+        // would take the steps the terminal has already read back off its screen.
+        guard streamingReplySegmenter != nil else { return }
+
+        commandSocketServer.send(.text(spokenTextSoFar:
+            spokenTextOfTheStepsBeforeTheOneInProgress + spokenTextOfTheStepInProgress
+        ))
     }
 
     /// Takes what the segmenter made of the reply so far.
     private func applyStreamedReplyIngest(_ ingest: StreamedReplyIngest) {
-        speechSegments = ingest.speechSegments
-        finalizedSpeechSegmentCount = ingest.finalizedSpeechSegmentCount
+        // The ingest speaks about one step, and this step's segments start at zero — so they are
+        // hung on the end of the turn's list at the offset the step began at rather than replacing
+        // what the steps before it put there. Those are already behind the voice or being spoken;
+        // only this step's own tail is recomputed.
+        var segmentsOfTheWholeTurn = Array(
+            speechSegmentsOfTheTurnBeingSpoken.prefix(speechSegmentCountBeforeTheStepNowStreaming)
+        )
+        // A segment the step before this one cut carries a range into that step's
+        // `resolvedPointingTourStops` — an array the first tag of this step has just replaced — and
+        // an offset into that step's own text, which is not what the narration's word count is
+        // counting now. Left as it was, a range that happens to fit the new tour reads as "the
+        // narration has reached this stop" and sends the cursor to an element the voice has not come
+        // to yet.
+        for index in segmentsOfTheWholeTurn.indices {
+            segmentsOfTheWholeTurn[index].stopIndexRange = 0..<0
+        }
+
+        speechSegmentsOfTheTurnBeingSpoken = segmentsOfTheWholeTurn + ingest.speechSegments
+        finalizedSpeechSegmentCount = speechSegmentCountBeforeTheStepNowStreaming
+            + ingest.finalizedSpeechSegmentCount
+        // The answer is final when `conclude` runs, and the marker only ever appears once its `]`
+        // has arrived — so a `[LOOK]` cut short by the end of a step reads as no marker rather than
+        // as half of one.
+        hasTheModelAskedToLookAgain = ingest.hasAskedToLookAgain
 
         // Handed to the synthesizer whether or not they can be spoken yet: synthesis is what the
         // streaming design moved into the generation window, so the audio is in hand when it is asked for.
@@ -3450,7 +4110,10 @@ final class CompanionManager: ObservableObject {
             for settledSegment in ingest.segmentsToSynthesise {
                 ttsClient.prepareSpeechSegment(
                     spokenText: settledSegment.spokenText,
-                    segmentIndex: settledSegment.segmentIndex
+                    // The numbering is the turn's, because the audio of the whole turn is one queue
+                    // and `speakPreparedSegment(segmentIndex:)` looks a prepared segment up by this
+                    // number alone — so two steps' first segments must not share one.
+                    segmentIndex: speechSegmentCountBeforeTheStepNowStreaming + settledSegment.segmentIndex
                 )
             }
         }
@@ -3470,7 +4133,11 @@ final class CompanionManager: ObservableObject {
             }
 
             for newlyResolvedStop in ingest.newlyResolvedPointingTourStops {
-                print("🎯 Element pointing: (\(Int(newlyResolvedStop.screenshotCoordinate.x)), \(Int(newlyResolvedStop.screenshotCoordinate.y))) → \"\(newlyResolvedStop.elementLabel ?? "element")\"")
+                print("🎯 Element pointing: (\(Int(newlyResolvedStop.screenshotCoordinate.x)), \(Int(newlyResolvedStop.screenshotCoordinate.y))) → \"\(newlyResolvedStop.elementLabel ?? "element")\""
+                      + " · model said (\(Int(newlyResolvedStop.modelScreenshotCoordinate.x)), \(Int(newlyResolvedStop.modelScreenshotCoordinate.y)))"
+                      + (newlyResolvedStop.didTheLabelMatchTextOnScreen
+                         ? " · label matched screen text"
+                         : " · label matched nothing on screen, the model's own estimate was used"))
             }
         }
 
@@ -3500,6 +4167,8 @@ final class CompanionManager: ObservableObject {
         let newlyResolvedPointingTourStops: [ResolvedPointingTourStop]
         /// Every stop resolved so far, in the same order, for the caller's own copy.
         let allResolvedPointingTourStops: [ResolvedPointingTourStop]
+        /// Whether the reply as it stands carries the [LOOK] marker.
+        let hasAskedToLookAgain: Bool
     }
 
     /// Cuts the reply into speech segments while it is still being written.
@@ -3628,6 +4297,13 @@ final class CompanionManager: ObservableObject {
             ).spokenText
         }
 
+        /// The reply as the model wrote it, tags and all.
+        ///
+        /// Beside the spoken text because the two answer different questions: that one is what the model
+        /// said, this one is what it asked for. A tag the parser did not recognise is the one way a step can
+        /// ask to look again and read as having stopped, and it is invisible in the spoken text.
+        func rawTextAsItStands() -> String { rawTextAsReceived }
+
         private func ingest(accumulatedRawText incomingRawText: String, isReplyComplete: Bool) async -> StreamedReplyIngest {
             accumulatedRawText = Self.droppingAHalfWrittenTag(from: incomingRawText)
 
@@ -3670,7 +4346,8 @@ final class CompanionManager: ObservableObject {
                 finalizedSpeechSegmentCount: finalizedSpeechSegmentCount,
                 segmentsToSynthesise: segmentsToSynthesise,
                 newlyResolvedPointingTourStops: Array(newlyResolvedStops),
-                allResolvedPointingTourStops: resolvedPointingTourStops
+                allResolvedPointingTourStops: resolvedPointingTourStops,
+                hasAskedToLookAgain: parseResult.hasAskedToLookAgain
             )
         }
 
@@ -3716,6 +4393,8 @@ final class CompanionManager: ObservableObject {
 
                 resolvedPointingTourStops.append(CompanionManager.ResolvedPointingTourStop(
                     screenshotCoordinate: screenshotCoordinate,
+                    modelScreenshotCoordinate: tourStop.screenshotCoordinate,
+                    didTheLabelMatchTextOnScreen: precisePosition.matchedTextBox != nil,
                     screenLocation: resolvedLocation.screenLocation,
                     displayFrame: resolvedLocation.displayFrame,
                     elementLabel: tourStop.elementLabel,
@@ -3811,17 +4490,17 @@ final class CompanionManager: ObservableObject {
     /// The stops the segment being spoken names, as a range into `resolvedPointingTourStops`.
     /// Empty once every segment has been spoken.
     private var currentSpeechSegmentStopIndexRange: Range<Int> {
-        guard currentSpeechSegmentIndex < speechSegments.count else {
+        guard currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count else {
             return resolvedPointingTourStops.count..<resolvedPointingTourStops.count
         }
-        return speechSegments[currentSpeechSegmentIndex].stopIndexRange
+        return speechSegmentsOfTheTurnBeingSpoken[currentSpeechSegmentIndex].stopIndexRange
     }
 
     /// Where in the reply's spoken text the segment being spoken starts, which is what converts
     /// the voice's own offsets back into positions in the reply.
     private var currentSpeechSegmentStartOffsetInSpokenText: Int {
-        guard currentSpeechSegmentIndex < speechSegments.count else { return 0 }
-        return speechSegments[currentSpeechSegmentIndex].startOffsetInSpokenText
+        guard currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count else { return 0 }
+        return speechSegmentsOfTheTurnBeingSpoken[currentSpeechSegmentIndex].startOffsetInSpokenText
     }
 
     /// How much longer the cursor has to stay on the stop it landed on before it may leave.
@@ -3884,7 +4563,23 @@ final class CompanionManager: ObservableObject {
         guard isSpeakingReply, hasCurrentSpeechSegmentFinishedSpeaking else { return }
         guard hasPointerFinishedWithCurrentSpeechSegment() else { return }
 
-        currentSpeechSegmentIndex += 1
+        // The spoken-through flag answers for the segment the index is standing on, and only a segment
+        // that is actually handed to the voice clears it — so the index moves onto a segment that has
+        // been cut, and never onto one the model is still writing. Stepped onto one of those,
+        // `speakCurrentSpeechSegment` returns before it clears the flag, the next chunk reads the flag
+        // as "the segment after this one has been said" and steps over that one as well, and the index
+        // goes on tracking the tip of the list: the rest of the step is never spoken, and every stop
+        // the missed segments named is never visited.
+        let indexAfterTheCurrentSegment = currentSpeechSegmentIndex + 1
+        let isThereACutSegmentToMoveOnTo = indexAfterTheCurrentSegment < finalizedSpeechSegmentCount
+        // The one move that is not onto a segment is the ending, and it is the ending only once the
+        // model has stopped writing this step: the end of a step's segments is an empty waiting room
+        // while a step after it may still be writing more of the turn.
+        let isTheStreamDoneAndThisWasTheLastSegment =
+            isReplyStreamComplete && indexAfterTheCurrentSegment >= speechSegmentsOfTheTurnBeingSpoken.count
+        guard isThereACutSegmentToMoveOnTo || isTheStreamDoneAndThisWasTheLastSegment else { return }
+
+        currentSpeechSegmentIndex = indexAfterTheCurrentSegment
         speakCurrentSpeechSegment()
     }
 
@@ -3908,9 +4603,9 @@ final class CompanionManager: ObservableObject {
     /// Two waits meet here: `finalizedSpeechSegmentCount`, so a segment the model may still be writing is
     /// never handed over, and the one inside the TTS client for a segment whose synthesis has not finished.
     private func speakCurrentSpeechSegment() {
-        guard currentSpeechSegmentIndex < speechSegments.count else {
-            // Reaching the end of the segments is not the end of the reply while more may still
-            // be written — it is an empty waiting room.
+        guard currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count else {
+            // Reaching the end of the segments is not the end of the turn while a step after this
+            // one may still be writing them — it is an empty waiting room.
             guard isReplyStreamComplete else { return }
             finishSpeakingReply()
             return
@@ -3921,6 +4616,16 @@ final class CompanionManager: ObservableObject {
 
         hasCurrentSpeechSegmentFinishedSpeaking = false
         lastSpokenWordEndOffsetInCurrentSpeechSegment = 0
+        // The narration's position is counted in the text of the step that text belongs to, and a
+        // step's stops carry offsets into that same text, so the two are comparable only inside one
+        // step. This step's first segment is the only place the position can still be the step
+        // before it's — and the comparison it would lose is not a near miss: the step before it's
+        // whole narration outweighs an offset near the start of this step's text, so the stop reads
+        // as reached and the cursor flies to an element the voice has not come to. Restated here,
+        // the first word reported in this step's own space takes it from zero.
+        if speechSegmentIndex == speechSegmentCountBeforeTheStepNowStreaming {
+            lastNarrationWordEndOffsetInSpokenText = 0
+        }
         isSpeakingReply = true
         // `voiceState` follows from that write alone: a segment handed over is not yet a sound, so a
         // reply still waiting for its first one stays `.processing` — see `voiceStateTheFactsSupport`.
@@ -3944,9 +4649,11 @@ final class CompanionManager: ObservableObject {
             // The index is re-checked because a reply that arrived in the meantime has taken the
             // voice, and this segment is no longer part of what is being said.
             guard self.isSpeakingReply, self.currentSpeechSegmentIndex == speechSegmentIndex else { return }
-            // Armed once, on the first segment: it asks whether this voice has said anything at
-            // all, and by the end of the first segment the answer is in.
-            if speechSegmentIndex == 0 {
+            // Armed once per step, on its first segment: it asks whether this voice has said
+            // anything at all, and by the end of the first segment the answer is in. Per step and
+            // not per turn because the answer it reads, `hasNarrationReportedAnyWords`, is cleared
+            // where a step's tour is armed — so the count it asks about starts again at every step.
+            if speechSegmentIndex == self.speechSegmentCountBeforeTheStepNowStreaming {
                 self.schedulePointingTourFallbackIfNarrationIsSilent()
             }
         }
@@ -3967,6 +4674,10 @@ final class CompanionManager: ObservableObject {
             shouldReturnBuddyToCursorAfterPointing = true
         }
         requestBuddyReturnHome()
+
+        // The voice is what holds a step back from being followed by the next one, so the step that
+        // has just become speakable-through is the other half of that join and has to say so.
+        finishTheStepIfEverythingItAskedForIsDone()
     }
 
     /// Tells the cursor to come home and resume following, on every screen.
@@ -4014,24 +4725,34 @@ final class CompanionManager: ObservableObject {
         // is nowhere: an empty assistant message would teach the model that answering with nothing works.
         let replyAsItStands = streamingReplySegmenter?.spokenTextAsItStands() ?? ""
         guard !replyAsItStands.isEmpty else { return }
+        let replyAsTheModelWroteIt = streamingReplySegmenter?.rawTextAsItStands() ?? ""
 
         hasWrittenTheCurrentTurnIntoHistory = true
+        dateOfTheLastActivityInTheConversation = Date()
         conversationHistory.append((
+            turnIdentifier: turnIdentifierOfTheTurnBeingAnswered,
             userTranscript: transcriptOfTheTurnBeingAnswered,
             assistantResponse: replyAsItStands
                 + (interruption?.markerAppendedToTheHistoryEntry ?? "")
         ))
 
-        // Where the history is actually bounded by `maximumExchangeCountCarriedInHistory`.
-        if conversationHistory.count > Self.maximumExchangeCountCarriedInHistory {
-            conversationHistory.removeFirst(
-                conversationHistory.count - Self.maximumExchangeCountCarriedInHistory
-            )
+        // Where the history is actually bounded by `maximumExchangeCountCarriedInHistory`. Dropped
+        // one entry at a time and never past the turn in progress, so a turn's steps leave together
+        // whatever the count is: cutting at the count alone would evict the question being answered
+        // the moment a search passed fifteen steps, and the rest of the session behind it.
+        while conversationHistory.count > Self.maximumExchangeCountCarriedInHistory,
+              conversationHistory.first?.turnIdentifier != turnIdentifierOfTheTurnBeingAnswered {
+            conversationHistory.removeFirst()
         }
 
         print("🧠 History \(conversationHistory.count) exchange(s) — 问 "
               + "\(transcriptOfTheTurnBeingAnswered.count) 字 / 答 \(replyAsItStands.count) 字"
               + (interruption == nil ? "" : "（中断）"))
+
+        // The step's own words, tags and all: the raw text is the only account of why a turn stopped asking
+        // to look again, and a tag the parser did not recognise is invisible in the spoken text the history
+        // keeps — the step would read as having had nothing to ask for.
+        print("💬 Step reply as the model wrote it: \(replyAsTheModelWroteIt)")
     }
 
     /// Writes off the reply being spoken. For a reply that was replaced, or one the app is done with — the
@@ -4042,8 +4763,13 @@ final class CompanionManager: ObservableObject {
     /// the one thing here that grows without bound. The cursor *is* sent home from here, because a reply
     /// that failed or was replaced reaches only this path.
     ///
+    /// This writes off the whole **turn's** narration, not one step's, which is why the only callers
+    /// are the ones that replace or end a turn. `beginStreamingReply` reaches it too, but only when
+    /// the voice has already fallen silent — a step boundary must not cut a sentence still being
+    /// spoken, and its segments are appended to the turn's list rather than replacing it.
+    ///
     /// - Parameter settlingTheVoiceState: Whether writing the reply off also ends the turn the panel shows.
-    ///   False only for `beginStreamingReply`, which runs inside the new turn, where the caller has already
+    ///   False for `beginStreamingReply`, which runs inside the new turn, where the caller has already
     ///   armed this turn's facts; clearing them here would put the spinner out for the whole reply.
     private func abandonSpeakingReply(settlingTheVoiceState: Bool = true) {
         isSpeakingReply = false
@@ -4054,7 +4780,7 @@ final class CompanionManager: ObservableObject {
             isWaitingForTheFirstSoundOfTheReply = false
             isProducingAReply = false
         }
-        speechSegments = []
+        speechSegmentsOfTheTurnBeingSpoken = []
         currentSpeechSegmentIndex = 0
         hasCurrentSpeechSegmentFinishedSpeaking = false
         lastNarrationWordEndOffsetInSpokenText = 0
@@ -4094,7 +4820,9 @@ final class CompanionManager: ObservableObject {
     /// A cancelled segment reports nothing and so releases nothing: it was cut off, and how much of it was
     /// heard is not something the voice can say.
     private func handlePlaybackFinished() {
-        guard isSpeakingReply, currentSpeechSegmentIndex < speechSegments.count else { return }
+        guard isSpeakingReply,
+              currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count
+        else { return }
         markCurrentSpeechSegmentAsSpokenThrough()
     }
 
@@ -4274,7 +5002,15 @@ final class CompanionManager: ObservableObject {
         // the same screenshot the starting point was, which clamps it to that screen's bounds.
         let dragDestinationScreenLocation = pointingTourStop.dragDestinationScreenLocation
 
+        // Counted here rather than where the task reports back, because the two ends of the join are
+        // counted by different code: the step is over when as many reports have come back as were
+        // asked for, and a silent turn's cursor is the only thing that would ever ask this again.
+        stepInProgress.numberOfActionsAskedFor += 1
+        let thisStepIdentifier = turnIdentifierOfTheReplyBeingStreamed
+
         Task {
+            // Every arm below ends by reporting what it did, and the report is what the step is
+            // waiting for — so each one says so whether it reached the screen or not.
             switch action {
             case .press(let clickKind):
                 // Played before the click, and only for a click that will actually go out: asking the refusal
@@ -4293,6 +5029,12 @@ final class CompanionManager: ObservableObject {
                 )
 
                 print("🖱 \(clickKind) at stop \(stopIndex): \(clickOutcome)")
+                recordWhatAnActionOfTheStepDid(
+                    clickOutcome,
+                    action: action,
+                    elementLabel: elementLabel,
+                    identifiedBy: thisStepIdentifier
+                )
 
             case .scroll(let direction, let distance):
                 // Nothing is played: the click's sound is feedback for a press, and a scroll presses
@@ -4306,6 +5048,12 @@ final class CompanionManager: ObservableObject {
                 )
 
                 print("🖱 \(direction) \(distance) at stop \(stopIndex): \(scrollOutcome)")
+                recordWhatAnActionOfTheStepDid(
+                    scrollOutcome,
+                    action: action,
+                    elementLabel: elementLabel,
+                    identifiedBy: thisStepIdentifier
+                )
 
             case .drag:
                 // Nothing is played, for the scroll's reason: what moves is its own feedback.
@@ -4316,6 +5064,12 @@ final class CompanionManager: ObservableObject {
                 )
 
                 print("🖱 drag at stop \(stopIndex): \(dragOutcome)")
+                recordWhatAnActionOfTheStepDid(
+                    dragOutcome,
+                    action: action,
+                    elementLabel: elementLabel,
+                    identifiedBy: thisStepIdentifier
+                )
 
                 // The one place a model-asked-for drag ends, and the only action that ends after the
                 // arrival rather than at it: the flight the arrival deliberately left open is closed
@@ -4325,6 +5079,124 @@ final class CompanionManager: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Notes what one action of the step in progress did, in the order the model asked for them.
+    ///
+    /// The report is what the next step is told, so it is written as a sentence the model reads —
+    /// 「已点击「确定」。」 or 「「确定」没做成：点击没能发出去。」 — rather than as the outcome value the
+    /// terminal is answered with. The two audiences want different things from the same fact: a
+    /// terminal is told what happened so a script can branch on it, while the model is told it about
+    /// the element it named, because the element is the only thing in the sentence it can look for
+    /// on the next picture and the coordinate means nothing to it written down.
+    ///
+    /// Dropped for a step that is no longer the one in progress: a click takes as long as it takes,
+    /// and a tour called off while one was in the air would otherwise have its report attributed to
+    /// whatever step happens to be running by the time it lands.
+    private func recordWhatAnActionOfTheStepDid(
+        _ outcome: ElementClickOutcome,
+        action: ElementActionOnArrival,
+        elementLabel: String?,
+        identifiedBy stepIdentifier: UUID
+    ) {
+        recordWhatAnActionOfTheStepDid(
+            sentence: sentenceTellingTheModelWhatItsActionDid(action, toElementLabel: elementLabel, orTheFailure: outcome.isASuccess ? nil : Self.sentenceForAnActionOutcome(outcome)),
+            didItReachTheScreen: outcome.isASuccess,
+            identifiedBy: stepIdentifier
+        )
+    }
+
+    private func recordWhatAnActionOfTheStepDid(
+        _ outcome: ElementScrollOutcome,
+        action: ElementActionOnArrival,
+        elementLabel: String?,
+        identifiedBy stepIdentifier: UUID
+    ) {
+        recordWhatAnActionOfTheStepDid(
+            sentence: sentenceTellingTheModelWhatItsActionDid(action, toElementLabel: elementLabel, orTheFailure: outcome.isASuccess ? nil : Self.sentenceForAnActionOutcome(outcome)),
+            didItReachTheScreen: outcome.isASuccess,
+            identifiedBy: stepIdentifier
+        )
+    }
+
+    private func recordWhatAnActionOfTheStepDid(
+        _ outcome: ElementDragOutcome,
+        action: ElementActionOnArrival,
+        elementLabel: String?,
+        identifiedBy stepIdentifier: UUID
+    ) {
+        recordWhatAnActionOfTheStepDid(
+            sentence: sentenceTellingTheModelWhatItsActionDid(action, toElementLabel: elementLabel, orTheFailure: outcome.isASuccess ? nil : Self.sentenceForAnActionOutcome(outcome)),
+            didItReachTheScreen: outcome.isASuccess,
+            identifiedBy: stepIdentifier
+        )
+    }
+
+    private func recordWhatAnActionOfTheStepDid(
+        sentence: String,
+        didItReachTheScreen: Bool,
+        identifiedBy stepIdentifier: UUID
+    ) {
+        guard isStillTheStepIdentifiedBy(stepIdentifier) else {
+            print("🔁 An action reported back after its step was over: \(sentence)")
+            return
+        }
+
+        stepInProgress.numberOfActionsThatHaveReportedBack += 1
+        stepInProgress.sentencesSayingWhatTheActionDid.append(sentence)
+        stepInProgress.didAnyActionReachTheScreen = stepInProgress.didAnyActionReachTheScreen || didItReachTheScreen
+
+        // The last of them, and the tour may have run out of stops long ago — an action is performed
+        // while its flight is still open, so this can be the only thing still running.
+        finishTheStepIfEverythingItAskedForIsDone()
+    }
+
+    /// Whether the step being reported on is still the step in progress.
+    ///
+    /// The turn identifier is what the streaming reply already uses to recognise a chunk that arrived
+    /// after the turn it belonged to was replaced; a step is a turn's worth of work, so one identifier
+    /// answers both. It moves when the next step is asked for and when a new question arrives.
+    private func isStillTheStepIdentifiedBy(_ stepIdentifier: UUID) -> Bool {
+        stepIdentifier == turnIdentifierOfTheReplyBeingStreamed
+    }
+
+    /// What the model is told its own action did.
+    ///
+    /// Built on the same completion phrase the terminal is answered with — 「已点击」, 「已双击」,
+    /// 「已往下滚 3 屏：」 — rather than on a second pool written for the model, because the whole point
+    /// of that pool is that a gesture's name is decided in one place: two pools would let a gesture
+    /// added later be named for one audience and described only approximately for the other. Only the
+    /// object of the sentence differs, and it has to: a terminal may be a script looking for which
+    /// occurrence was pressed, while an occurrence is not a thing the model can do anything with. An
+    /// action with no label — the model's tag may name a scroll by direction alone — is called
+    /// 那个元素, because a sentence about nothing is worse than a vague one.
+    private func sentenceTellingTheModelWhatItsActionDid(
+        _ action: ElementActionOnArrival,
+        toElementLabel elementLabel: String?,
+        orTheFailure failureSentence: String?
+    ) -> String {
+        let elementName = elementLabel.map { "「\($0)」" } ?? "那个元素"
+        guard let failureSentence else {
+            return Self.completionPhraseForTheAction(action) + elementName + "。"
+        }
+        return elementName + "没做成：" + failureSentence
+    }
+
+    /// The prompt for a step that follows the model's own actions.
+    ///
+    /// It is written as a report and not as a question, because that is what it is: the user asked
+    /// once, and everything after the first step is Kiki telling the model what happened. The prompt
+    /// names the picture as the one taken after the actions, without which a model that sees a screen
+    /// different from the one its reply was written against has no way to know why.
+    private static func promptForTheStepAfterTheModelsOwnActions(
+        sentencesSayingWhatTheyDid: [String]
+    ) -> String {
+        var prompt = "（你上一步的动作结果："
+        prompt += sentencesSayingWhatTheyDid.isEmpty
+            ? "没有一步操作成功。"
+            : sentencesSayingWhatTheyDid.joined()
+        prompt += " 截图是这些动作之后的画面。接着说给用户听，别回应这条说明。）"
+        return prompt
     }
 
     /// Drags from one point to another for the user, with the cursor drawn following it.
@@ -4386,6 +5258,11 @@ final class CompanionManager: ObservableObject {
         // on, and nothing else will notice when it runs out.
         schedulePointingTourDwellCompletion()
         continuePointingTourIfPossible()
+
+        // The tour running out of stops is one of the four things that can finish a step, and in a
+        // silent turn it is the last of them: with no voice to wait on, the segment walk runs
+        // itself out long before the cursor has visited everything the reply named.
+        finishTheStepIfEverythingItAskedForIsDone()
     }
 
     /// Pokes the tour once the cursor has spent its minimum time on the stop it landed on.

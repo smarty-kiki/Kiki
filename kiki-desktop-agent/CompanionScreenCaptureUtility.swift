@@ -51,8 +51,107 @@ enum CompanionScreenCaptureUtility {
         }
     }
 
+    /// The directory every screenshot is written to, when `KIKI_SAVE_CAPTURES` names one.
+    ///
+    /// A diagnostic switch, unset in normal use. The picture a reply was written against is gone
+    /// the moment the next step captures over it, so a click that landed on the wrong occurrence —
+    /// or on nothing at all — cannot be explained after the fact without it.
+    private static let directoryToSaveCapturesIn = ProcessInfo.processInfo.environment["KIKI_SAVE_CAPTURES"]
+
+    /// Writes the saved screenshots, in the order they were taken.
+    ///
+    /// Serial and off the main actor for the reasons the encode is: the write is tens of
+    /// milliseconds and the overlay animates while it happens, and a run of captures read back as
+    /// a timeline is worth more than the writes overlapped are.
+    private static let captureSavingQueue = DispatchQueue(
+        label: "com.smarty.kiki.screenshot-saving",
+        qos: .utility
+    )
+
+    /// Numbers the saved screenshots so a log line and a file can be matched up.
+    private static var captureSequenceNumber = 0
+
+    /// Writes one screenshot out, and prints where it went so a log line can be matched to a file.
+    private static func saveCaptureIfAsked(
+        _ jpegData: Data,
+        screenNumber: Int,
+        widthInPixels: Int,
+        heightInPixels: Int
+    ) {
+        guard let directoryToSaveCapturesIn else { return }
+
+        captureSequenceNumber += 1
+        let sequenceNumberText = String(format: "%02d", captureSequenceNumber)
+        let filePath = "\(directoryToSaveCapturesIn)/capture-\(sequenceNumberText)-screen\(screenNumber).jpg"
+
+        captureSavingQueue.async {
+            try? FileManager.default.createDirectory(
+                atPath: directoryToSaveCapturesIn,
+                withIntermediateDirectories: true
+            )
+            try? jpegData.write(to: URL(fileURLWithPath: filePath))
+        }
+        print("🖼️ Screenshot \(sequenceNumberText) screen \(screenNumber) "
+            + "(\(widthInPixels)x\(heightInPixels)) → \(filePath)")
+    }
+
+    /// How long the app keeps looking for a screen that has stopped changing before it looks anyway.
+    ///
+    /// Bounded rather than open-ended because a screen does not always settle: a video, a spinner and a
+    /// progress bar are all still moving at the moment the model needs to see them.
+    private static let millisecondsToWaitForTheScreenToSettle = 2500
+
+    /// The gap between the two captures compared to decide whether the screen has stopped changing.
+    private static let millisecondsBetweenSettleChecks = 250
+
+    /// Captures every connected display once the screen has stopped changing.
+    ///
+    /// A step's screenshot is taken the moment the step before it has finished acting, and a posted
+    /// event returns long before the app receiving it has redrawn. Captured straight away, the picture
+    /// is the screen as it was *before* kiki's own last click — the page may already have navigated
+    /// away — and the model then answers from elements that are no longer there and points at where
+    /// they used to be. Two captures matching byte for byte are this app's own answer to "has the
+    /// screen finished reacting", and the later of the pair is the one worth sending.
+    static func captureAllScreensAsJPEGOnceTheScreenHasSettled() async throws -> [CompanionScreenCapture] {
+        var capturedScreens = try await captureAllScreensAsJPEG(savingCaptures: false)
+        var millisecondsWaited = 0
+
+        while millisecondsWaited < millisecondsToWaitForTheScreenToSettle {
+            try await Task.sleep(for: .milliseconds(millisecondsBetweenSettleChecks))
+            millisecondsWaited += millisecondsBetweenSettleChecks
+
+            let recapturedScreens = try await captureAllScreensAsJPEG(savingCaptures: false)
+            let hasTheScreenStoppedChanging = recapturedScreens.map(\.imageData)
+                == capturedScreens.map(\.imageData)
+            capturedScreens = recapturedScreens
+
+            if hasTheScreenStoppedChanging { break }
+            // Worth a line: it is the difference between a screenshot that shows what the last
+            // action did and one that shows the screen as it was before it, and from outside the
+            // app that difference is an unexplained few hundred milliseconds.
+            print("⏳ Screen still changing \(millisecondsWaited)ms in — waiting for it to settle")
+        }
+
+        // Saved on its way out rather than inside the loop: the rounds above are checks, and only the
+        // picture the model is actually sent belongs in the diagnostic record.
+        for (displayIndex, screenCapture) in capturedScreens.enumerated() {
+            saveCaptureIfAsked(
+                screenCapture.imageData,
+                screenNumber: displayIndex + 1,
+                widthInPixels: screenCapture.screenshotWidthInPixels,
+                heightInPixels: screenCapture.screenshotHeightInPixels
+            )
+        }
+
+        return capturedScreens
+    }
+
     /// Captures every connected display as JPEG data, labeled with whether the cursor is on it.
-    static func captureAllScreensAsJPEG() async throws -> [CompanionScreenCapture] {
+    ///
+    /// `savingCaptures` is off for the repeat captures `captureAllScreensAsJPEGOnceTheScreenHasSettled`
+    /// makes to watch the screen settle, which are throwaways and would otherwise double every entry in
+    /// the diagnostic record and renumber the ones that matter.
+    static func captureAllScreensAsJPEG(savingCaptures: Bool = true) async throws -> [CompanionScreenCapture] {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
         guard !content.displays.isEmpty else {
@@ -101,6 +200,14 @@ enum CompanionScreenCaptureUtility {
             let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows)
 
             let configuration = SCStreamConfiguration()
+            // The pointer is deliberately left out of the picture. By the time a step's screenshot is
+            // taken it is kiki's own puppet — every flight that acts carries it onto the element it is
+            // about to press — so it comes to rest on the very label the app has to read back off the
+            // screen, and it is drawn *over* that label. A two-character chinese caption with an arrow
+            // across half of it disappears from the recognized lines altogether: the label stops
+            // matching, the click falls back to the model's own estimate, and the one mechanism that
+            // exists to aim a click at an element stops applying to the element just used.
+            configuration.showsCursor = false
             let maxDimension = 1280
             let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
             if display.width >= display.height {
@@ -153,6 +260,15 @@ enum CompanionScreenCaptureUtility {
                 screenshotWidthInPixels: capturedWidthInPixels,
                 screenshotHeightInPixels: capturedHeightInPixels
             ))
+
+            if savingCaptures {
+                saveCaptureIfAsked(
+                    jpegData,
+                    screenNumber: displayIndex + 1,
+                    widthInPixels: capturedWidthInPixels,
+                    heightInPixels: capturedHeightInPixels
+                )
+            }
         }
 
         guard !capturedScreens.isEmpty else {

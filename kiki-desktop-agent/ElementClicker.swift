@@ -103,15 +103,34 @@ extension ElementScrollDirection: CustomStringConvertible {
 /// asks for it here.
 enum ElementScrollDistance: Equatable {
     /// A number of screenfuls, as a tag or a terminal counts them.
-    case screenfuls(Int)
+    ///
+    /// Fractional, in steps of half a screenful. A whole screen takes everything the reader was
+    /// following off the display, so what they were reading is gone and the line they were looking
+    /// for is as likely to be in the part that just went past as in the part that arrived — half a
+    /// screen is the distance that keeps it. Whole screenfuls are the special case, not the unit.
+    case screenfuls(CGFloat)
     /// A distance in points, as a wheel event reports it.
     case points(CGFloat)
+
+    /// A screenful count as it is written out: `0.5` and `1.5` keep their fraction, and a whole
+    /// count reads `1` rather than the `1.0` a `CGFloat` prints on its own.
+    ///
+    /// Shared rather than written twice, because the sentence a terminal is answered with and the
+    /// bubble over the cursor are both made from it and 「往下滚 1 屏」 must not come out as
+    /// 「往下滚 1.0 屏」 in one of them.
+    static func screenfulsAsText(_ screenfuls: CGFloat) -> String {
+        let wholeScreenfuls = screenfuls.rounded()
+        if screenfuls == wholeScreenfuls {
+            return String(Int(wholeScreenfuls))
+        }
+        return String(Double(screenfuls))
+    }
 }
 
 extension ElementScrollDistance: CustomStringConvertible {
     var description: String {
         switch self {
-        case .screenfuls(let count): return "\(count) screenful(s)"
+        case .screenfuls(let count): return "\(Self.screenfulsAsText(count)) screenful(s)"
         case .points(let points): return "\(Int(points.rounded())) point(s)"
         }
     }
@@ -180,6 +199,22 @@ enum ElementClickOutcome {
     case refusedBecauseTheLabelLooksDestructive(matchedWord: String)
 }
 
+extension ElementClickOutcome {
+    /// Whether the click actually went out, which is the one thing a caller that is not the terminal
+    /// can do anything with: a refusal and a failed post are both "the screen is unchanged".
+    ///
+    /// A `switch` over every case rather than a comparison against `.clicked`, so a case added later
+    /// fails to build here instead of silently reading as a failure.
+    var isASuccess: Bool {
+        switch self {
+        case .clicked: return true
+        case .failedToPostTheClick, .refusedBecauseTheTagCarriedNoLabel,
+             .refusedBecauseAccessibilityIsNotEnabled, .refusedBecauseTheLabelLooksDestructive:
+            return false
+        }
+    }
+}
+
 extension ElementClickOutcome: CustomStringConvertible {
     var description: String {
         switch self {
@@ -211,6 +246,16 @@ enum ElementScrollOutcome {
     case refusedBecauseAccessibilityIsNotEnabled
 }
 
+extension ElementScrollOutcome {
+    /// Whether the scroll actually went out. See `ElementClickOutcome.isASuccess`.
+    var isASuccess: Bool {
+        switch self {
+        case .scrolled: return true
+        case .failedToPostTheScroll, .refusedBecauseAccessibilityIsNotEnabled: return false
+        }
+    }
+}
+
 extension ElementScrollOutcome: CustomStringConvertible {
     var description: String {
         switch self {
@@ -239,6 +284,18 @@ enum ElementDragOutcome {
     case refusedBecauseNoDestinationWasNamed
     /// Accessibility is not granted. Synthesising an event needs it.
     case refusedBecauseAccessibilityIsNotEnabled
+}
+
+extension ElementDragOutcome {
+    /// Whether the drag actually went out. See `ElementClickOutcome.isASuccess`.
+    var isASuccess: Bool {
+        switch self {
+        case .dragged: return true
+        case .failedToPostTheDrag, .refusedBecauseNoDestinationWasNamed,
+             .refusedBecauseAccessibilityIsNotEnabled:
+            return false
+        }
+    }
 }
 
 extension ElementDragOutcome: CustomStringConvertible {
@@ -573,6 +630,13 @@ enum ElementScroller {
     /// fifth left over is what makes the next screenful read as movement rather than as a new page.
     private static let fractionOfTheDisplayOneScreenfulCovers: CGFloat = 0.8
 
+    /// The smallest distance one request can carry, in screenfuls.
+    ///
+    /// Half a screen, and it is a floor rather than a value the callers are merely expected to stay
+    /// above: a request for half a screen clamped up to a whole one is precisely the scroll the
+    /// request was made to avoid, and it would happen silently.
+    static let smallestScreenfulsInOneRequest: CGFloat = 0.5
+
     /// The most screenfuls one request can carry.
     ///
     /// Twenty screens is already past the end of anything a person reads on a display, so a larger
@@ -676,19 +740,28 @@ enum ElementScroller {
     /// The whole distance broken into one wheel event per screenful, with what is left over as an
     /// event of its own.
     ///
-    /// A recorded distance is the only one that is not a whole number of screenfuls, and it is kept
-    /// exact rather than rounded: fifty points goes out as fifty points, because a recording
-    /// replayed at a different size is not a recording of what the user did. It is bounded in its
-    /// own unit, at the same total the screenful form is bounded at, so a flung scroll carrying a
-    /// thousand points cannot become a hundred events.
+    /// The leftover event is what carries a fractional request: `:x2.5` goes out as two screenfuls
+    /// and one of half, so a distance that is not a whole number reads as one gesture of that length
+    /// rather than being rounded up into a longer one. A recorded distance is kept exact for the
+    /// same reason — fifty points goes out as fifty points, because a recording replayed at a
+    /// different size is not a recording of what the user did. It is bounded in its own unit, at the
+    /// same total the screenful form is bounded at, so a flung scroll carrying a thousand points
+    /// cannot become a hundred events.
     private static func pointsOfEachWheelEvent(
         for distance: ElementScrollDistance,
         pointsPerScreenful: CGFloat
     ) -> [CGFloat] {
         switch distance {
         case .screenfuls(let screenfuls):
-            let numberOfScreenfuls = min(max(screenfuls, 1), mostScreenfulsInOneRequest)
-            return Array(repeating: pointsPerScreenful, count: numberOfScreenfuls)
+            var screenfulsLeft = min(max(screenfuls, smallestScreenfulsInOneRequest),
+                                     CGFloat(mostScreenfulsInOneRequest))
+            var pointsOfEachEvent: [CGFloat] = []
+            while screenfulsLeft > 0 {
+                let screenfulsThisEvent = min(screenfulsLeft, 1)
+                pointsOfEachEvent.append(screenfulsThisEvent * pointsPerScreenful)
+                screenfulsLeft -= screenfulsThisEvent
+            }
+            return pointsOfEachEvent
 
         case .points(let points):
             // A floor of one point: below that the event rounds to a delta that moves nothing, and

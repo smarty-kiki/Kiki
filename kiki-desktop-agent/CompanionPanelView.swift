@@ -22,6 +22,12 @@ struct CompanionPanelView: View {
                 .padding(.horizontal, 16)
 
             if isSetUp {
+                taskProgressSection
+                    .padding(.top, 14)
+
+                Spacer()
+                    .frame(height: 6)
+
                 howToUseKikiSection
                     .padding(.top, 16)
 
@@ -138,6 +144,120 @@ struct CompanionPanelView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - Task Progress
+
+    /// What the task in progress has taken, where it stands, and how close its context is to being
+    /// compressed into a summary.
+    ///
+    /// Read off `taskProgress` rather than worked out here: the estimate walks every character of
+    /// the conversation, and this body re-evaluates on every chunk of the reply.
+    ///
+    /// Absent until there is a task: a panel that says "no task yet" every time it is opened is
+    /// describing nothing, and the row would be there for the whole life of the app without ever
+    /// having anything to say.
+    @ViewBuilder
+    private var taskProgressSection: some View {
+        if companionManager.taskProgress.hasATask {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionHeader("任务")
+
+                taskStatusCard
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    /// The card itself: where the task stands on one line, and how full Kiki's head is on the next.
+    ///
+    /// Tinted and outlined in the accent rather than filled with `surface1` like the cards below it,
+    /// because those three describe ways of talking to Kiki that are always available while this one
+    /// is the task happening now — and it is the blue thing on a panel of grey ones.
+    private var taskStatusCard: some View {
+        let progress = companionManager.taskProgress
+
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(progress.isRunning ? DS.Colors.blue400 : DS.Colors.textTertiary)
+                    .frame(width: 6, height: 6)
+
+                Text(taskStateDescription(of: progress))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                Spacer()
+
+                Text("第 \(progress.roundCount) 件事 · 走了 \(progress.stepCount) 步")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize()
+            }
+
+            HStack(spacing: 8) {
+                contextUseBar(fractionUsed: progress.fractionOfTheRoomBeforeCompressionUsed)
+
+                Text(memoryUseDescription(of: progress))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                .fill(DS.Colors.accentSubtle)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                .stroke(DS.Colors.blue500.opacity(0.35), lineWidth: 0.5)
+        )
+    }
+
+    /// Whether Kiki is still working on the task, and which step of it it is on.
+    private func taskStateDescription(of progress: TaskProgress) -> String {
+        guard progress.isRunning else {
+            // Deliberately 忙完了 rather than a countdown to the idle reset: the task is over as far
+            // as the user is concerned, and the history being kept is what the next question will
+            // continue from rather than something still in progress.
+            return "忙完了"
+        }
+        return "正在忙 · 第 \(progress.stepInTheRoundInProgress) 步"
+    }
+
+    /// How full Kiki's head is, said the way a person would say it rather than the way the
+    /// compression is implemented.
+    ///
+    /// The threshold that makes it "getting full" is the same one the bar changes colour at, so the
+    /// sentence and the bar agree about when that is instead of being two opinions of it.
+    private func memoryUseDescription(of progress: TaskProgress) -> String {
+        let percentUsed = Int(progress.fractionOfTheRoomBeforeCompressionUsed * 100)
+
+        if progress.fractionOfTheRoomBeforeCompressionUsed >= 0.8 {
+            return "脑子快满了 · 只剩 \(100 - percentUsed)%"
+        }
+        return "脑子用了 \(percentUsed)% · 还有 \(100 - percentUsed)% 才满"
+    }
+
+    /// How much of the room there is before the compression, drawn as a bar.
+    ///
+    /// Measured against the trigger rather than against the model's whole window, so a full bar and
+    /// the compression starting are the same moment.
+    private func contextUseBar(fractionUsed: Double) -> some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(DS.Colors.surface3)
+
+                Capsule()
+                    .fill(fractionUsed >= 0.8 ? DS.Colors.warning : DS.Colors.accentText)
+                    .frame(width: geometry.size.width * fractionUsed)
+            }
+        }
+        .frame(height: 4)
     }
 
     // MARK: - Setup Copy

@@ -265,7 +265,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    /// Replaced, never repaired in place: see `theAudioInputDeviceChangedUnderTheAudioEngine()`.
+    private var audioEngine = AVAudioEngine()
+    private var audioEngineConfigurationChangeObserver: NSObjectProtocol?
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -288,6 +290,58 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.transcriptionProviderDisplayName = transcriptionProvider.displayName
         self.transcriptionProviderRequiresSpeechRecognitionPermission = transcriptionProvider.requiresSpeechRecognitionPermission
         super.init()
+        startListeningForTheAudioEngineConfigurationChanging()
+    }
+
+    /// Apple's answer to the input device changing under an engine: the engine is stopped and its
+    /// nodes' formats may have moved, so whatever was connected to it has to be rebuilt. For a
+    /// graph that is only an input node, that means a new engine — see the handler.
+    private func startListeningForTheAudioEngineConfigurationChanging() {
+        audioEngineConfigurationChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: .main
+        ) { [weak self] _ in
+            self?.theAudioInputDeviceChangedUnderTheAudioEngine()
+        }
+    }
+
+    /// The input device changed — a headset connected, one was unplugged — and the engine is
+    /// holding the format of the device it bound to when it started.
+    ///
+    /// It cannot be repaired in place. `inputNode` caches its format from the first time it binds
+    /// to the hardware and goes on reporting that sample rate however the hardware has changed,
+    /// and handing the stale rate to `installTap` is not a Swift error: AVFoundation raises an
+    /// Objective-C exception, which `try` cannot catch and which takes the process down when it
+    /// unwinds through the concurrency frames that started the dictation. A fresh `AVAudioEngine`
+    /// is the only thing that re-reads the format, so the engine is replaced whole — the tap
+    /// installed on it goes with it.
+    private func theAudioInputDeviceChangedUnderTheAudioEngine() {
+        print("🎙️ BuddyDictationManager: the audio configuration changed, rebuilding the audio engine")
+
+        // Read before the rebuild: a session that is still running needs a new tap on the new
+        // engine or it hears nothing for the rest of the dictation. A session still being opened
+        // has no tap yet, and installs its own the moment the provider answers.
+        let wasFeedingAudioToATranscriptionSession = isActivelyRecordingAudio
+            && activeTranscriptionSession != nil
+
+        if let observerOfTheEngineBeingReplaced = audioEngineConfigurationChangeObserver {
+            NotificationCenter.default.removeObserver(observerOfTheEngineBeingReplaced)
+            audioEngineConfigurationChangeObserver = nil
+        }
+        audioEngine.stop()
+        audioEngine = AVAudioEngine()
+        startListeningForTheAudioEngineConfigurationChanging()
+
+        guard wasFeedingAudioToATranscriptionSession else { return }
+
+        do {
+            try startTheAudioEngineTappingTheMicrophone()
+        } catch {
+            print("❌ BuddyDictationManager: could not tap the new input device: \(error)")
+            lastErrorMessage = "麦克风刚换了设备，这次没接上。松开再按一次就好。"
+            cancelCurrentDictation(preserveDraftText: true)
+        }
     }
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
@@ -555,6 +609,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
+        try startTheAudioEngineTappingTheMicrophone()
+    }
+
+    /// Points whichever engine is current at the microphone and starts it.
+    ///
+    /// The format is read here and not any earlier, because the engine that was current when the
+    /// transcription provider was opened is not necessarily the one that is current now: the input
+    /// device can change while that call is in the air, and the engine is replaced when it does.
+    private func startTheAudioEngineTappingTheMicrophone() throws {
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
