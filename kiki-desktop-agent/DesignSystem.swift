@@ -129,7 +129,7 @@ enum DS {
         /// The cursor/bubble color used in OverlayWindow — the triangle, the waveform bars,
         /// the spinner's arc and the bubble fills. Kept distinct from the accent on purpose:
         /// it is the screen overlay's colour, not the in-app UI's.
-        static let overlayCursorBlue = Color(hex: "#BD79FF")
+        static let overlayCursorPurple = Color(hex: "#BD79FF")
 
         /// The color the cursor turns while it is carrying the user's mouse to a click.
         ///

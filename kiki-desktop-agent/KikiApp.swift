@@ -38,9 +38,6 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 
-        KikiAnalytics.configure()
-        KikiAnalytics.trackAppOpened()
-
         menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
         companionManager.start()
         // Auto-open the panel if the user still has something to do: onboarding, or permissions.

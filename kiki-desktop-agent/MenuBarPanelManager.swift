@@ -319,7 +319,7 @@ final class MenuBarPanelManager: NSObject {
                 switch phase {
                 case .cursorRestingInIcon:
                     button.image = self.makeKikiMenuBarIcon(
-                        fillColor: NSColor(DS.Colors.overlayCursorBlue),
+                        fillColor: NSColor(DS.Colors.overlayCursorPurple),
                         glowBlurRadius: 4
                     )
                     // A template image is the system's to tint, and it would recolour this one back

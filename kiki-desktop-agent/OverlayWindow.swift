@@ -2,7 +2,7 @@
 //  OverlayWindow.swift
 //  kiki-desktop-agent
 //
-//  System-wide transparent overlay for the blue cursor: one window per display.
+//  System-wide transparent overlay for the purple cursor: one window per display.
 //
 
 import AppKit
@@ -104,10 +104,10 @@ enum BuddyNavigationMode {
     }
 }
 
-// SwiftUI view for the blue glowing cursor pointer, one per screen. The view checks whether the
+// SwiftUI view for the purple glowing cursor pointer, one per screen. The view checks whether the
 // cursor is on THIS screen and only shows the buddy triangle when it is; during a voice
 // interaction the triangle is replaced by a waveform, spinner or streaming text bubble.
-struct BlueCursorView: View {
+struct CursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
     @ObservedObject var companionManager: CompanionManager
@@ -126,8 +126,8 @@ struct BlueCursorView: View {
         let localX = mouseLocation.x - screenFrame.origin.x
         let localY = screenFrame.height - (mouseLocation.y - screenFrame.origin.y)
         _cursorPosition = State(initialValue: CGPoint(
-            x: localX + BlueCursorView.followingOffsetFromPointer.x,
-            y: localY + BlueCursorView.followingOffsetFromPointer.y
+            x: localX + CursorView.followingOffsetFromPointer.x,
+            y: localY + CursorView.followingOffsetFromPointer.y
         ))
         _isCursorOnThisScreen = State(initialValue: screenFrame.contains(mouseLocation))
     }
@@ -148,7 +148,7 @@ struct BlueCursorView: View {
     private static let restingTriangleRotationDegrees = -35.0
 
     /// Rest at `restingTriangleRotationDegrees`; faces the direction of travel while flying.
-    @State private var triangleRotationDegrees: Double = BlueCursorView.restingTriangleRotationDegrees
+    @State private var triangleRotationDegrees: Double = CursorView.restingTriangleRotationDegrees
 
     /// Where the triangle's tip sits relative to the point `.position(cursorPosition)` places the
     /// view at, with the resting rotation applied. The tip, not the frame centre, has to land on an
@@ -158,7 +158,7 @@ struct BlueCursorView: View {
         let triangleFrameEdgeLength: CGFloat = 16
         let triangleHeight = triangleFrameEdgeLength * sqrt(3.0) / 2.0
         let tipOffsetBeforeRotation = CGPoint(x: 0, y: -(triangleHeight / 1.5))
-        let restingRotationRadians = BlueCursorView.restingTriangleRotationDegrees * .pi / 180
+        let restingRotationRadians = CursorView.restingTriangleRotationDegrees * .pi / 180
         // Positive angles rotate clockwise in SwiftUI's y-down space, so the standard
         // rotation matrix applies unchanged.
         return CGPoint(
@@ -211,7 +211,7 @@ struct BlueCursorView: View {
 
     /// How the user is told Kiki is about to act where the cursor is standing.
     private var cursorColor: Color {
-        isAboutToPerformAnAction ? DS.Colors.overlayCursorClickRed : DS.Colors.overlayCursorBlue
+        isAboutToPerformAnAction ? DS.Colors.overlayCursorClickRed : DS.Colors.overlayCursorPurple
     }
 
     /// Whether the user's own hands are being watched, which is what the record dot replaces the
@@ -227,7 +227,7 @@ struct BlueCursorView: View {
     /// rather than a reach for the mouse, since the buddy already stands here.
     static let followingOffsetFromPointer = CGPoint(x: 35, y: 25)
 
-    /// How long the triangle takes to fade between blue and red. Only the colour is on this clock —
+    /// How long the triangle takes to fade between purple and red. Only the colour is on this clock —
     /// the mouse changes hands at the two moments the flight does, not a quarter of a second later.
     static let cursorClickColourFadeDuration: Double = 0.28
 
@@ -372,8 +372,8 @@ struct BlueCursorView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
+                            .fill(DS.Colors.overlayCursorPurple)
+                            .shadow(color: DS.Colors.overlayCursorPurple.opacity(0.5), radius: 6, x: 0, y: 0)
                     )
                     .fixedSize()
                     .overlay(
@@ -418,8 +418,8 @@ struct BlueCursorView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
+                            .fill(DS.Colors.overlayCursorPurple)
+                            .shadow(color: DS.Colors.overlayCursorPurple.opacity(0.5), radius: 6, x: 0, y: 0)
                     )
                     .fixedSize()
                     .overlay(
@@ -447,9 +447,9 @@ struct BlueCursorView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
+                            .fill(DS.Colors.overlayCursorPurple)
                             .shadow(
-                                color: DS.Colors.overlayCursorBlue.opacity(0.5 + (1.0 - navigationBubbleScale) * 1.0),
+                                color: DS.Colors.overlayCursorPurple.opacity(0.5 + (1.0 - navigationBubbleScale) * 1.0),
                                 radius: 6 + (1.0 - navigationBubbleScale) * 16,
                                 x: 0, y: 0
                             )
@@ -472,7 +472,20 @@ struct BlueCursorView: View {
                     }
             }
 
-            // Blue triangle cursor — idle or responding. Following uses a spring; navigation must
+            // The voice, drawn as light around the cursor rather than as a separate indicator: what
+            // it is measuring is the sound coming out of Kiki, and the cursor is where Kiki is.
+            CursorVoiceGlowView(
+                voiceLoudnessMeter: companionManager.voiceLoudnessMeter,
+                cursorColor: cursorColor,
+                cursorPosition: cursorPosition,
+                flightScale: buddyFlightScale,
+                buddyNavigationMode: buddyNavigationMode,
+                opacity: buddyIsVisibleOnThisScreen && !isRecordingWhatTheUserIsDoing
+                    && (companionManager.voiceState == .idle || companionManager.voiceState == .responding)
+                    ? cursorOpacity : 0
+            )
+
+            // Purple triangle cursor — idle or responding. Following uses a spring; navigation must
             // carry no implicit animation, since the bezier timer drives the position at 60fps.
             Triangle()
                 .fill(cursorColor)
@@ -496,7 +509,7 @@ struct BlueCursorView: View {
                 // Taken and given back as a fade rather than a cut, so the pointer changing hands
                 // reads as the buddy taking hold of it. Both moments happen while it is moving.
                 .animation(
-                    .easeInOut(duration: BlueCursorView.cursorClickColourFadeDuration),
+                    .easeInOut(duration: CursorView.cursorClickColourFadeDuration),
                     value: isAboutToPerformAnAction
                 )
 
@@ -510,8 +523,8 @@ struct BlueCursorView: View {
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
 
-            // Blue waveform — replaces the triangle while listening
-            BlueCursorWaveformView(
+            // Cursor waveform — replaces the triangle while listening
+            CursorWaveformView(
                 audioPowerLevel: companionManager.currentAudioPowerLevel,
                 isOnScreen: buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening
             )
@@ -520,8 +533,8 @@ struct BlueCursorView: View {
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
-            // Blue spinner — shown while the AI is processing.
-            BlueCursorSpinnerView(
+            // Cursor spinner — shown while the AI is processing.
+            CursorSpinnerView(
                 isOnScreen: buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing
             )
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
@@ -538,8 +551,8 @@ struct BlueCursorView: View {
 
             let swiftUIPosition = convertScreenPointToSwiftUICoordinates(mouseLocation)
             self.cursorPosition = CGPoint(
-                x: swiftUIPosition.x + BlueCursorView.followingOffsetFromPointer.x,
-                y: swiftUIPosition.y + BlueCursorView.followingOffsetFromPointer.y
+                x: swiftUIPosition.x + CursorView.followingOffsetFromPointer.x,
+                y: swiftUIPosition.y + CursorView.followingOffsetFromPointer.y
             )
 
             startTrackingCursor()
@@ -681,8 +694,8 @@ struct BlueCursorView: View {
 
             let swiftUIPosition = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
             let followedPosition = CGPoint(
-                x: swiftUIPosition.x + BlueCursorView.followingOffsetFromPointer.x,
-                y: swiftUIPosition.y + BlueCursorView.followingOffsetFromPointer.y
+                x: swiftUIPosition.x + CursorView.followingOffsetFromPointer.x,
+                y: swiftUIPosition.y + CursorView.followingOffsetFromPointer.y
             )
             if followedPosition != self.cursorPosition {
                 self.cursorPosition = followedPosition
@@ -730,8 +743,8 @@ struct BlueCursorView: View {
         // Place the triangle so its tip — not the center of its 16×16 frame — lands on the element,
         // by offsetting the frame by the negative of the tip's own offset.
         let offsetTarget = CGPoint(
-            x: targetInSwiftUI.x - BlueCursorView.triangleTipOffsetFromFrameCenter.x,
-            y: targetInSwiftUI.y - BlueCursorView.triangleTipOffsetFromFrameCenter.y
+            x: targetInSwiftUI.x - CursorView.triangleTipOffsetFromFrameCenter.x,
+            y: targetInSwiftUI.y - CursorView.triangleTipOffsetFromFrameCenter.y
         )
 
         // Clamp to the screen bounds, so the arc's endpoint stays on this display.
@@ -749,7 +762,7 @@ struct BlueCursorView: View {
 
         // What this flight does was decided by the manager before it published the location, and it
         // is two questions rather than one. A stop Kiki is only going to point at is a plain arc and
-        // stays blue; a stop it is going to act on turns red on the way, and then the action's own
+        // stays purple; a stop it is going to act on turns red on the way, and then the action's own
         // answer decides whether the user's pointer comes along.
         guard companionManager.pointingTarget?.actionToPerformOnArrival != nil else {
             // The run, if there was one, ends here: this stop will not be acted on, so the pointer
@@ -811,7 +824,7 @@ struct BlueCursorView: View {
 
         animateBezierFlightArc(
             to: pointerInSwiftUI,
-            durationRange: BlueCursorView.pointerCarryingFlightDuration
+            durationRange: CursorView.pointerCarryingFlightDuration
         ) {
             onArrival()
         }
@@ -837,7 +850,7 @@ struct BlueCursorView: View {
 
         animateBezierFlightArc(
             to: swiftUIPosition,
-            durationRange: BlueCursorView.pointerCarryingFlightDuration,
+            durationRange: CursorView.pointerCarryingFlightDuration,
             onEachFrame: { positionInSwiftUI in
                 self.moveThePointerUnder(swiftUIPosition: positionInSwiftUI)
             }
@@ -966,7 +979,7 @@ struct BlueCursorView: View {
 
         // Back to the resting angle now that we have arrived, which is the orientation
         // `triangleTipOffsetFromFrameCenter` describes.
-        triangleRotationDegrees = BlueCursorView.restingTriangleRotationDegrees
+        triangleRotationDegrees = CursorView.restingTriangleRotationDegrees
 
         // Starts small for the scale-bounce entrance.
         navigationBubbleText = ""
@@ -1059,8 +1072,8 @@ struct BlueCursorView: View {
         let mouseLocation = NSEvent.mouseLocation
         let cursorInSwiftUI = convertScreenPointToSwiftUICoordinates(mouseLocation)
         let cursorWithTrackingOffset = CGPoint(
-            x: cursorInSwiftUI.x + BlueCursorView.followingOffsetFromPointer.x,
-            y: cursorInSwiftUI.y + BlueCursorView.followingOffsetFromPointer.y
+            x: cursorInSwiftUI.x + CursorView.followingOffsetFromPointer.x,
+            y: cursorInSwiftUI.y + CursorView.followingOffsetFromPointer.y
         )
 
         cursorPositionWhenNavigationStarted = cursorInSwiftUI
@@ -1109,7 +1122,7 @@ struct BlueCursorView: View {
         navigationAnimationTimer = nil
         buddyNavigationMode = .followingCursor
         isReturningToCursor = false
-        triangleRotationDegrees = BlueCursorView.restingTriangleRotationDegrees
+        triangleRotationDegrees = CursorView.restingTriangleRotationDegrees
         buddyFlightScale = 1.0
         navigationBubbleText = ""
         navigationBubbleOpacity = 0.0
@@ -1146,7 +1159,7 @@ struct BlueCursorView: View {
     /// itself fades out where it stands.
     private func settleIntoStatusItemIcon() {
         buddyNavigationMode = .mergedIntoStatusItemIcon
-        triangleRotationDegrees = BlueCursorView.restingTriangleRotationDegrees
+        triangleRotationDegrees = CursorView.restingTriangleRotationDegrees
         companionManager.cursorDidLandOnStatusItemIcon()
 
         withAnimation(.easeOut(duration: 0.3)) {
@@ -1182,8 +1195,8 @@ struct BlueCursorView: View {
         // the cursor lands beside wherever the user has got to.
         let pointerInSwiftUI = convertScreenPointToSwiftUICoordinates(NSEvent.mouseLocation)
         let standingPosition = CGPoint(
-            x: pointerInSwiftUI.x + BlueCursorView.followingOffsetFromPointer.x,
-            y: pointerInSwiftUI.y + BlueCursorView.followingOffsetFromPointer.y
+            x: pointerInSwiftUI.x + CursorView.followingOffsetFromPointer.x,
+            y: pointerInSwiftUI.y + CursorView.followingOffsetFromPointer.y
         )
 
         buddyNavigationMode = .wakingFromStatusItemIcon
@@ -1230,10 +1243,75 @@ struct BlueCursorView: View {
     }
 }
 
-// MARK: - Blue Cursor Waveform
+// MARK: - Cursor Voice Glow
 
-/// The blue waveform that replaces the triangle cursor while the user holds push-to-talk and speaks.
-private struct BlueCursorWaveformView: View {
+/// The light around the cursor while Kiki is speaking, which widens and narrows with the voice.
+///
+/// A view of its own for where the invalidation falls: the level it reads arrives with the audio,
+/// tens of times a second, and everything else in the cursor would be re-evaluated that often with
+/// it if the level were read from up there.
+///
+/// The rise and the fall are this view's own animation rather than a smoothed value, which is what
+/// lets two sources report at two different rates: a syllable widens the glow at once, and the
+/// silent moment between two syllables only takes it part of the way back down.
+private struct CursorVoiceGlowView: View {
+
+    @ObservedObject var voiceLoudnessMeter: VoiceLoudnessMeter
+    /// The cursor's colour as it stands rather than a colour of the glow's own: the light around the
+    /// cursor is the cursor's light, so it turns red with the triangle on a flight that is going to
+    /// press or carry something.
+    let cursorColor: Color
+    let cursorPosition: CGPoint
+    let flightScale: CGFloat
+    let buddyNavigationMode: BuddyNavigationMode
+    let opacity: Double
+
+    /// The glow's diameter at its widest, and the diameter it never goes below. Together they are
+    /// the whole range the voice moves it through.
+    private static let widestGlowDiameter: CGFloat = 52
+    private static let narrowestGlowDiameter: CGFloat = 16
+
+    /// Long enough that the glow swells rather than jumps with each syllable, short enough that it
+    /// is never still moving when the syllable after it arrives.
+    private static let glowRiseAndFallDuration: Double = 0.12
+
+    private var glowDiameter: CGFloat {
+        let voiceLoudness = voiceLoudnessMeter.loudness
+        let diameter = Self.narrowestGlowDiameter
+            + (Self.widestGlowDiameter - Self.narrowestGlowDiameter) * voiceLoudness
+        return diameter * flightScale
+    }
+
+    var body: some View {
+        Circle()
+            .fill(cursorColor)
+            .frame(width: glowDiameter, height: glowDiameter)
+            .blur(radius: 10)
+            // The level and the cursor's own fade as one number: a silence draws nothing whatever
+            // the cursor is doing, and the peak is deliberately below the triangle's own brightness
+            // — the glow is a reading of the voice, and a cursor outshone by its own light is the
+            // wrong trade.
+            .opacity(0.55 * voiceLoudnessMeter.loudness * opacity)
+            .position(cursorPosition)
+            .animation(
+                buddyNavigationMode == .followingCursor
+                    ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
+                    : nil,
+                value: cursorPosition
+            )
+            // Keyed on the colour rather than on the reason for it, and on the triangle's own clock:
+            // the two changing on two clocks is a button that is two colours for a quarter of a
+            // second, at the moment the user is watching to find out what Kiki is about to press.
+            .animation(.easeInOut(duration: CursorView.cursorClickColourFadeDuration), value: cursorColor)
+            .animation(.easeOut(duration: Self.glowRiseAndFallDuration), value: voiceLoudnessMeter.loudness)
+            .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Cursor Waveform
+
+/// The purple waveform that replaces the triangle cursor while the user holds push-to-talk and speaks.
+private struct CursorWaveformView: View {
     let audioPowerLevel: CGFloat
     /// Whether the waveform is the shape actually being drawn on this screen.
     ///
@@ -1252,7 +1330,7 @@ private struct BlueCursorWaveformView: View {
             HStack(alignment: .center, spacing: 2) {
                 ForEach(0..<barCount, id: \.self) { barIndex in
                     RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(DS.Colors.overlayCursorBlue)
+                        .fill(DS.Colors.overlayCursorPurple)
                         .frame(
                             width: 2,
                             height: barHeight(
@@ -1262,7 +1340,7 @@ private struct BlueCursorWaveformView: View {
                         )
                 }
             }
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: DS.Colors.overlayCursorPurple.opacity(0.6), radius: 6, x: 0, y: 0)
             .animation(.linear(duration: 0.08), value: audioPowerLevel)
         }
     }
@@ -1277,10 +1355,10 @@ private struct BlueCursorWaveformView: View {
     }
 }
 
-// MARK: - Blue Cursor Spinner
+// MARK: - Cursor Spinner
 
-/// The blue spinner that replaces the triangle cursor while the AI is processing a voice input.
-private struct BlueCursorSpinnerView: View {
+/// The purple spinner that replaces the triangle cursor while the AI is processing a voice input.
+private struct CursorSpinnerView: View {
     /// Whether the spinner is the shape actually being drawn on this screen.
     ///
     /// The timeline is paused when it is not. The rotation cannot be a `repeatForever` animation:
@@ -1301,8 +1379,8 @@ private struct BlueCursorSpinnerView: View {
                 .stroke(
                     AngularGradient(
                         colors: [
-                            DS.Colors.overlayCursorBlue.opacity(0.0),
-                            DS.Colors.overlayCursorBlue
+                            DS.Colors.overlayCursorPurple.opacity(0.0),
+                            DS.Colors.overlayCursorPurple
                         ],
                         center: .center
                     ),
@@ -1310,7 +1388,7 @@ private struct BlueCursorSpinnerView: View {
                 )
                 .frame(width: 14, height: 14)
                 .rotationEffect(.degrees(rotationDegrees(at: timelineContext.date)))
-                .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+                .shadow(color: DS.Colors.overlayCursorPurple.opacity(0.6), radius: 6, x: 0, y: 0)
         }
     }
 
@@ -1410,7 +1488,7 @@ class OverlayWindowManager {
     ) -> OverlayWindow {
         let window = OverlayWindow(screen: screen)
 
-        let contentView = BlueCursorView(
+        let contentView = CursorView(
             screenFrame: screen.frame,
             isFirstAppearance: isFirstAppearance,
             companionManager: companionManager

@@ -191,7 +191,7 @@ enum CompanionScreenCaptureUtility {
 
         for (displayIndex, display) in sortedDisplays.enumerated() {
             // NSScreen.frame, so displayFrame shares a coordinate system with
-            // NSEvent.mouseLocation and the overlay's screenFrame in BlueCursorView.
+            // NSEvent.mouseLocation and the overlay's screenFrame in CursorView.
             let displayFrame = nsScreenByDisplayID[display.displayID]?.frame
                 ?? CGRect(x: display.frame.origin.x, y: display.frame.origin.y,
                           width: CGFloat(display.width), height: CGFloat(display.height))

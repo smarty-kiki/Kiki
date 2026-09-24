@@ -9,7 +9,6 @@
 import AVFoundation
 import Combine
 import Foundation
-import PostHog
 import ScreenCaptureKit
 import Speech
 import SwiftUI
@@ -341,6 +340,10 @@ final class CompanionManager: ObservableObject {
     private var onboardingVideoEndObserver: NSObjectProtocol?
     private var onboardingDemoTimeObserver: Any?
 
+    /// Asks the player where it is, every step of the intro's narration, so the glow can read the
+    /// measured level for that moment. Holds the measurement itself as well as the player.
+    private var onboardingNarrationLoudnessObserver: Any?
+
     /// Something the onboarding demo has already pointed at during this run.
     ///
     /// Each demo is a fresh request with no history, so the model sees a screen it has already
@@ -372,6 +375,9 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+
+    /// What the cursor's glow widens and narrows by, whoever is speaking for Kiki.
+    let voiceLoudnessMeter = VoiceLoudnessMeter()
 
     /// Watches the mouse for a run of the user's own actions, and owns the shift+option tap that
     /// starts and ends one.
@@ -662,6 +668,12 @@ final class CompanionManager: ObservableObject {
         ttsClient.onFirstSoundHeard = { [weak self] in
             self?.isWaitingForTheFirstSoundOfTheReply = false
         }
+        // The voice's own level, which drives the glow around the cursor while the reply is read
+        // aloud. The onboarding video is the other thing that ever speaks for Kiki, and it reports
+        // to the same meter — see `listenForTheOnboardingNarrationLoudness`.
+        ttsClient.onVoiceLoudness = { [weak self] voiceLoudness in
+            self?.voiceLoudnessMeter.report(voiceLoudness)
+        }
     }
 
     /// The running response task, cancelled when the user speaks again.
@@ -693,7 +705,7 @@ final class CompanionManager: ObservableObject {
             || hasSpeechRecognitionPermission
     }
 
-    /// Whether the blue cursor overlay is currently visible on screen.
+    /// Whether the purple cursor overlay is currently visible on screen.
     @Published private(set) var isOverlayVisible: Bool = false
 
     /// The DeepSeek model used for voice responses, persisted under a key of its own so an
@@ -903,7 +915,6 @@ final class CompanionManager: ObservableObject {
 
         lastTranscript = commandText
         print("⌨️ Companion received command: \(commandText)")
-        KikiAnalytics.trackUserMessageSent(transcript: commandText)
 
         // Before the capture rather than after it: what follows is several seconds of screenshot
         // and recognition with nothing to show for it, and a terminal with no way to tell a turn
@@ -1787,8 +1798,6 @@ final class CompanionManager: ObservableObject {
 
         NotificationCenter.default.post(name: .kikiDismissPanel, object: nil)
 
-        KikiAnalytics.trackOnboardingStarted()
-
         startOnboardingMusic()
 
         // The first appearance is what triggers the welcome animation and onboarding video.
@@ -1803,7 +1812,6 @@ final class CompanionManager: ObservableObject {
         guard !isNotTakingInputBecauseOfTheStatusItemIcon else { return }
 
         NotificationCenter.default.post(name: .kikiDismissPanel, object: nil)
-        KikiAnalytics.trackOnboardingReplayed()
         startOnboardingMusic()
 
         overlayWindowManager.hasShownOverlayBefore = false
@@ -1827,7 +1835,7 @@ final class CompanionManager: ObservableObject {
 
         do {
             let player = try AVAudioPlayer(contentsOf: musicURL)
-            player.volume = 0.3
+            player.volume = 0.5
             player.play()
             self.onboardingMusicPlayer = player
 
@@ -1972,18 +1980,6 @@ final class CompanionManager: ObservableObject {
             print("🔑 Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), speech: \(hasSpeechRecognitionPermission)")
         }
 
-        if !previouslyHadAccessibility && hasAccessibilityPermission {
-            KikiAnalytics.trackPermissionGranted(permission: "accessibility")
-        }
-        if !previouslyHadScreenRecording && hasScreenRecordingPermission {
-            KikiAnalytics.trackPermissionGranted(permission: "screen_recording")
-        }
-        if !previouslyHadMicrophone && hasMicrophonePermission {
-            KikiAnalytics.trackPermissionGranted(permission: "microphone")
-        }
-        if !previouslyHadSpeechRecognition && hasSpeechRecognitionPermission {
-            KikiAnalytics.trackPermissionGranted(permission: "speech_recognition")
-        }
         // Screen content permission is persisted — once the SCShareableContent picker has been
         // approved there is nothing to re-check.
         if !hasScreenContentPermission {
@@ -1991,8 +1987,6 @@ final class CompanionManager: ObservableObject {
         }
 
         if !previouslyHadAll && allPermissionsGranted {
-            KikiAnalytics.trackAllPermissionsGranted()
-
             // Covers the user who pasted their key first and granted permissions second.
             playIntroDemoIfNeeded()
         }
@@ -2025,8 +2019,6 @@ final class CompanionManager: ObservableObject {
                     guard didCapture else { return }
                     hasScreenContentPermission = true
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                    KikiAnalytics.trackPermissionGranted(permission: "screen_content")
-
 
                     if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isKikiCursorEnabled {
                         overlayWindowManager.hasShownOverlayBefore = true
@@ -2243,8 +2235,6 @@ final class CompanionManager: ObservableObject {
             }
     
 
-            KikiAnalytics.trackPushToTalkStarted()
-
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = Task {
                 await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
@@ -2255,7 +2245,6 @@ final class CompanionManager: ObservableObject {
                     submitDraftText: { [weak self] finalTranscript in
                         self?.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
-                        KikiAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
                     }
                 )
@@ -2263,7 +2252,6 @@ final class CompanionManager: ObservableObject {
         case .released:
             // A release arriving before the async start began recording would otherwise be
             // dropped, leaving the waveform overlay stuck on screen.
-            KikiAnalytics.trackPushToTalkReleased()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
@@ -2490,7 +2478,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're kiki, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're kiki, a friendly always-on companion that lives in the user's menu bar. the user just asked you for something — spoken through push-to-talk, or typed into their terminal — and you can see their screen(s). your reply is spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     language: you always reply in chinese (简体中文), written as natural spoken mandarin that sounds right out loud — not english sentences translated word for word. keep terms people actually say in english as english (like "commit", "pull request", "bug"), the way a chinese developer would say them.
 
@@ -2505,15 +2493,15 @@ final class CompanionManager: ObservableObject {
     - if you receive multiple screen images, the one labeled as where the cursor is matters most — prioritize it, but reference the others if they're relevant.
 
     element pointing:
-    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
+    you have a small purple triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
 
     don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
 
     when you point, put the coordinate tag right where you mention the element — inside the sentence, tight against the words that name it — never at the end of the sentence and never at the start of the next one. the cursor sets off when your voice reaches the sentence the tag sits in, and it holds the narration there until it has arrived and stood on the element. a tag left at a sentence boundary is read as belonging to the sentence before it, so the cursor sets off on words that have nothing to do with the element and the pause lands in the wrong place. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
 
-    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is what the element is CALLED. when the element has text written on it, copy that text into the label character for character, exactly as it appears on screen — chinese, file paths, identifiers, product names, all of it — and do not translate or tidy it. the label is matched against the text actually on the screen to place the cursor exactly, so the closer it is to what is really written there, the more precisely you point, and your coordinate only needs to be in the right neighbourhood rather than perfect. when the element has no text of its own — an icon button, a toolbar, a colour swatch, a panel with nothing written in it — name it in 1-3 english words instead (like "search bar" or "save button"). the tag and the label inside it are parsed by code and never read aloud, so nothing about the label has to sound like speech — but that cuts both ways: the label is not how the user hears what you are pointing at, so the sentence around the tag still has to name the element out loud, in chinese. "最上面是 [POINT:400,213:新华网] 新华网" is heard as "最上面是新华网"; leave that last word out and the very same reply is heard as "最上面是，". this slips most easily when you tag several things in a row — a list of names is exactly where the names end up living in the tags alone, and the user then hears you point at nine things without saying what any of them are.
+    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is what the element is CALLED. when the element has text written on it, copy that text into the label character for character, exactly as it appears on screen — chinese, file paths, identifiers, product names, all of it — and do not translate or tidy it. the label is matched against the text actually on the screen to place the cursor exactly, so the closer it is to what is really written there, the more precisely you point, and your coordinate only needs to be in the right neighbourhood rather than perfect — as long as the label does match. when nothing is written on the element and you are naming it yourself, there is no text to find, so your coordinate is the only thing placing the cursor and it has to be measured properly rather than estimated. when the element has no text of its own — an icon button, a toolbar, a colour swatch, a panel with nothing written in it — name it in 1-3 english words instead (like "search bar" or "save button"). the tag and the label inside it are parsed by code and never read aloud, so nothing about the label has to sound like speech — but that cuts both ways: the label is not how the user hears what you are pointing at, so the sentence around the tag still has to name the element out loud, in chinese. "最上面是 [POINT:400,213:新华网] 新华网" is heard as "最上面是新华网"; leave that last word out and the very same reply is heard as "最上面是，". this slips most easily when you tag several things in a row — a list of names is exactly where the names end up living in the tags alone, and the user then hears you point at nine things without saying what any of them are.
 
-    write [CLICK:x,y:label] instead when the user wants that element actually operated — opened, pressed, switched on — and you are doing it for them. this tag is not just wording: once the cursor lands on the element, kiki clicks it, once. so write it only where you mean the thing to happen now, and never for anything the user cannot take back — deleting, clearing, uninstalling, formatting, resetting, quitting, shutting down, paying, sending — those stay [POINT:x,y:label] and the user makes that click themselves. keep [POINT:x,y:label] when you are only locating something for them, which is the usual case: someone who asked where a setting lives has not asked to click it. if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
+    write [CLICK:x,y:label] instead when the user wants that element actually operated — opened, pressed, switched on — and you are doing it for them. this tag is not just wording: once the cursor lands on the element, kiki clicks it, once. so write it only where you mean the thing to happen now, and never for anything the user cannot take back — deleting, clearing, uninstalling, formatting, resetting, restoring, restarting, logging out, quitting, shutting down, paying, sending — those stay [POINT:x,y:label] and the user makes that click themselves. keep [POINT:x,y:label] when you are only locating something for them, which is the usual case: someone who asked where a setting lives has not asked to click it. if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
     write [DOUBLECLICK:x,y:label] when the element takes two clicks to do what was asked — opening a file, folder or icon on the desktop or in finder, selecting a word in a piece of text, dropping into a cell so it can be edited. a single click on any of those only selects it, so [CLICK:x,y:label] leaves the user looking at a file that never opened. everything above about [CLICK:x,y:label] holds here as well: kiki is doing it for the user, so write it only where you mean it to happen now, and never on anything the user cannot take back. but do not reach for it just because the element matters or because clicking it feels decisive — a button, a menu item, a toolbar control, a switch, a link and a favourite tile on a browser's start page all take exactly one click, and two on those is a different action than the one the user asked for, or nothing at all. when in doubt, [CLICK:x,y:label].
 
@@ -2523,7 +2511,7 @@ final class CompanionManager: ObservableObject {
 
     one thing to know about it: the menu your own right click opens is not in your screenshot, because you are looking at the screen as it was before your reply started. so never tag anything inside a menu you just opened — say in words what the menu will offer and let the user choose. what you can do instead is write [LOOK] at the end of the reply, which brings you back for a second look at the menu that is now really open.
 
-    write [SCROLLUP:x,y:label], [SCROLLDOWN:x,y:label], [SCROLLLEFT:x,y:label] or [SCROLLRIGHT:x,y:label] when what the user needs is past the edge of what is on screen — the rest of a long list, a page that continues below, a column cut off to the left. kiki scrolls at the element once the cursor lands, so point it at the thing that should move: the list, the text pane, the document. it rolls one screenful by default; append :xN after the label and before any :screenN to say how far — [SCROLLDOWN:640,400:消息列表:x3] rolls that list down three screenfuls, [SCROLLDOWN:640,400:消息列表:x0.5] rolls it half a screen, and N runs from 0.5 to 20 in steps of half a screenful. prefer half a screen when you are scrolling in order to read — following a list, hunting for one entry — because a whole screen carries the lines the user was on off the display, and what they were looking for is as likely to be in the part that just went past as in the part that arrived; save a whole screen or more for when you mean to travel. always with the x: everything after the second colon is read as the element's name, so a bare 「:3」 is swallowed into the label and the scroll never happens.
+    write [SCROLLUP:x,y:label], [SCROLLDOWN:x,y:label], [SCROLLLEFT:x,y:label] or [SCROLLRIGHT:x,y:label] when what the user needs is past the edge of what is on screen — the rest of a long list, a page that continues below, a column cut off to the left. kiki scrolls at the element once the cursor lands, so point it at the thing that should move: the list, the text pane, the document. it rolls one screenful by default; append :xN after the label and before any :screenN to say how far — [SCROLLDOWN:640,400:消息列表:x3] rolls that list down three screenfuls, [SCROLLDOWN:640,400:消息列表:x0.5] rolls it half a screen, and N runs from 0.5 to 20 — half a screen is the shortest scroll kiki will make, and whole or half screens are what read best. prefer half a screen when you are scrolling in order to read — following a list, hunting for one entry — because a whole screen carries the lines the user was on off the display, and what they were looking for is as likely to be in the part that just went past as in the part that arrived; save a whole screen or more for when you mean to travel. always with the x: everything after the second colon is read as the element's name, so a bare 「:3」 is swallowed into the label and the scroll never happens.
 
     two things to know about scrolling. the first is the same one that applies to a menu your own right click opens: your screenshot is the screen as it was when your reply started, so whatever a scroll brings into view is not in front of you — say in words what is down there, and never tag anything you could only see by scrolling, because that coordinate is one you do not have. if what the scroll turns up is something you need to work with, write [LOOK] after it and you will be asked again with the list scrolled. the second is order: a scroll moves everything the tags after it were reading, so a scroll tag goes at the very end of your reply, once every element you meant to point at has been pointed at.
 
@@ -2546,7 +2534,7 @@ final class CompanionManager: ObservableObject {
     examples:
     - user asks how to color grade in final cut: "打开 [POINT:1100,42:color inspector] 调色检查器就行，在工具栏右上角那一块。点开之后色轮和曲线都在里面。"
     - user asks what a folder in their terminal is: "最后那一行的 [POINT:660,151:Build] Build 就是 xcode 放编译产物的地方。每次重新构建都往里面写东西，删掉不会有任何损失。"
-    - user asks what html is: "html 是超文本标记语言，基本上就是每个网页的骨架。想不想知道它跟你正在看的 css 是怎么配合的？"
+    - user asks what html is: "html 是超文本标记语言，基本上就是每个网页的骨架。你现在看的这个页面就是它搭的，css 只管往上刷颜色和排版。"
     - user asks how to commit in xcode: "我先把顶上那个 [CLICK:285,11:源代码管理] 源代码管理菜单给你打开，你在里面选提交就行，或者直接按 command option c。"
     - user asks how to save their work in an app: "按一下右上角那个 [CLICK:880,64:保存] 保存按钮就存上了，存过一次之后 command s 也能随时存。"
     - user asks you to open a file sitting on their desktop: "桌面上那个 [DOUBLECLICK:420,330:季度报告] 季度报告双击就打开了，单击它只是选中，不会打开。"
@@ -2555,7 +2543,7 @@ final class CompanionManager: ObservableObject {
     - the same request, but the user asks you to do it rather than show them — the menu is not in your screenshot, so the first reply opens it and looks: "我先在 [RIGHTCLICK:420,330:季度报告] 季度报告上点右键。 [LOOK]"
       and then, with the menu really open in front of you: "菜单出来了，我点 [CLICK:470,395:压缩] 压缩，压缩包会生成在旁边。"
     - user asks you to make a new folder on their desktop, and where that lives is inside a menu you cannot see into: "好，我先在 [CLICK:512,11:文件] 文件菜单里找新建文件夹。 [LOOK]" and then "在菜单第三项，[CLICK:556,120:新建文件夹] 新建文件夹，你在弹出的框里打个名字就行。"
-    - user asks you to open a page or a site for them, and what you say about it has to be what is really on screen: "我点开 [CLICK:400,213:新华网] 新华网。 [LOOK]" and then, with the page in front of you: "开了，头条是……" — and if it did not open: "点了没反应，还停在原来那页，我再点一次。 [LOOK]"
+    - user asks you to open a page or a site for them, and what you say about it has to be what is really on screen: "我点开 [CLICK:400,213:新华网] 新华网。 [LOOK]" and then, with the page in front of you: "开了，头条是……" — and if it did not open: "点了没反应，还停在原来那页。我再点一次 [CLICK:400,213:新华网] 新华网。 [LOOK]"
     - user asks which of the folders on their desktop holds last quarter's reports, and no folder name says — so you open them and look, one at a time: "我挨个翻，先开 [DOUBLECLICK:420,330:归档] 归档。 [LOOK]" and then "这个里面只有去年的周报，不是。我退回去看下一个，[CLICK:96,52:back button] 返回。 [LOOK]" and then, from the folder list again, the next one: "[DOUBLECLICK:420,362:项目] 项目我再看一眼。 [LOOK]" — and when they run out: "六个都翻过了，没有放季度报告的那个。它是放在别的地方，还是名字跟这些不一样？"
     - user asks where to start in an unfamiliar app, worth two tags: "先看左上角那个 [POINT:210,64:search field] 搜索框，想找什么直接敲就行。要是找不到，右下角还有个 [POINT:1180,690:filter button] 筛选按钮，点开能按类型和时间筛。"
     - user asks what's in a list, worth several tags — every name is said out loud, not just tagged: "带上「新闻」两个字的从上到下就这几条：最上面是 [POINT:400,213:新华网] 新华网，接着是 [POINT:400,246:央视新闻] 央视新闻，再往下是 [POINT:400,279:腾讯新闻] 腾讯新闻。"
@@ -2972,7 +2960,6 @@ final class CompanionManager: ObservableObject {
                 ttsClient.discardPreparedSegments()
                 writeTheCurrentTurnIntoHistory(interruption: .theReplyFailedPartWayThrough)
                 abandonSpeakingReply()
-                KikiAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
                 // A terminal watching this turn is owed an ending rather than a wait it cannot
                 // resolve — nothing else about this turn will reach it.
@@ -4450,7 +4437,7 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Drops any tour in progress.
+    /// Drops any tour in progress, and sends the cursor home with it.
     ///
     /// Speech is deliberately left alone: a tour ending says the cursor is finished pointing, not that the
     /// reply is finished being spoken.
@@ -4474,9 +4461,17 @@ final class CompanionManager: ObservableObject {
         lastPointingTourStopArrivalDate = nil
         shouldReturnBuddyToCursorAfterPointing = false
         // No stop is left to be pressed, so the press is withdrawn from the target the cursor is
-        // standing on. Only that field: the cursor is left where it is until the tour's return-home
-        // timeout takes it back, and clearing the target outright would read as a flight to nil.
+        // standing on. Only that field: clearing the target outright would read as a flight to nil.
         pointingTarget?.actionToPerformOnArrival = nil
+
+        // The tour was the only thing holding the cursor out there, and the return-home timeout that
+        // would have brought it back is one of the things cancelled above. A cursor left standing on
+        // the last stop is a cursor still holding the user's pointer, so the visit ends with the tour.
+        // Reached mid-run, not only at the end of one: a step's screen work being done is followed
+        // within the timeout by the next step's request, which is what cancels it.
+        if pointingTarget != nil {
+            requestBuddyReturnHome()
+        }
     }
 
     /// The stop the tour is on, or nil once every stop has been visited.
@@ -4855,7 +4850,6 @@ final class CompanionManager: ObservableObject {
             performing: actionThatWillActuallyBePerformed(at: pointingTourStop)
         )
 
-        KikiAnalytics.trackElementPointed(elementLabel: pointingTourStop.elementLabel)
         print("🎯 Pointing tour: flying to (\(Int(pointingTourStop.screenshotCoordinate.x)), \(Int(pointingTourStop.screenshotCoordinate.y))) → \"\(pointingTourStop.elementLabel ?? "element")\"")
 
         schedulePointingTourArrivalTimeout()
@@ -5390,7 +5384,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Onboarding Video
 
     /// Sets up the onboarding video player, starts playback, and schedules the demo interactions.
-    /// Called by BlueCursorView when onboarding starts.
+    /// Called by CursorView when onboarding starts.
     func setupOnboardingVideo() {
         // Bundled rather than streamed: fetching the intro put the first thing a new user ever sees behind
         // a network round trip, and its failure was silent.
@@ -5437,9 +5431,10 @@ final class CompanionManager: ObservableObject {
             forTimes: demoTriggerTimes.map { NSValue(time: $0) },
             queue: .main
         ) { [weak self] in
-            KikiAnalytics.trackOnboardingDemoTriggered()
             self?.performOnboardingDemoInteraction()
         }
+
+        listenForTheOnboardingNarrationLoudness(of: player, videoAt: videoURL)
 
         // Fade out and clean up when the video finishes
         onboardingVideoEndObserver = NotificationCenter.default.addObserver(
@@ -5448,7 +5443,6 @@ final class CompanionManager: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            KikiAnalytics.trackOnboardingVideoCompleted()
             self.onboardingVideoOpacity = 0.0
             // Wait out the fade-out before tearing down, matching the opacity animation's own
             // duration in `OverlayWindow`, or the clip disappears in one frame instead of fading.
@@ -5462,12 +5456,47 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Measures the clip's own narration once, then follows it by where the player has got to.
+    ///
+    /// `AVPlayer` publishes no level, so the track is decoded instead of listened to. The decode is
+    /// a fraction of a second of pure arithmetic and belongs off the main actor — what it would
+    /// otherwise be holding up is the fade-in of the video it is measuring.
+    ///
+    /// The music underneath the intro is not in this: it is mixed at playback rather than stored in
+    /// the clip, and the glow follows a voice, not a soundtrack.
+    private func listenForTheOnboardingNarrationLoudness(of player: AVPlayer, videoAt videoURL: URL) {
+        Task { [weak self] in
+            let envelope = await Task.detached(priority: .userInitiated) {
+                OnboardingNarrationLoudnessEnvelope.measuring(videoAt: videoURL)
+            }.value
+
+            // The video may have been torn down or replayed while that was being measured, and a
+            // report from the run before this one would drive the glow of the run now.
+            guard let self, let envelope, self.onboardingVideoPlayer === player else { return }
+
+            self.onboardingNarrationLoudnessObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: OnboardingNarrationLoudnessEnvelope.secondsPerStep, preferredTimescale: 600),
+                queue: .main
+            ) { [weak self] playbackTime in
+                guard let self else { return }
+                self.voiceLoudnessMeter.report(envelope.loudness(atSeconds: playbackTime.seconds))
+            }
+        }
+    }
+
     func tearDownOnboardingVideo() {
         showOnboardingVideo = false
         if let timeObserver = onboardingDemoTimeObserver {
             onboardingVideoPlayer?.removeTimeObserver(timeObserver)
             onboardingDemoTimeObserver = nil
         }
+        if let loudnessObserver = onboardingNarrationLoudnessObserver {
+            onboardingVideoPlayer?.removeTimeObserver(loudnessObserver)
+            onboardingNarrationLoudnessObserver = nil
+        }
+        // The clip is the only thing that was speaking; whatever it left the glow at is not
+        // something anything would report over.
+        voiceLoudnessMeter.report(0)
         onboardingVideoPlayer?.pause()
         onboardingVideoPlayer = nil
         if let observer = onboardingVideoEndObserver {
@@ -5512,7 +5541,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Onboarding Demo Interaction
 
     private static let onboardingDemoSystemPrompt = """
-    you're kiki, a small blue cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
+    you're kiki, a small purple cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
 
     make a short quirky observation about the specific thing you picked — something fun, playful, or curious that shows you actually read/recognized it. write it in chinese (简体中文), the way you'd say it out loud. no emojis ever. the observation is the one part that must not repeat what's written on screen — react to the thing, don't read it back. keep it to 12 chinese characters max, no exceptions.
 

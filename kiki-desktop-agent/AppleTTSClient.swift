@@ -44,6 +44,14 @@ final class AppleTTSClient {
     /// position knows the node has rendered.
     var onFirstSoundHeard: (@MainActor () -> Void)?
 
+    /// Reports how loud the audio being rendered is, from 0 to 1, once per playback tick, and zero
+    /// once the segment is over.
+    ///
+    /// The raw measurement rather than a smoothed one: how a glow rises and falls over a pause
+    /// between two syllables is the glow's business, and the two things that ever speak for Kiki
+    /// report here at rates of their own.
+    var onVoiceLoudness: (@MainActor (CGFloat) -> Void)?
+
     /// Whether a segment is currently being played. False between segments, which is why
     /// `CompanionManager` schedules the transient cursor hide off its own `isSpeakingReply`.
     var isPlaying: Bool { currentlyPlayingSegment != nil }
@@ -90,6 +98,12 @@ final class AppleTTSClient {
     /// The format the player node is connected to the mixer with: the voice's own output format,
     /// which is not knowable until the first buffer of audio exists.
     private var connectedPlaybackAudioFormat: AVAudioFormat?
+
+    /// What the tap below most recently measured, read by the polling timer.
+    ///
+    /// The measurement itself happens on the render thread, and the poll is what carries it to the
+    /// main actor — so the audio thread is written to and never written from.
+    private let playbackLoudnessMeasurement = PlaybackLoudnessMeasurement()
 
     private var playbackHeadPollingTimer: Timer?
     private var currentlyPlayingSegment: PreparedSpeechSegment?
@@ -151,6 +165,9 @@ final class AppleTTSClient {
         // anything scheduled and resets the node's timeline, so the frame numbers the word marks
         // were measured in start at zero again for this segment.
         playbackPlayerNode.stop()
+        // The previous segment's last reading outlives its audio, and the first tick of this one
+        // would report it as though it were this segment's opening syllable.
+        playbackLoudnessMeasurement.reset()
         for audioBuffer in synthesizedAudio.audioBuffers {
             // Written out in full rather than as `scheduleBuffer(_:)`, because that shorthand is
             // ambiguous inside an `async` function: AVFoundation also publishes a one-argument
@@ -183,6 +200,8 @@ final class AppleTTSClient {
         consecutiveMissingPlaybackReadings = 0
         hasHeardTheFirstSoundOfTheCurrentReply = false
         playbackPlayerNode.stop()
+        // The audio stops here without the timer that would have gone on reporting it.
+        onVoiceLoudness?(0)
     }
 
     /// Drops every segment that has not been played, and abandons the one being synthesised.
@@ -208,10 +227,17 @@ final class AppleTTSClient {
             // The voice is pinned, so every segment of every reply comes out in the same format.
             // Reconnecting on a difference is the cheap answer to a case that should not arise,
             // and it beats scheduling buffers into a mismatched connection, which fails silently.
-            playbackPlayerNode.stop()
-            playbackEngine.stop()
-            isPlaybackEngineRunning = false
-            self.connectedPlaybackAudioFormat = nil
+            disconnectThePlaybackGraph()
+        }
+
+        // An engine that has stopped is not something this object is told about in time: the output
+        // device changing under it takes it down, and the notification that means that arrives after
+        // the fact, if at all. So the flag is checked against the engine itself, here, where the next
+        // thing to happen is a buffer going into it — scheduling into a stopped engine fails
+        // silently, which would be the rest of the reply going quiet with no fault reported anywhere.
+        if isPlaybackEngineRunning, !playbackEngine.isRunning {
+            print("🔊 TTS: the playback engine had stopped, rebuilding it before this segment")
+            disconnectThePlaybackGraph()
         }
 
         if connectedPlaybackAudioFormat == nil {
@@ -220,6 +246,7 @@ final class AppleTTSClient {
             }
             playbackEngine.connect(playbackPlayerNode, to: playbackEngine.mainMixerNode, format: audioFormat)
             connectedPlaybackAudioFormat = audioFormat
+            installPlaybackLoudnessTap()
         }
 
         // The connection outlives a stopped engine — `stop()` halts the render thread and leaves the
@@ -239,11 +266,54 @@ final class AppleTTSClient {
         }
     }
 
+    /// Takes the player node and the engine down to where they stand before the first segment of a
+    /// reply, so that what happens next is the connect and the start rather than a schedule into a
+    /// graph that has gone.
+    ///
+    /// A tap is installed by the connect below and goes with the connection it was made for, so one
+    /// exists exactly while a format is remembered — which is what makes removing it safe at both
+    /// call sites.
+    private func disconnectThePlaybackGraph() {
+        playbackPlayerNode.stop()
+        playbackPlayerNode.removeTap(onBus: 0)
+        playbackEngine.stop()
+        isPlaybackEngineRunning = false
+        connectedPlaybackAudioFormat = nil
+    }
+
+    /// Puts a tap on the player node that measures the audio as it is rendered.
+    ///
+    /// Installed and removed with the connection it is installed on, so there is never more than
+    /// one. The block runs on the render thread, and the only thing it touches is the measurement
+    /// it was handed — which is what lets the value cross to the main actor without a lock on the
+    /// side that reads it.
+    private func installPlaybackLoudnessTap() {
+        let loudnessMeasurement = playbackLoudnessMeasurement
+        playbackPlayerNode.installTap(onBus: 0, bufferSize: 512, format: nil) { buffer, _ in
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0, let channelData = buffer.floatChannelData else { return }
+
+            // The node's output is one lane per channel, but the stride is asked for rather than
+            // assumed: reading an interleaved buffer as if it were not would measure one channel
+            // in `channelCount` and hear a different signal.
+            let samplesBetweenFrames = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
+            var sumOfSquares: Float = 0
+            for frameIndex in 0..<frameCount {
+                let sample = channelData[0][frameIndex * samplesBetweenFrames]
+                sumOfSquares += sample * sample
+            }
+
+            loudnessMeasurement.record(rootMeanSquare: (sumOfSquares / Float(frameCount)).squareRoot())
+        }
+    }
+
     private func stopPlaybackEngine() {
         guard isPlaybackEngineRunning else { return }
         playbackPlayerNode.stop()
         playbackEngine.stop()
         isPlaybackEngineRunning = false
+        // Nothing is being rendered any more, and no tick is left to say so.
+        onVoiceLoudness?(0)
     }
 
     // MARK: - Reporting the playback position
@@ -278,6 +348,7 @@ final class AppleTTSClient {
               let playbackTime = playbackPlayerNode.playerTime(forNodeTime: lastRenderTime) else {
             consecutiveMissingPlaybackReadings += 1
             if consecutiveMissingPlaybackReadings >= Self.consecutiveMissingPlaybackReadingsBeforeGivingUp {
+                print("🔇 TTS: the playback position went missing — segment \(currentlyPlayingSegment?.segmentIndex ?? -1) is written off as played, so the rest of this reply is silent")
                 finishCurrentSegmentPlayback()
             }
             return
@@ -288,6 +359,14 @@ final class AppleTTSClient {
         // Negative for the moment before the node has rendered its first cycle.
         let playedFrameCount = playbackTime.sampleTime
         guard playedFrameCount >= 0 else { return }
+
+        // The tap's latest reading, which is this tick's answer to how loud the voice is right now.
+        // Read here rather than off the playback position because the position says where the voice
+        // is, not how it sounds — and at one tick per 20 ms the reading is never stale by more than
+        // the buffer it came out of.
+        onVoiceLoudness?(
+            VoiceLoudness.loudness(fromRootMeanSquare: playbackLoudnessMeasurement.rootMeanSquare)
+        )
 
         // The first frame the node has rendered is the first sound the user could have heard — asked
         // of the playback position, because asking for playback says only that it was scheduled.
@@ -320,6 +399,12 @@ final class AppleTTSClient {
         totalFramesBeingPlayed = 0
         nextWordMarkIndexToReport = 0
         consecutiveMissingPlaybackReadings = 0
+        // The gap before the next segment is silent, and the timer that would have reported the
+        // silence is stopped here — so the last sound of the segment is reported over by this.
+        onVoiceLoudness?(0)
+        // TEMPORARY, with the 🔇/🔊 lines above: what this voice measures, to check the glow's
+        // scale against it. Comes out with them.
+        print("🔊 TTS: segment peak \(String(format: "%.3f", playbackLoudnessMeasurement.peakRootMeanSquare)) rms")
         onPlaybackFinished?()
     }
 
@@ -356,6 +441,52 @@ final class AppleTTSClient {
         }
     }
 
+}
+
+// MARK: - How loud the audio being played is
+
+/// The level of the audio passing through the player node, written from the render thread and read
+/// from the main actor.
+///
+/// The tap that fills it runs on the render thread, where a lock held for the length of a poll is
+/// not an option, so the two directions are kept to the width of one `Float` under a lock that is
+/// held for two instructions at a time. `nonisolated` puts the whole class outside the target's
+/// default main-actor isolation, which is what lets the render thread touch it at all.
+private nonisolated final class PlaybackLoudnessMeasurement {
+
+    private let lock = NSLock()
+    private var mostRecentRootMeanSquare: Float = 0
+    private var highestRootMeanSquareSinceReset: Float = 0
+
+    /// The most recent buffer's level, which is what a tick reports.
+    var rootMeanSquare: Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return mostRecentRootMeanSquare
+    }
+
+    /// The loudest level since the last reset, which nothing but the diagnostic read uses.
+    var peakRootMeanSquare: Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return highestRootMeanSquareSinceReset
+    }
+
+    func record(rootMeanSquare: Float) {
+        lock.lock()
+        mostRecentRootMeanSquare = rootMeanSquare
+        highestRootMeanSquareSinceReset = max(highestRootMeanSquareSinceReset, rootMeanSquare)
+        lock.unlock()
+    }
+
+    /// Called before a segment is played, so what the last one measured cannot be read as this
+    /// one's opening.
+    func reset() {
+        lock.lock()
+        mostRecentRootMeanSquare = 0
+        highestRootMeanSquareSinceReset = 0
+        lock.unlock()
+    }
 }
 
 // MARK: - One segment, from its text to its audio
