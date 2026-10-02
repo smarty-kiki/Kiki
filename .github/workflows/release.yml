@@ -13,9 +13,11 @@ permissions:
 jobs:
   release:
     name: Build and attach the release artifacts
-    runs-on: macos-15
+    # macos-15 defaults to Xcode 16.4, which does not build this project; macos-26
+    # defaults to Xcode 26.6, the era the project's Swift settings target.
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read the version from the tag
         id: version
@@ -26,6 +28,7 @@ jobs:
       # tell the user to strip the quarantine flag — see the step below.
       - name: Build
         run: |
+          set -o pipefail
           xcodebuild \
             -project kiki-desktop-agent.xcodeproj \
             -scheme kiki-desktop-agent \
@@ -35,7 +38,18 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="-" \
             DEVELOPMENT_TEAM="" \
-            build
+            build 2>&1 | tee build.log
+
+      # The job log needs admin rights to read; annotations do not, so a failed build
+      # re-emits its first errors (or its last lines) where anyone can see them.
+      - name: Report the build errors
+        if: failure()
+        run: |
+          errors=$(grep -E "error:|The following build commands failed" build.log | head -12 || true)
+          if [ -z "$errors" ]; then errors=$(tail -20 build.log 2>/dev/null || true); fi
+          while IFS= read -r line; do
+            echo "::error::${line//%/%25}"
+          done <<< "$errors"
 
       # A version's number is written in three places — the tag, the app's
       # CFBundleShortVersionString and the CHANGELOG heading — and nothing else keeps
