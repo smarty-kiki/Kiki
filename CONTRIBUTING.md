@@ -27,3 +27,4 @@
 - 分支命名 `feature/描述` 或 `fix/描述`。
 - 大改动先开 issue 说清楚再动手。
 - PR 按 [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) 的自查清单过一遍，CI 绿。这个项目的很多问题只有驱动真的 app 才会暴露——权限、TCC、事件注入都是——所以「真实验证过」指的是跑起来的 app，不只是编译通过。
+- 发版是维护者的事：一个版本的完整流程和一次性仓库设置见 [RELEASING.md](RELEASING.md)。

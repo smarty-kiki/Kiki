@@ -11,19 +11,23 @@ concurrency:
 
 jobs:
   build:
-    name: Build Kiki.app and kiki
+    name: Build Kiki.app and kiki (${{ matrix.configuration }})
     runs-on: macos-15
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
     steps:
       - uses: actions/checkout@v4
 
       # The runner holds no signing certificate, so both targets are built ad-hoc.
-      # A local build usually wants a real identity instead — see README for why.
+      # A local build can do the same; a self-signed certificate is what keeps its
+      # TCC grants across rebuilds — see README.
       - name: Build
         run: |
           xcodebuild \
             -project kiki-desktop-agent.xcodeproj \
             -scheme kiki-desktop-agent \
-            -configuration Debug \
+            -configuration ${{ matrix.configuration }} \
             -destination 'platform=macOS' \
             -derivedDataPath build \
             CODE_SIGN_STYLE=Manual \

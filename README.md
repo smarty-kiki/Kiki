@@ -1,5 +1,9 @@
 # Kiki
 
+[![CI](https://github.com/smarty-kiki/Kiki/actions/workflows/ci.yml/badge.svg)](https://github.com/smarty-kiki/Kiki/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/smarty-kiki/Kiki)](https://github.com/smarty-kiki/Kiki/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **一个住在 macOS 菜单栏里的中文伙伴。** 按住 **Control+Option** 说一句话，它一边用中文回答，一边让一个紫色光标飞到屏幕上答案所说的那个东西上，指给你看。该点的时候，它真的会点。
 
 没有 Dock 图标，没有主窗口，没有账号，没有服务器。它在菜单栏上等着，你按住键，它就在。

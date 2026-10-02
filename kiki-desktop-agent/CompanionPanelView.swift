@@ -1153,6 +1153,12 @@ struct CompanionPanelView: View {
 
     // MARK: - Footer
 
+    /// Read from the bundle rather than written here, so the number the panel shows is always the
+    /// one this build actually is — the same number a release tag and a bug report have to match.
+    private var appVersionText: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+    }
+
     private var footerSection: some View {
         HStack {
             Button(action: {
@@ -1169,9 +1175,9 @@ struct CompanionPanelView: View {
             .buttonStyle(.plain)
             .pointerCursor()
 
-            if companionManager.hasCompletedOnboarding {
-                Spacer()
+            Spacer()
 
+            if companionManager.hasCompletedOnboarding {
                 Button(action: {
                     companionManager.replayOnboarding()
                 }) {
@@ -1186,6 +1192,10 @@ struct CompanionPanelView: View {
                 .buttonStyle(.plain)
                 .pointerCursor()
             }
+
+            Text("v\(appVersionText)")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
         }
     }
 

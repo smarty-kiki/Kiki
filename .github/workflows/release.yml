@@ -6,6 +6,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
@@ -13,6 +16,10 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Read the version from the tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       # The runner holds no signing certificate, so the app is signed ad-hoc. The
       # download therefore carries no Gatekeeper approval and the release notes
@@ -30,12 +37,32 @@ jobs:
             DEVELOPMENT_TEAM="" \
             build
 
+      # A version's number is written in three places — the tag, the app's
+      # CFBundleShortVersionString and the CHANGELOG heading — and nothing else keeps
+      # them in step. A disagreement fails the run before anything is packaged,
+      # which costs no more than deleting the tag.
+      - name: Check the tag against the app and the changelog
+        env:
+          version: ${{ steps.version.outputs.version }}
+        run: |
+          built_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            build/Build/Products/Release/Kiki.app/Contents/Info.plist)
+          if [ "$built_version" != "$version" ]; then
+            echo "::error::tag v$version but the app builds as $built_version — set MARKETING_VERSION to $version first"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"
+            exit 1
+          fi
+
       # ditto cannot take two sources into one archive, so the zip is built with
       # Info-ZIP from inside the staging directory: -y keeps symlinks, and the
       # zip's top level ends up as Kiki.app/ and kiki side by side.
       - name: Package
+        env:
+          version: ${{ steps.version.outputs.version }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
           stage="Kiki-$version"
           mkdir "$stage"
           cp -R build/Build/Products/Release/Kiki.app "$stage/Kiki.app"
@@ -43,11 +70,18 @@ jobs:
           (cd "$stage" && zip -qry "../Kiki-$version.zip" Kiki.app kiki)
           shasum -a 256 "Kiki-$version.zip" > SHA256SUMS.txt
 
+      # Attestations need a public repository; a private one needs GitHub Enterprise
+      # Cloud for this step to succeed.
+      - name: Attest the build provenance of the zip
+        uses: actions/attest@v4
+        with:
+          subject-path: Kiki-${{ steps.version.outputs.version }}.zip
+
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          version: ${{ steps.version.outputs.version }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
           cat > release-notes.md <<EOF
           ## 安装
 
@@ -62,10 +96,28 @@ jobs:
           3. 首次启动按面板提示授权五项权限，把自己的 DeepSeek API key 粘进去；
           4. 要用 \`kiki\` 命令行：\`ln -s "\$(pwd)/kiki" /usr/local/bin/kiki\`。
 
+          这个包附有 GitHub 来源证明，可以核对它确实由本仓库的发布流程构建：
+
+          \`\`\`bash
+          gh attestation verify Kiki-$version.zip --repo ${GITHUB_REPOSITORY}
+          \`\`\`
+
           详细说明见 [README](https://github.com/${GITHUB_REPOSITORY}#readme)。
+
           EOF
+
+          # The changelog is the one place a version's changes are written down; the
+          # notes carry that section whole rather than a second retelling of it.
+          awk -v version="$version" '
+            index($0, "## [" version "]") == 1 { inside = 1; next }
+            inside && index($0, "## [") == 1 { exit }
+            inside { print }
+          ' CHANGELOG.md >> release-notes.md
+
+          prerelease=""
+          case "$version" in *-*) prerelease="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" \
-            --draft \
+            --draft $prerelease \
             --title "Kiki $version" \
             --notes-file release-notes.md \
             "Kiki-$version.zip" SHA256SUMS.txt
