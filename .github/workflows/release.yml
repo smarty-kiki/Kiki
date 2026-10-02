@@ -124,7 +124,7 @@ jobs:
           open /Applications/Kiki.app
           \`\`\`
 
-          不想用 dmg 就用 zip：解压后对 \`Kiki.app\` 做同样两件事。命令行工具 \`kiki\` 就在 app 里面，和 app 永远同版本——打开面板，在「命令行」卡片上点**安装命令行工具**，会弹一次系统授权（\`/usr/local/bin\` 属于 root），装好的那行变绿。不想点按钮就手动，效果一样：
+          不想用 dmg 就用 zip：解压后对 \`Kiki.app\` 做同样两件事。命令行工具 \`kiki\` 就在 app 里面，和 app 永远同版本——打开面板，在「命令行」卡片上点**安装命令行工具**，会弹一次系统授权（\`/usr/local/bin\` 属于 root），装好的那行变紫色。不想点按钮就手动，效果一样：
 
           \`\`\`bash
           ln -s /Applications/Kiki.app/Contents/Resources/kiki /usr/local/bin/kiki
