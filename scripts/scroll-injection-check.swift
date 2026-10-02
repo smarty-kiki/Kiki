@@ -234,7 +234,7 @@ final class ScrollInjectionCheck {
 
     static func run() async {
         guard AXIsProcessTrusted() else {
-            print("❌ 没有辅助功能权限，事件发不出去。")
+            print("没有辅助功能权限，事件发不出去。")
             print("   权限判给的是「为这个进程负责的那个 app」——从终端跑，要授权的是终端本身。")
             print("   打开「系统设置 → 隐私与安全性 → 辅助功能」，把你的终端加进去再跑一次。")
             exit(1)

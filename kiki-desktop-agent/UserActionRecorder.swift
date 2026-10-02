@@ -149,7 +149,7 @@ final class UserActionRecorder: ObservableObject {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            print("⚠️ Action recorder: couldn't create CGEvent tap")
+            print("Action recorder: couldn't create CGEvent tap")
             return
         }
 
@@ -159,7 +159,7 @@ final class UserActionRecorder: ObservableObject {
             0
         ) else {
             CFMachPortInvalidate(globalEventTap)
-            print("⚠️ Action recorder: couldn't create event tap run loop source")
+            print("Action recorder: couldn't create event tap run loop source")
             return
         }
 
@@ -259,7 +259,7 @@ final class UserActionRecorder: ObservableObject {
         shortcutWasPressedTheLastTimeTheFlagsChanged = isShortcutPressedNow
         guard isShortcutPressedNow else { return }
 
-        print("⏺ Action recorder: shortcut tapped")
+        print("Action recorder: shortcut tapped")
         shortcutWasTappedPublisher.send(())
     }
 

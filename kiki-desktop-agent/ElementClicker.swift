@@ -2,9 +2,9 @@
 //  ElementClicker.swift
 //  kiki-desktop-agent
 //
-//  Posts a real click, a real scroll or a real drag for the user — the one place the app acts on
-//  the machine rather than merely suggesting — plus `PointerCarrier`, which takes the user's
-//  pointer along with it.
+//  Posts a real click, a real scroll, a real drag and real keystrokes for the user — the one place
+//  the app acts on the machine rather than merely suggesting — plus `PointerCarrier`, which takes
+//  the user's pointer along with it.
 //
 //  Pressing through the Accessibility API was the first design and was abandoned on
 //  measurement: the element the feature exists for offered `AXShowMenu` and `AXScrollToVisible`
@@ -136,6 +136,26 @@ extension ElementScrollDistance: CustomStringConvertible {
     }
 }
 
+/// What Kiki types at the element, rather than what it does to it with the mouse.
+///
+/// The third gesture family, and the one that is not a mouse event at all: a press and a scroll act
+/// on the thing under the point, where typing acts on whatever holds the input focus there. The
+/// point still matters — it is where the cursor flies, what the bubble is said over, and in the
+/// text's case the point that is clicked to put the focus in — so this rides the same flight as
+/// everything else rather than being a path of its own.
+enum ElementKeyboardInput: Equatable {
+    /// A run of characters, typed one at a time into the element.
+    case text(String)
+    /// One key press, with the modifiers that are held while it goes down.
+    ///
+    /// The name as the model or the terminal wrote it (`cmd+s`, `⌘⇧T`, `return`) rather than a
+    /// decoded value, because a name that cannot be read is a refusal with a sentence attached to
+    /// it — 「这个组合键 Kiki 不认识」 — and a value that failed to decode would have nothing to
+    /// say that in. Decoding happens inside `ElementKeyboard`, twice through one implementation:
+    /// once to refuse before the flight, once to press at the end of it.
+    case combination(name: String)
+}
+
 /// Who named the thing being clicked, which decides whether naming nothing is a refusal.
 ///
 /// The refusals are otherwise identical for both — a destructive label and a missing grant are
@@ -150,12 +170,13 @@ enum ElementClickOrigin {
     case theUsersOwnCommand
 }
 
-/// What the cursor does when it gets there: press a button, or scroll.
+/// What the cursor does when it gets there: press a button, scroll, drag, or type.
 ///
-/// The place the two gesture axes meet, and one value rather than a kind beside a flag because
-/// four separate decisions are read off it and they must not be able to disagree — whether the
-/// flight is a red one, which bubble is said over the element, whether anything happens on
-/// arrival at all, and whether the user's pointer is taken along.
+/// The place the gesture families meet — a click's axis, a scroll's, a drag with no axis of its
+/// own, and what is typed — and one value rather than a kind beside a flag because four separate
+/// decisions are read off it and they must not be able to disagree — whether the flight is a red
+/// one, which bubble is said over the element, whether anything happens on arrival at all, and
+/// whether the user's pointer is taken along.
 enum ElementActionOnArrival: Equatable {
     case press(ElementClickKind)
     case scroll(ElementScrollDirection, distance: ElementScrollDistance)
@@ -164,6 +185,8 @@ enum ElementActionOnArrival: Equatable {
     /// this on the same values the point it starts from does — a `PointingTourStop` or a
     /// `TerminalActionInFlight` — and is read at the moment the drag runs.
     case drag
+    /// What is typed at the element, and the one action that is not a mouse event.
+    case keyboard(ElementKeyboardInput)
 
     /// Whether this action needs the user's pointer to be at the element.
     ///
@@ -182,6 +205,11 @@ enum ElementActionOnArrival: Equatable {
     /// A drag says yes because it *is* the pointer moving: unlike a press, the point on the event
     /// and the pointer's position have to agree the whole way, or what the app underneath sees is a
     /// press with the mouse standing still and a jump at the end.
+    ///
+    /// A keyboard action says yes for the same reason a press does. Nothing about typing needs the
+    /// pointer to be anywhere — a keystroke is delivered to whatever holds the input focus, and the
+    /// carry is what puts the focus where Kiki is about to type. Which is also the whole of what
+    /// the red flight is for here: 「Kiki 要在这儿打字了」 before a character goes in.
     var carriesTheUsersPointer: Bool { true }
 }
 
@@ -313,6 +341,63 @@ extension ElementDragOutcome: CustomStringConvertible {
     }
 }
 
+/// What came of asking for keystrokes.
+///
+/// One case for both halves of the family, because what was asked for is an input to this rather
+/// than a result of it — the same shape the click's outcome has for its four gestures.
+enum ElementKeyboardOutcome {
+    /// The characters went in one at a time, or the combination went down and came back up.
+    case postedTheKeystrokes
+    /// Nothing was posted, and the reason is on this side of the event system — either the focus
+    /// click that typing begins with could not be posted, or an event could not be built.
+    case failedToPostTheKeystrokes
+    /// Typing begins by clicking the element to put the input focus in it, so a point that cannot
+    /// be clicked is a point nothing can be typed into. The click's own reason travels inside.
+    case refusedBecauseTheElementCannotBeClicked(ElementClickRefusal)
+    case refusedBecauseTheCombinationIsADangerousOne(matchedName: String)
+    case refusedBecauseTheCombinationIsNotOneKikiKnows(name: String)
+    case refusedBecauseTheTextIsLongerThanKikiWillType(characterCount: Int)
+    /// Accessibility is not granted. Synthesising an event needs it.
+    case refusedBecauseAccessibilityIsNotEnabled
+}
+
+extension ElementKeyboardOutcome {
+    /// Whether the keystrokes actually went out. See `ElementClickOutcome.isASuccess`.
+    var isASuccess: Bool {
+        switch self {
+        case .postedTheKeystrokes:
+            return true
+        case .failedToPostTheKeystrokes, .refusedBecauseTheElementCannotBeClicked,
+             .refusedBecauseTheCombinationIsADangerousOne,
+             .refusedBecauseTheCombinationIsNotOneKikiKnows,
+             .refusedBecauseTheTextIsLongerThanKikiWillType,
+             .refusedBecauseAccessibilityIsNotEnabled:
+            return false
+        }
+    }
+}
+
+extension ElementKeyboardOutcome: CustomStringConvertible {
+    var description: String {
+        switch self {
+        case .postedTheKeystrokes:
+            return "posted the keystrokes"
+        case .failedToPostTheKeystrokes:
+            return "the keystrokes could not be posted"
+        case .refusedBecauseTheElementCannotBeClicked(let clickRefusal):
+            return "refused: the element cannot be clicked (\(clickRefusal))"
+        case .refusedBecauseTheCombinationIsADangerousOne(let matchedName):
+            return "refused: \(matchedName) is a combination Kiki will not press"
+        case .refusedBecauseTheCombinationIsNotOneKikiKnows(let name):
+            return "refused: \(name) is not a combination Kiki knows"
+        case .refusedBecauseTheTextIsLongerThanKikiWillType(let characterCount):
+            return "refused: \(characterCount) characters is more than Kiki will type"
+        case .refusedBecauseAccessibilityIsNotEnabled:
+            return "refused: accessibility is not granted"
+        }
+    }
+}
+
 /// Why a drag is never posted, decided without asking the screen anything.
 ///
 /// Two cases, and the missing destination is the one no other gesture has: a press and a scroll are
@@ -371,6 +456,41 @@ enum ElementScrollRefusal {
     /// the scroll rather than by asking about it first.
     var outcome: ElementScrollOutcome {
         switch self {
+        case .accessibilityIsNotEnabled:
+            return .refusedBecauseAccessibilityIsNotEnabled
+        }
+    }
+}
+
+/// Why keystrokes are never posted, decided without asking the screen anything.
+///
+/// The click's three refusals are not repeated here as a keyboard's own copies: typing begins by
+/// clicking the element to put the input focus in it, so the first case carries the click's answer
+/// to the same question. What is here instead are the two things only a combination can be —
+/// one Kiki will not press, and one it cannot read — and the text that is simply too long to type.
+enum ElementKeyboardRefusal {
+    /// Typing begins by clicking the element. See `refusalOfTyping`.
+    case theElementCannotBeClicked(ElementClickRefusal)
+    /// A combination in `ElementKeyboard.writtenFormsKikiWillNotPress`.
+    case theCombinationIsADangerousOne(matchedName: String)
+    /// A name that does not read as a key and its modifiers.
+    case theCombinationIsNotOneKikiKnows(name: String)
+    case theTextIsLongerThanKikiWillType(characterCount: Int)
+    /// Accessibility is not granted. Synthesising an event needs it.
+    case accessibilityIsNotEnabled
+
+    /// The outcome that reports this refusal, for the path that reaches the decision by running the
+    /// keystrokes rather than by asking about them first.
+    var outcome: ElementKeyboardOutcome {
+        switch self {
+        case .theElementCannotBeClicked(let clickRefusal):
+            return .refusedBecauseTheElementCannotBeClicked(clickRefusal)
+        case .theCombinationIsADangerousOne(let matchedName):
+            return .refusedBecauseTheCombinationIsADangerousOne(matchedName: matchedName)
+        case .theCombinationIsNotOneKikiKnows(let name):
+            return .refusedBecauseTheCombinationIsNotOneKikiKnows(name: name)
+        case .theTextIsLongerThanKikiWillType(let characterCount):
+            return .refusedBecauseTheTextIsLongerThanKikiWillType(characterCount: characterCount)
         case .accessibilityIsNotEnabled:
             return .refusedBecauseAccessibilityIsNotEnabled
         }
@@ -544,9 +664,11 @@ enum ElementClicker {
     /// congruent everywhere else, including a display above the primary, which this maps to the
     /// negative y that space describes it with.
     ///
-    /// `fileprivate` so `PointerCarrier` converts through this same function. A second copy of
-    /// the flip would carry the mouse to somewhere the click does not land.
-    fileprivate static func accessibilityPoint(
+    /// Every caller converts through this same function — `PointerCarrier`, which carries the mouse,
+    /// and the command line tool's answers, which are read by a terminal in the space its own clicks
+    /// are posted in. A second copy of the flip would carry the mouse to somewhere the click does not
+    /// land, or hand a terminal a coordinate a screen height from the thing it names.
+    static func accessibilityPoint(
         fromAppKitScreenLocation appKitScreenLocation: CGPoint,
         primaryScreenHeightInPoints: CGFloat
     ) -> CGPoint {
@@ -1002,6 +1124,481 @@ enum ElementDragger {
         // the user's own press must not be counted as the second half of their double click.
         event.setIntegerValueField(.mouseEventClickState, value: 1)
         return event
+    }
+}
+
+/// One key on the keyboard: the code the system presses, and the way the key is written.
+struct ElementKey: Equatable {
+    /// The physical key, which is what the system matches a combination against.
+    let virtualKeyCode: CGKeyCode
+    /// How the key is written in a combination, the way a menu writes it: a letter as its capital,
+    /// and a key that has a symbol as that symbol.
+    let name: String
+}
+
+/// Which modifiers are held while a key goes down.
+///
+/// An option set of its own rather than `CGEventFlags`: this value travels on the flight, which the
+/// overlay reads, and that side has no business with CoreGraphics. The conversion is one place, at
+/// the bottom of this file beside the events it is for.
+struct ElementKeyModifiers: OptionSet {
+    let rawValue: Int
+
+    static let control = ElementKeyModifiers(rawValue: 1 << 0)
+    static let option = ElementKeyModifiers(rawValue: 1 << 1)
+    static let shift = ElementKeyModifiers(rawValue: 1 << 2)
+    static let command = ElementKeyModifiers(rawValue: 1 << 3)
+}
+
+/// Which key goes down, and which modifiers are held while it does.
+struct ElementKeyCombination: Equatable {
+    let key: ElementKey
+    let modifiers: ElementKeyModifiers
+
+    /// The combination as a menu prints it: the modifiers in the order macOS shows them, then the
+    /// key.
+    var writtenAs: String { modifiers.writtenAs + key.name }
+}
+
+extension ElementKeyModifiers {
+    /// ⌃⌥⇧⌘ — macOS's own order, which is the order a menu prints and the reason the shortcut for
+    /// logging out is written ⇧⌘Q here rather than ⌘⇧Q.
+    var writtenAs: String {
+        var text = ""
+        if contains(.control) { text += "⌃" }
+        if contains(.option) { text += "⌥" }
+        if contains(.shift) { text += "⇧" }
+        if contains(.command) { text += "⌘" }
+        return text
+    }
+}
+
+/// The modifier flags as the event system carries them, and the keys those flags describe.
+private extension ElementKeyModifiers {
+    var asEventFlags: CGEventFlags {
+        var flags: CGEventFlags = []
+        if contains(.control) { flags.insert(.maskControl) }
+        if contains(.option) { flags.insert(.maskAlternate) }
+        if contains(.shift) { flags.insert(.maskShift) }
+        if contains(.command) { flags.insert(.maskCommand) }
+        return flags
+    }
+
+    /// Each modifier as the key a keyboard presses, in the order a combination presses them — the
+    /// ⌃⌥⇧⌘ order a menu writes them in.
+    ///
+    /// The left-hand key of each pair, because a combination names a modifier and not a side. Every
+    /// one of these codes and the key name printed on it: 55 is ⌘, 56 ⇧, 58 ⌥, 59 ⌃.
+    var asKeysInTheOrderTheyArePressed: [(modifier: ElementKeyModifiers, virtualKeyCode: CGKeyCode)] {
+        var keys: [(modifier: ElementKeyModifiers, virtualKeyCode: CGKeyCode)] = []
+        if contains(.control) { keys.append((.control, 59)) }
+        if contains(.option) { keys.append((.option, 58)) }
+        if contains(.shift) { keys.append((.shift, 56)) }
+        if contains(.command) { keys.append((.command, 55)) }
+        return keys
+    }
+}
+
+/// Types and presses keys for the user.
+///
+/// The fourth sibling of `ElementClicker`, `ElementScroller` and `ElementDragger`, and the only one
+/// that posts no mouse event of its own: a keystroke is delivered to whatever holds the input focus,
+/// so the point is where the focus is put rather than where the keys are aimed.
+///
+/// **Two mechanisms, and neither is a choice.** Text is carried on the event itself
+/// (`keyboardSetUnicodeString`), because no key code produces 季 and a code's meaning depends on the
+/// keyboard layout. A combination is a real key code with the modifier flags on it, because AppKit
+/// matches a menu's key equivalent on the code and the flags — an event carrying the character "s"
+/// with ⌘ down triggers nothing at all.
+enum ElementKeyboard {
+
+    // MARK: - Limits
+
+    /// How fast Kiki types, in characters a second.
+    ///
+    /// Slow enough to watch and to interrupt, which is the whole of what typing buys over pasting:
+    /// the text is seen arriving, and the keyboard can be taken back mid-word.
+    static let charactersTypedPerSecond = 8
+
+    /// The gap between two typed characters, derived from the rate so that changing the speed is
+    /// changing one number.
+    private static var secondsBetweenTypedCharacters: Double {
+        1.0 / Double(charactersTypedPerSecond)
+    }
+
+    /// The most Kiki will type in one action. At `charactersTypedPerSecond` this is fifteen seconds
+    /// of watching, which is already long for a gesture whose end the user cannot see; anything
+    /// longer is a paste, and Kiki does not paste.
+    static let maximumCharacterCountKikiWillType = 120
+
+    /// The combinations Kiki will never press, by the way a menu writes them.
+    ///
+    /// Judged as a click's label is judged: a refusal costs the user one keystroke they can perform
+    /// themselves, and accepting costs something that cannot be undone. These are the ones with no
+    /// undo — emptying the trash and logging out, both of which macOS asks about but both of which
+    /// are the user's decisions to make; force quit, which takes whatever is unsaved in the app it
+    /// hits; and locking the screen. Quitting the frontmost app is here for the reason 「退出」 is on
+    /// the click's list: it is the same act written as a shortcut.
+    private static let writtenFormsKikiWillNotPress: Set<String> = [
+        "⇧⌘⌫",  // 清空废纸篓
+        "⇧⌘Q",  // 注销
+        "⌥⌘⎋",  // 强制退出
+        "⌃⌘Q",  // 锁屏
+        "⌘Q",   // 退出当前 App
+    ]
+
+    /// `.hidSystemState` describes the state a real keyboard would report, as on the click path.
+    private static let keyboardEventSource = CGEventSource(stateID: .hidSystemState)
+
+    /// Every key a combination may name: the code the system presses, and the way it is written.
+    ///
+    /// The code is what a shortcut is matched on, so it is the physical key rather than the
+    /// character — which is why a combination is read from a name and never derived from text.
+    private static let keysByName: [String: ElementKey] = {
+        var keys: [String: ElementKey] = [:]
+
+        // Letters and digits are written as themselves, a letter as its capital — the way a menu
+        // writes ⌘S.
+        let letterAndDigitKeyCodes: [String: CGKeyCode] = [
+            "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+            "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "o": 31, "u": 32,
+            "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
+            "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29,
+        ]
+        for (name, virtualKeyCode) in letterAndDigitKeyCodes {
+            keys[name] = ElementKey(virtualKeyCode: virtualKeyCode, name: name.uppercased())
+        }
+
+        // The punctuation keys, written as the character printed on them.
+        let punctuationKeyCodes: [String: CGKeyCode] = [
+            "-": 27, "=": 24, "[": 33, "]": 30, "\\": 42, ";": 41, "'": 39,
+            ",": 43, ".": 47, "/": 44, "`": 50,
+        ]
+        for (name, virtualKeyCode) in punctuationKeyCodes {
+            keys[name] = ElementKey(virtualKeyCode: virtualKeyCode, name: name)
+        }
+
+        // The keys whose name is not a character, written the way a menu writes them. Several names
+        // for one key are what that key is called, not several keys.
+        let namedKeyCodes: [(names: [String], virtualKeyCode: CGKeyCode, writtenAs: String)] = [
+            (["return", "enter"], 36, "↩"),
+            (["tab"], 48, "⇥"),
+            (["space"], 49, "␣"),
+            (["delete", "backspace"], 51, "⌫"),
+            (["forwarddelete", "del"], 117, "⌦"),
+            (["escape", "esc"], 53, "⎋"),
+            (["left"], 123, "←"),
+            (["right"], 124, "→"),
+            (["down"], 125, "↓"),
+            (["up"], 126, "↑"),
+            (["home"], 115, "↖"),
+            (["end"], 119, "↘"),
+            (["pageup"], 116, "⇞"),
+            (["pagedown"], 121, "⇟"),
+            (["f1"], 122, "F1"),
+            (["f2"], 120, "F2"),
+            (["f3"], 99, "F3"),
+            (["f4"], 118, "F4"),
+            (["f5"], 96, "F5"),
+            (["f6"], 97, "F6"),
+            (["f7"], 98, "F7"),
+            (["f8"], 100, "F8"),
+            (["f9"], 101, "F9"),
+            (["f10"], 109, "F10"),
+            (["f11"], 103, "F11"),
+            (["f12"], 111, "F12"),
+        ]
+        for (names, virtualKeyCode, writtenAs) in namedKeyCodes {
+            for name in names {
+                keys[name] = ElementKey(virtualKeyCode: virtualKeyCode, name: writtenAs)
+            }
+        }
+
+        return keys
+    }()
+
+    /// Every way a modifier is written: the words a developer types and the symbols a menu prints.
+    private static let modifiersByName: [String: ElementKeyModifiers] = [
+        "control": .control, "ctrl": .control, "⌃": .control,
+        "option": .option, "opt": .option, "alt": .option, "⌥": .option,
+        "shift": .shift, "⇧": .shift,
+        "command": .command, "cmd": .command, "⌘": .command,
+    ]
+
+    // MARK: - Reading a combination
+
+    /// Reads a combination from the way it is written: `cmd+shift+s` or `⌘⇧S`, `return`, `esc`.
+    ///
+    /// Both ways round — the words a developer types and the symbols a menu prints — in either case
+    /// and in any order, because the model writes whichever it saw last. Nil for anything that does
+    /// not read as a key with modifiers, so that a caller can say so out loud rather than press
+    /// something near it.
+    private static func combination(named name: String) -> ElementKeyCombination? {
+        let writtenName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !writtenName.isEmpty else { return nil }
+
+        var modifiers: ElementKeyModifiers = []
+        var remainder = Substring(writtenName)
+
+        // A name written in symbols has no separator to split on — ⌘⇧S is one run of modifiers and
+        // then the key — so those are peeled off the front before anything is split.
+        while let firstCharacter = remainder.first,
+              let modifier = modifiersByName[String(firstCharacter)] {
+            modifiers.insert(modifier)
+            remainder = remainder.dropFirst()
+        }
+
+        var keyNames = remainder
+            .split(separator: "+")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard let keyName = keyNames.popLast() else { return nil }
+        for modifierName in keyNames {
+            guard let modifier = modifiersByName[modifierName] else { return nil }
+            modifiers.insert(modifier)
+        }
+
+        guard let key = keysByName[keyName] else { return nil }
+        return ElementKeyCombination(key: key, modifiers: modifiers)
+    }
+
+    /// A combination as it is written, the way a menu writes it — `⌘⇧S`.
+    ///
+    /// The one place a combination becomes words, because two readers want it and they must not
+    /// disagree about which key was pressed: the bubble over the cursor, and the sentence the
+    /// terminal is answered with. A name that does not read as a combination comes back as it was
+    /// written, which is what the refusal sentence has to name.
+    static func phraseForPressingKey(_ name: String) -> String {
+        combination(named: name)?.writtenAs ?? name
+    }
+
+    // MARK: - Refusing
+
+    /// Whether typing into this element would be refused, and why — without typing anything.
+    ///
+    /// Typing begins by clicking the element to put the input focus in it, so the question is the
+    /// click's question — a tag with no label, a label naming something destructive, no
+    /// Accessibility — and it is answered by the click's own rules rather than by a keyboard copy of
+    /// them. The copy that drifted would be the one deciding whether 删除 gets typed into.
+    static func refusalOfTyping(
+        _ text: String,
+        matchingElementLabel elementLabel: String?,
+        origin: ElementClickOrigin
+    ) -> ElementKeyboardRefusal? {
+        let characterCount = text.count
+        guard characterCount <= maximumCharacterCountKikiWillType else {
+            return .theTextIsLongerThanKikiWillType(characterCount: characterCount)
+        }
+
+        if let clickRefusal = ElementClicker.refusalOfClick(
+            matchingElementLabel: elementLabel,
+            origin: origin
+        ) {
+            return .theElementCannotBeClicked(clickRefusal)
+        }
+
+        return nil
+    }
+
+    /// Whether a combination would be refused, and why — without pressing anything.
+    ///
+    /// Asked before the flight, which is what makes a refused combination not even turn the cursor
+    /// red: the cursor never going red is the whole of what "Kiki will not press that" looks like
+    /// from the user's side.
+    static func refusalOfCombination(named name: String) -> ElementKeyboardRefusal? {
+        guard let combination = combination(named: name) else {
+            return .theCombinationIsNotOneKikiKnows(name: name)
+        }
+        return refusalOfCombination(combination)
+    }
+
+    /// The rules themselves, for a combination that has already been read — so that the path that
+    /// asks before the flight and the path that presses at the end of it run the same ones.
+    private static func refusalOfCombination(
+        _ combination: ElementKeyCombination
+    ) -> ElementKeyboardRefusal? {
+        if writtenFormsKikiWillNotPress.contains(combination.writtenAs) {
+            return .theCombinationIsADangerousOne(matchedName: combination.writtenAs)
+        }
+
+        guard AXIsProcessTrusted() else {
+            return .accessibilityIsNotEnabled
+        }
+
+        return nil
+    }
+
+    // MARK: - Typing
+
+    /// Types a run of characters into the element at a point, one character at a time.
+    ///
+    /// The click comes first and is a real left click: it is what puts the input focus into the
+    /// field, and without it the characters land wherever the focus was last left. It goes through
+    /// `ElementClicker.clickElement` rather than a pair of events built here, because it is an
+    /// ordinary single click and a second copy of one is a second answer to what a click is.
+    static func typeText(
+        _ text: String,
+        atAppKitScreenLocation appKitScreenLocation: CGPoint,
+        primaryScreenHeightInPoints: CGFloat,
+        matchingElementLabel elementLabel: String?,
+        origin: ElementClickOrigin
+    ) async -> ElementKeyboardOutcome {
+        if let refusal = refusalOfTyping(text, matchingElementLabel: elementLabel, origin: origin) {
+            return refusal.outcome
+        }
+
+        let focusClickOutcome = await ElementClicker.clickElement(
+            atAppKitScreenLocation: appKitScreenLocation,
+            primaryScreenHeightInPoints: primaryScreenHeightInPoints,
+            matchingElementLabel: elementLabel,
+            kind: .singleClick,
+            origin: origin
+        )
+        // Unreachable behind the refusal above, which asked the click's own question with these same
+        // arguments. One outcome covers it rather than a translation of each of the click's: the
+        // refusals have already been reported, and what is left is a click that did not land — in
+        // which case there is nowhere for the text to go either way.
+        guard case .clicked = focusClickOutcome else {
+            return .failedToPostTheKeystrokes
+        }
+
+        // Every character's events are built before any is posted, as in a multi-press click and a
+        // drag: half a text is text the user has to notice and delete.
+        var eventsByCharacter: [[CGEvent]] = []
+        for character in text {
+            guard let events = keystrokeEvents(forTyping: String(character)) else {
+                return .failedToPostTheKeystrokes
+            }
+            eventsByCharacter.append(events)
+        }
+
+        for (characterNumber, eventsForThisCharacter) in eventsByCharacter.enumerated() {
+            // A gap exists only between two characters; the first goes out the moment it is built.
+            // `Task.sleep` and not `usleep`: this is the main actor, and the overlay is drawing the
+            // cursor on it for the whole of the time the text is going in.
+            if characterNumber > 0 {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(secondsBetweenTypedCharacters * 1_000_000_000)
+                )
+            }
+            for event in eventsForThisCharacter {
+                event.post(tap: .cghidEventTap)
+            }
+        }
+
+        return .postedTheKeystrokes
+    }
+
+    /// The press and the release of one typed character, or nil if either could not be built.
+    ///
+    /// The character rides on the event rather than being looked up as a key code: no code produces
+    /// 季, and a code's meaning depends on the layout and on what else is held down. This is also
+    /// what keeps the text from being a paste in any sense the app could notice — the characters go
+    /// in as keystrokes, the input method is not involved, and the pasteboard is never touched.
+    private static func keystrokeEvents(forTyping character: String) -> [CGEvent]? {
+        var events: [CGEvent] = []
+        for isKeyDown in [true, false] {
+            guard let event = CGEvent(
+                keyboardEventSource: keyboardEventSource,
+                virtualKey: 0,
+                keyDown: isKeyDown
+            ) else {
+                return nil
+            }
+            // Stated rather than inherited. An event built from `keyboardEventSource` starts with
+            // whatever flags that source is carrying, and a combination posted a moment before is
+            // enough to leave ⌘ on them — which delivers every character as a shortcut rather than
+            // as text into the field the click just put the focus in.
+            event.flags = []
+
+            // The key code types nothing of its own; the text on the event is the whole of what goes
+            // in. A character is more than one UTF-16 unit often enough that its count is the length
+            // handed over, not one.
+            var unicodeUnits = Array(character.utf16)
+            event.keyboardSetUnicodeString(
+                stringLength: unicodeUnits.count,
+                unicodeString: &unicodeUnits
+            )
+            events.append(event)
+        }
+        return events
+    }
+
+    // MARK: - Pressing a combination
+
+    /// Presses a combination at the input focus.
+    ///
+    /// Nothing is clicked first, deliberately: a click moves the insertion point, and no combination
+    /// Kiki presses wants the caret somewhere other than where the user left it.
+    static func pressCombination(named name: String) -> ElementKeyboardOutcome {
+        guard let combination = combination(named: name) else {
+            return .refusedBecauseTheCombinationIsNotOneKikiKnows(name: name)
+        }
+        if let refusal = refusalOfCombination(combination) {
+            return refusal.outcome
+        }
+
+        let flagsOfTheWholeCombination = combination.modifiers.asEventFlags
+        let modifierKeys = combination.modifiers.asKeysInTheOrderTheyArePressed
+
+        var events: [CGEvent] = []
+
+        // The modifiers are pressed as keys of their own before the key they modify, and released
+        // after it, because a flags field describes a modifier without ever pressing one. A pair of
+        // flagged events on its own leaves ⌘ down in the system once Kiki has finished — the window
+        // server holds it until some later event clears it — and the next thing to be typed, by
+        // Kiki or by the user, arrives as a shortcut rather than as text.
+        //
+        // The flags accumulate on the way down and unwind on the way up, so the last event of the
+        // sequence carries none and the keyboard is handed back as it was found.
+        var flagsWhileGoingDown: CGEventFlags = []
+        for (modifier, virtualKeyCode) in modifierKeys {
+            flagsWhileGoingDown.insert(modifier.asEventFlags)
+            guard let event = CGEvent(
+                keyboardEventSource: keyboardEventSource,
+                virtualKey: virtualKeyCode,
+                keyDown: true
+            ) else {
+                return .failedToPostTheKeystrokes
+            }
+            event.flags = flagsWhileGoingDown
+            events.append(event)
+        }
+
+        for isKeyDown in [true, false] {
+            guard let event = CGEvent(
+                keyboardEventSource: keyboardEventSource,
+                virtualKey: combination.key.virtualKeyCode,
+                keyDown: isKeyDown
+            ) else {
+                return .failedToPostTheKeystrokes
+            }
+            // On the release as well as the press: a key equivalent is matched on the flags the
+            // event carries, and the key going up is what an app sees of the gesture being finished
+            // rather than abandoned.
+            event.flags = flagsOfTheWholeCombination
+            events.append(event)
+        }
+
+        var flagsWhileComingUp = flagsOfTheWholeCombination
+        for (modifier, virtualKeyCode) in modifierKeys.reversed() {
+            flagsWhileComingUp.subtract(modifier.asEventFlags)
+            guard let event = CGEvent(
+                keyboardEventSource: keyboardEventSource,
+                virtualKey: virtualKeyCode,
+                keyDown: false
+            ) else {
+                return .failedToPostTheKeystrokes
+            }
+            event.flags = flagsWhileComingUp
+            events.append(event)
+        }
+
+        for event in events {
+            event.post(tap: .cghidEventTap)
+        }
+
+        return .postedTheKeystrokes
     }
 }
 

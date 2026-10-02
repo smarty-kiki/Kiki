@@ -82,7 +82,7 @@ enum ScreenshotTextRecognizer {
             try VNImageRequestHandler(cgImage: screenshotImage, options: [:])
                 .perform([textRecognitionRequest])
         } catch {
-            print("🔍 Text recognition failed: \(error)")
+            print("Text recognition failed: \(error)")
             return []
         }
 

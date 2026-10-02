@@ -91,7 +91,7 @@ enum CompanionScreenCaptureUtility {
             )
             try? jpegData.write(to: URL(fileURLWithPath: filePath))
         }
-        print("🖼️ Screenshot \(sequenceNumberText) screen \(screenNumber) "
+        print("Screenshot \(sequenceNumberText) screen \(screenNumber) "
             + "(\(widthInPixels)x\(heightInPixels)) → \(filePath)")
     }
 
@@ -129,7 +129,7 @@ enum CompanionScreenCaptureUtility {
             // Worth a line: it is the difference between a screenshot that shows what the last
             // action did and one that shows the screen as it was before it, and from outside the
             // app that difference is an unexplained few hundred milliseconds.
-            print("⏳ Screen still changing \(millisecondsWaited)ms in — waiting for it to settle")
+            print("Screen still changing \(millisecondsWaited)ms in — waiting for it to settle")
         }
 
         // Saved on its way out rather than inside the loop: the rounds above are checks, and only the
@@ -232,7 +232,7 @@ enum CompanionScreenCaptureUtility {
             if capturedWidthInPixels != configuration.width
                 || capturedHeightInPixels != configuration.height {
                 // Worth a line rather than silence: an ignored request is invisible otherwise.
-                print("⚠️ Screenshot is \(capturedWidthInPixels)x\(capturedHeightInPixels) "
+                print("Screenshot is \(capturedWidthInPixels)x\(capturedHeightInPixels) "
                     + "but \(configuration.width)x\(configuration.height) was requested")
             }
 

@@ -30,7 +30,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
 
     /// What the app does with each thing a terminal can send, given once, when the server is built.
     ///
-    /// An argument to the initializer rather than four properties assigned afterwards, because a
+    /// An argument to the initializer rather than six properties assigned afterwards, because a
     /// server that is listening without one of them accepts a connection it can never answer: the
     /// terminal waits on a handler nothing will call, which from out there is indistinguishable
     /// from Kiki being stuck. Required, a half-wired server does not compile, and there is no
@@ -38,16 +38,21 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
     ///
     /// The second argument of `commandHandler` is whether that terminal asked for the reply to be
     /// read aloud; the second argument of `clickHandler` is the terminal that asked for the click,
-    /// so its answer can be addressed back to it.
+    /// so its answer can be addressed back to it. Both of the reading commands are given the
+    /// terminal that asked for the same reason.
     init(
         commandHandler: @escaping @MainActor (String, Bool) -> Void,
         cancelHandler: @escaping @MainActor () -> Void,
         clickHandler: @escaping @MainActor (KikiClickRequest, CommandTerminalIdentifier) -> Void,
+        screenshotHandler: @escaping @MainActor (KikiScreenshotRequest, CommandTerminalIdentifier) -> Void,
+        locateHandler: @escaping @MainActor (KikiLocateRequest, CommandTerminalIdentifier) -> Void,
         readinessProvider: @escaping @MainActor () -> KikiCommandReadiness
     ) {
         self.commandHandler = commandHandler
         self.cancelHandler = cancelHandler
         self.clickHandler = clickHandler
+        self.screenshotHandler = screenshotHandler
+        self.locateHandler = locateHandler
         self.readinessProvider = readinessProvider
     }
 
@@ -58,6 +63,11 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
     /// outlives the moment it was asked for, while the reply-watching role may change hands in the
     /// meantime: whoever performs the click reports the outcome to that terminal and no other.
     private let clickHandler: @MainActor (KikiClickRequest, CommandTerminalIdentifier) -> Void
+
+    /// A terminal asking Kiki to read the screen and tell it what it saw — a picture of one screen,
+    /// or where a piece of text is. Answered on the terminal's own connection, like a click.
+    private let screenshotHandler: @MainActor (KikiScreenshotRequest, CommandTerminalIdentifier) -> Void
+    private let locateHandler: @MainActor (KikiLocateRequest, CommandTerminalIdentifier) -> Void
 
     /// Asked on the main actor once per connection — never per chunk. The permission flags and the
     /// Keychain item it reads both belong to the main actor, and a round trip per chunk would put
@@ -139,7 +149,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
 
         let pathByteCount = KikiCommandProtocol.socketPath.utf8.count
         guard pathByteCount <= KikiCommandProtocol.maximumSocketPathByteCount else {
-            print("🔌 Command socket path is \(pathByteCount) bytes, past the \(KikiCommandProtocol.maximumSocketPathByteCount)-byte limit a `sockaddr_un` can hold — the kiki command line tool cannot connect.")
+            print("Command socket path is \(pathByteCount) bytes, past the \(KikiCommandProtocol.maximumSocketPathByteCount)-byte limit a `sockaddr_un` can hold — the kiki command line tool cannot connect.")
             return
         }
 
@@ -150,7 +160,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            print("🔌 Could not create \(KikiCommandProtocol.socketDirectoryPath): \(error)")
+            print("Could not create \(KikiCommandProtocol.socketDirectoryPath): \(error)")
             return
         }
 
@@ -161,7 +171,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
 
         let fileDescriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fileDescriptor >= 0 else {
-            print("🔌 Could not open a command socket: errno \(errno)")
+            print("Could not open a command socket: errno \(errno)")
             return
         }
 
@@ -180,7 +190,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
             }
         }
         guard bindResult == 0 else {
-            print("🔌 Could not bind \(KikiCommandProtocol.socketPath): errno \(errno)")
+            print("Could not bind \(KikiCommandProtocol.socketPath): errno \(errno)")
             close(fileDescriptor)
             return
         }
@@ -190,7 +200,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
         chmod(KikiCommandProtocol.socketPath, S_IRUSR | S_IWUSR)
 
         guard listen(fileDescriptor, 8) == 0 else {
-            print("🔌 Could not listen on \(KikiCommandProtocol.socketPath): errno \(errno)")
+            print("Could not listen on \(KikiCommandProtocol.socketPath): errno \(errno)")
             close(fileDescriptor)
             return
         }
@@ -206,7 +216,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
         source.resume()
         listeningSource = source
 
-        print("🔌 Command socket listening at \(KikiCommandProtocol.socketPath)")
+        print("Command socket listening at \(KikiCommandProtocol.socketPath)")
     }
 
     // MARK: - Connections
@@ -318,7 +328,7 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
 
             guard !lineBytes.isEmpty else { continue }
             guard let request = try? KikiCommandProtocol.makeDecoder().decode(KikiCommandRequest.self, from: lineBytes) else {
-                print("🔌 Ignoring an unreadable line from the command line tool")
+                print("Ignoring an unreadable line from the command line tool")
                 continue
             }
             handOff(request, from: identifier)
@@ -344,6 +354,14 @@ nonisolated final class CompanionCommandSocketServer: @unchecked Sendable {
             // time the click has been made the reply-watching role may belong to somebody else, or
             // to nobody, and neither of those is who asked.
             Task { @MainActor in clickHandler(clickRequest, identifier) }
+
+        case KikiCommandProtocol.MessageType.screenshot:
+            guard let screenshotRequest = request.screenshot else { return }
+            Task { @MainActor in screenshotHandler(screenshotRequest, identifier) }
+
+        case KikiCommandProtocol.MessageType.locate:
+            guard let locateRequest = request.locate else { return }
+            Task { @MainActor in locateHandler(locateRequest, identifier) }
 
         default:
             // An unknown type is ignored rather than treated as an error, so a newer CLI can add

@@ -38,7 +38,7 @@ enum BuddyTranscriptionProviderFactory {
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
         let provider = resolveProvider()
-        print("🎙️ Transcription: using \(provider.displayName)")
+        print("Transcription: using \(provider.displayName)")
         return provider
     }
 
@@ -60,14 +60,14 @@ enum BuddyTranscriptionProviderFactory {
                 return assemblyAIProvider
             }
 
-            print("⚠️ Transcription: AssemblyAI preferred but not configured, falling back")
+            print("Transcription: AssemblyAI preferred but not configured, falling back")
 
             if openAIProvider.isConfigured {
-                print("⚠️ Transcription: using OpenAI as fallback")
+                print("Transcription: using OpenAI as fallback")
                 return openAIProvider
             }
 
-            print("⚠️ Transcription: using Apple Speech as fallback")
+            print("Transcription: using Apple Speech as fallback")
             return AppleSpeechTranscriptionProvider()
         }
 
@@ -76,14 +76,14 @@ enum BuddyTranscriptionProviderFactory {
                 return openAIProvider
             }
 
-            print("⚠️ Transcription: OpenAI preferred but not configured, falling back")
+            print("Transcription: OpenAI preferred but not configured, falling back")
 
             if assemblyAIProvider.isConfigured {
-                print("⚠️ Transcription: using AssemblyAI as fallback")
+                print("Transcription: using AssemblyAI as fallback")
                 return assemblyAIProvider
             }
 
-            print("⚠️ Transcription: using Apple Speech as fallback")
+            print("Transcription: using Apple Speech as fallback")
             return AppleSpeechTranscriptionProvider()
         }
 

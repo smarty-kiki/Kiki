@@ -672,11 +672,11 @@ private struct PointingCalibration {
             imageHeightInPixels: options.imageHeightInPixels,
             markers: markers
         ) else {
-            print("✗ 渲染失败")
+            print("渲染失败")
             exit(1)
         }
         guard let jpegData = encodeAsJPEG(renderedImage) else {
-            print("✗ JPEG 编码失败")
+            print("JPEG 编码失败")
             exit(1)
         }
         try? jpegData.write(to: URL(fileURLWithPath: options.renderedImagePath))
@@ -694,7 +694,7 @@ private struct PointingCalibration {
         do {
             apiKey = try readAPIKey()
         } catch {
-            print("✗ \(error.localizedDescription)")
+            print("\(error.localizedDescription)")
             exit(1)
         }
 
@@ -713,7 +713,7 @@ private struct PointingCalibration {
                 model: options.model
             )
         } catch {
-            print("✗ 请求失败: \(error.localizedDescription)")
+            print("请求失败: \(error.localizedDescription)")
             exit(1)
         }
 
@@ -732,7 +732,7 @@ private struct PointingCalibration {
 
         let matchedMarkers = markers.filter { $0.reportedPixelCoordinate != nil }
         guard !matchedMarkers.isEmpty else {
-            print("✗ 回复里没有能和方块对应上的 [POINT:…] 标签，无法校准。")
+            print("回复里没有能和方块对应上的 [POINT:…] 标签，无法校准。")
             exit(1)
         }
 
@@ -804,11 +804,11 @@ private struct PointingCalibration {
             imageWidthInPixels: options.imageWidthInPixels,
             imageHeightInPixels: options.imageHeightInPixels
         ) else {
-            print("✗ 渲染失败")
+            print("渲染失败")
             exit(1)
         }
         guard let jpegData = encodeAsJPEG(renderedImage) else {
-            print("✗ JPEG 编码失败")
+            print("JPEG 编码失败")
             exit(1)
         }
         try? jpegData.write(to: URL(fileURLWithPath: options.renderedImagePath))
@@ -828,7 +828,7 @@ private struct PointingCalibration {
         do {
             apiKey = try readAPIKey()
         } catch {
-            print("✗ \(error.localizedDescription)")
+            print("\(error.localizedDescription)")
             exit(1)
         }
 
@@ -846,7 +846,7 @@ private struct PointingCalibration {
                     model: options.model
                 )
             } catch {
-                print("✗ 「\(element.question)」请求失败: \(error.localizedDescription)")
+                print("「\(element.question)」请求失败: \(error.localizedDescription)")
                 continue
             }
             print("问: \(element.question)")
@@ -866,7 +866,7 @@ private struct PointingCalibration {
     ) {
         let answered = elements.filter { $0.reportedPixelCoordinate != nil }
         guard !answered.isEmpty else {
-            print("✗ 没有一条回复里带可解析的 [POINT:…] 标签，无法判断。")
+            print("没有一条回复里带可解析的 [POINT:…] 标签，无法判断。")
             exit(1)
         }
 

@@ -62,7 +62,7 @@ final class ElevenLabsTTSClient {
         let player = try AVAudioPlayer(data: data)
         self.audioPlayer = player
         player.play()
-        print("🔊 ElevenLabs TTS: playing \(data.count / 1024)KB audio")
+        print("ElevenLabs TTS: playing \(data.count / 1024)KB audio")
     }
 
     /// Whether TTS audio is currently playing back.

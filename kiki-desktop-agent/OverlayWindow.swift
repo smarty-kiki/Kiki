@@ -337,7 +337,22 @@ struct CursorView: View {
         "拖着它走！"
     ]
 
+    /// For an arrival where Kiki is about to type, tagged [TYPE:...]. The words being typed are
+    /// deliberately not in the bubble — a paragraph of Chinese where a two-word phrase goes would
+    /// say less than the pool does, and what the user needs to read at a glance is that the keyboard
+    /// is about to be used at all.
+    private let navigationTypingPhrases = [
+        "帮你打字！",
+        "这就打上去！",
+        "我来输入！"
+    ]
+
     /// The phrase pool an arrival draws from, chosen by what the model's tag asked for.
+    ///
+    /// A combination's pool is built here rather than kept as a stored array, because the one thing
+    /// that makes it worth saying is *which* combination it is — and the name is written the one way
+    /// `ElementKeyboard.phraseForPressingKey` writes it, so the bubble, the report sentence and the
+    /// terminal all say ⌘S the same way round.
     private func phrases(
         for pointingBubbleInvitation: CompanionManager.PointingBubbleInvitation
     ) -> [String] {
@@ -348,6 +363,14 @@ struct CursorView: View {
         case .tripleClickElement: return navigationTripleClickPhrases
         case .rightClickElement: return navigationRightClickPhrases
         case .dragElement: return navigationDragPhrases
+        case .keyboardElement(.text): return navigationTypingPhrases
+        case .keyboardElement(.combination(let name)):
+            let writtenCombination = ElementKeyboard.phraseForPressingKey(name)
+            return [
+                "帮你按 \(writtenCombination)！",
+                "这就按 \(writtenCombination)！",
+                "按一下 \(writtenCombination)！"
+            ]
         case .scrollElement(let direction, _):
             switch direction {
             case .up: return navigationScrollUpPhrases
@@ -595,10 +618,12 @@ struct CursorView: View {
                 startWakingFromStatusItemIcon()
             }
         }
-        // Keyed on the location alone, not on the target: the manager withdraws the press of a stop
-        // the cursor is standing on without moving it, and a flight to the spot it never left would
-        // be the result of watching the whole value.
-        .onChange(of: companionManager.pointingTarget?.screenLocation) { _ in
+        // Keyed on the flight the manager has asked for rather than on where it goes: two stops of
+        // one tour can name the same point, and keyed on the location the second of them was never
+        // flown to — no bubble, no arrival, and an action that quietly never happened. The manager
+        // bumps this only for a flight, so withdrawing the press of the stop the cursor is standing
+        // on still moves nothing.
+        .onChange(of: companionManager.pointingFlightRequestCount) { _ in
             // Fly the buddy to the detected element so it points at it. Read as the target whole
             // rather than as the two fields the flight needs: a newer flight that landed between the
             // change and this callback is the one to fly, and the fields of one target are the only

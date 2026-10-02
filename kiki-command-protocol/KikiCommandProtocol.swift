@@ -53,6 +53,16 @@ nonisolated enum KikiCommandProtocol {
         /// The one gesture that is a movement between two points rather than an event at one, and
         /// the only one `KikiClickRequest.dragToGlobalScreenX` means anything for.
         static let drag = "drag"
+
+        /// Typing words into whatever has the focus at the point, one character at a time. The
+        /// words are `KikiClickRequest.typedText` and are the only gesture with a payload that is
+        /// the action itself rather than a parameter of it.
+        static let typeText = "typeText"
+
+        /// Pressing a combination — `cmd+s`, `⌘⇧T` — at the point. `KikiClickRequest.keyCombination`
+        /// names it, and unlike typing this presses no mouse button first: a click would move the
+        /// insertion point out from under the keys.
+        static let pressKey = "pressKey"
     }
 
     /// Message `type` values, for both directions. Strings rather than an enum so that an
@@ -77,6 +87,23 @@ nonisolated enum KikiCommandProtocol {
         /// own, because the terminal is waiting on the same question either way — "did it happen,
         /// and where" — and an old tool reads a scroll's answer as readily as a click's.
         static let clicked = "clicked"
+
+        /// A picture of one screen, as base64 JPEG in the one JSON line. Base64 rather than a
+        /// second channel because the socket is one JSON message per line and both ends already
+        /// frame it that way; a side channel would be a second protocol to keep in step with this
+        /// one, and the first thing to drift would be which of the two was authoritative.
+        static let screenshot = "screenshot"
+
+        /// The picture arrived, in `KikiCommandEvent.screenshotJPEGBase64`.
+        static let captured = "captured"
+
+        /// Where a piece of text is on screen: a question with no action in it at all. Neither a
+        /// point nor an occurrence number is sent — every appearance is wanted, which is the whole
+        /// difference between this and a click by text.
+        static let locate = "locate"
+
+        /// The answer to that question, in `KikiCommandEvent.locatedPoints`.
+        static let located = "located"
     }
 
     /// The coders both ends use, so a change to formatting cannot make one end unreadable to
@@ -127,6 +154,26 @@ nonisolated struct KikiCommandReadiness: Codable {
     /// rather than with a scroll of the wrong length. Only a distance that is not whole is asked
     /// about, because such an app still reads `-b 3` correctly.
     let understandsFractionalScreenfuls: Bool?
+
+    /// And again for the two keyboard gestures.
+    ///
+    /// Named per gesture rather than as one "understands the keyboard", for the reason the drag's
+    /// flag gives: an app built between the two — one that types but does not press combinations —
+    /// is a real thing to be talking to, and one flag would have it refuse a request it understands.
+    let understandsTyping: Bool?
+    let understandsPressingKeys: Bool?
+
+    /// And again for the two commands that only read the screen.
+    ///
+    /// Neither is a gesture — nothing on the machine changes and no switch has an opinion — but they
+    /// meet the same trap the flags above exist for, and the one they would fall into is worse than
+    /// any of those: an app that does not know a request type ignores it in silence, so a newer tool
+    /// talking to an older Kiki would sit out its whole timeout and report a wait that ran out, which
+    /// it cannot tell from Kiki having gone away. Named per command rather than as one "understands
+    /// reading the screen", for the reason the keyboard's two are separate: an app built between
+    /// them is a real thing to be talking to.
+    let understandsScreenshots: Bool?
+    let understandsLocatingText: Bool?
 }
 
 /// Where a terminal wants a mouse action performed, in one of the two ways it can say: a point, or
@@ -185,6 +232,52 @@ nonisolated struct KikiClickRequest: Codable {
     /// arrives. A drag with no destination is refused rather than read as a press.
     var dragToGlobalScreenX: Double?
     var dragToGlobalScreenY: Double?
+
+    /// The words to type, read only by `Gesture.typeText`.
+    ///
+    /// A `var` optional rather than a nested payload type, for the drag's reason: an app built
+    /// before typing decodes the request whole and ignores the field, rather than failing on a
+    /// shape it has never seen — so what an old app does with it is refuse the gesture it does not
+    /// know, which is a sentence the terminal can read, instead of a dropped connection.
+    var typedText: String?
+
+    /// The combination to press, spelled the way `ElementKeyCombination` reads it — `cmd+s`,
+    /// `cmd+shift+t`, `⌘⇧S`. Read only by `Gesture.pressKey`.
+    ///
+    /// A name rather than a key code and a modifier mask, deliberately: the table of combinations
+    /// Kiki will not press lives in the app and is matched on the written form, and a terminal that
+    /// had to encode `⌥⌘⎋` as bits would have to know that table to spell it the way it is matched.
+    var keyCombination: String?
+}
+
+/// Which screen a terminal wants a picture of.
+nonisolated struct KikiScreenshotRequest: Codable {
+    /// The one screen to capture, 1-based in capture order — the pointer's screen first, the rest
+    /// behind it, the same numbering `KikiClickRequest.screenNumber` uses. Absent means that first
+    /// screen, because a picture is one screen's worth by construction and the one the user is
+    /// looking at is the one they mean.
+    var screenNumber: Int?
+}
+
+/// The text a terminal wants located on screen.
+nonisolated struct KikiLocateRequest: Codable {
+    /// The character or word to look for, as the user typed it.
+    var text: String
+
+    /// The one screen to search, 1-based in that same order. Absent means every screen, which is
+    /// what a search wants: the text is wanted wherever it is.
+    var screenNumber: Int?
+}
+
+/// One place a piece of text was found on screen.
+nonisolated struct KikiLocatedPoint: Codable {
+    /// The centre of the text, in the global screen space — the same one `KikiClickRequest` takes
+    /// its point in, so a terminal can hand it straight back as `kiki click -x -y`.
+    var globalScreenX: Double
+    var globalScreenY: Double
+
+    /// Which screen it is on, 1-based in capture order.
+    var screenNumber: Int
 }
 
 /// A line the CLI sent to the app.
@@ -201,6 +294,12 @@ nonisolated struct KikiCommandRequest: Codable {
 
     var click: KikiClickRequest?
 
+    /// A nested payload rather than more fields on this type, for the drag's reason read the other
+    /// way round: a `screenshot` arriving at an app built before it is then a request whose *type*
+    /// it does not know — ignored whole — rather than one it half reads.
+    var screenshot: KikiScreenshotRequest?
+    var locate: KikiLocateRequest?
+
     static func command(_ commandText: String, speakReply: Bool) -> KikiCommandRequest {
         KikiCommandRequest(
             type: KikiCommandProtocol.MessageType.command,
@@ -211,6 +310,14 @@ nonisolated struct KikiCommandRequest: Codable {
 
     static func click(_ clickRequest: KikiClickRequest) -> KikiCommandRequest {
         KikiCommandRequest(type: KikiCommandProtocol.MessageType.click, click: clickRequest)
+    }
+
+    static func screenshot(_ screenshotRequest: KikiScreenshotRequest) -> KikiCommandRequest {
+        KikiCommandRequest(type: KikiCommandProtocol.MessageType.screenshot, screenshot: screenshotRequest)
+    }
+
+    static func locate(_ locateRequest: KikiLocateRequest) -> KikiCommandRequest {
+        KikiCommandRequest(type: KikiCommandProtocol.MessageType.locate, locate: locateRequest)
     }
 
     static let cancel = KikiCommandRequest(type: KikiCommandProtocol.MessageType.cancel)
@@ -231,6 +338,22 @@ nonisolated struct KikiCommandEvent: Codable {
     var understandsTripleClick: Bool?
     var understandsDragging: Bool?
     var understandsFractionalScreenfuls: Bool?
+    var understandsTyping: Bool?
+    var understandsPressingKeys: Bool?
+    var understandsScreenshots: Bool?
+    var understandsLocatingText: Bool?
+
+    /// The picture, base64-encoded JPEG. Base64 because the message is one JSON line and a JPEG's
+    /// own bytes would not survive it.
+    var screenshotJPEGBase64: String?
+
+    /// Which screen the picture is of, 1-based in capture order.
+    var screenNumber: Int?
+
+    /// Every place the text was found, in reading order — top to bottom, left to right, screen 1
+    /// before screen 2. Never empty: a search that found nothing is a refusal, so a terminal that
+    /// reads a `located` always has at least one coordinate to use.
+    var locatedPoints: [KikiLocatedPoint]?
 
     /// Whether a `failed` was the app declining to act rather than trying and not managing it.
     ///
@@ -239,6 +362,10 @@ nonisolated struct KikiCommandEvent: Codable {
     /// alone cannot be read for it.
     var isRefusal: Bool?
 
+    /// Hand-written rather than memberwise, because these fields are `var` optionals: a readiness
+    /// flag added to the struct defaults to nil in a synthesised initialiser and this copy would go
+    /// on compiling without it — and the terminal would be told Kiki is too old, which is exactly
+    /// the refusal the flag exists to make true.
     static func ready(_ readiness: KikiCommandReadiness) -> KikiCommandEvent {
         KikiCommandEvent(
             type: KikiCommandProtocol.MessageType.ready,
@@ -247,7 +374,11 @@ nonisolated struct KikiCommandEvent: Codable {
             understandsScrolling: readiness.understandsScrolling,
             understandsTripleClick: readiness.understandsTripleClick,
             understandsDragging: readiness.understandsDragging,
-            understandsFractionalScreenfuls: readiness.understandsFractionalScreenfuls
+            understandsFractionalScreenfuls: readiness.understandsFractionalScreenfuls,
+            understandsTyping: readiness.understandsTyping,
+            understandsPressingKeys: readiness.understandsPressingKeys,
+            understandsScreenshots: readiness.understandsScreenshots,
+            understandsLocatingText: readiness.understandsLocatingText
         )
     }
 
@@ -280,6 +411,28 @@ nonisolated struct KikiCommandEvent: Codable {
     /// click went out, not on text.
     static func clicked(message: String) -> KikiCommandEvent {
         KikiCommandEvent(type: KikiCommandProtocol.MessageType.clicked, message: message)
+    }
+
+    /// The picture arrived, base64-encoded in `screenshotJPEGBase64`.
+    ///
+    /// `message` is the app's own sentence about which screen it is — 「已截取第 1/2 块屏幕。」 —
+    /// and goes to the terminal's stderr, because this command's stdout is carrying the bytes.
+    static func captured(message: String, screenshotJPEGBase64: String, screenNumber: Int) -> KikiCommandEvent {
+        KikiCommandEvent(
+            type: KikiCommandProtocol.MessageType.captured,
+            message: message,
+            screenshotJPEGBase64: screenshotJPEGBase64,
+            screenNumber: screenNumber
+        )
+    }
+
+    /// Where the text was found, in `locatedPoints` and in reading order.
+    static func located(message: String, locatedPoints: [KikiLocatedPoint]) -> KikiCommandEvent {
+        KikiCommandEvent(
+            type: KikiCommandProtocol.MessageType.located,
+            message: message,
+            locatedPoints: locatedPoints
+        )
     }
 
     static func failed(message: String, isRefusal: Bool) -> KikiCommandEvent {

@@ -38,13 +38,22 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
 
                 Spacer()
-                    .frame(height: 12)
+                    .frame(height: 4)
 
                 automaticClickingToggleRow
                     .padding(.horizontal, 16)
 
                 Spacer()
-                    .frame(height: 14)
+                    .frame(height: 4)
+
+                automaticKeyboardToggleRow
+                    .padding(.horizontal, 16)
+
+                // 10 rather than the 4 the rows above use: a settings row carries 4pt of padding
+                // of its own and its switch is drawn taller than its label, and this section
+                // carries neither, so the difference is added here to leave the same gap again.
+                Spacer()
+                    .frame(height: 10)
 
                 savedDeepSeekAPIKeySection
                     .padding(.horizontal, 16)
@@ -183,9 +192,14 @@ struct CompanionPanelView: View {
                     .fill(progress.isRunning ? DS.Colors.blue400 : DS.Colors.textTertiary)
                     .frame(width: 6, height: 6)
 
-                Text(taskStateDescription(of: progress))
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
+                // The clock is read here rather than on the manager: what moves every second is the
+                // distance to a moment, not the moment itself, and that distance is drawn by this
+                // one line and nobody else.
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(taskStateDescription(of: progress, at: context.date))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
 
                 Spacer()
 
@@ -217,15 +231,36 @@ struct CompanionPanelView: View {
         )
     }
 
-    /// Whether Kiki is still working on the task, and which step of it it is on.
-    private func taskStateDescription(of progress: TaskProgress) -> String {
+    /// Whether Kiki is still working on the task, which step of it it is on, and — once it is over —
+    /// how long it has before it resets.
+    ///
+    /// The countdown is shown only while nothing is running, because that is the only time it says
+    /// anything: a task in progress is activity, and every step of it pushes the moment back.
+    private func taskStateDescription(of progress: TaskProgress, at now: Date) -> String {
         guard progress.isRunning else {
-            // Deliberately 忙完了 rather than a countdown to the idle reset: the task is over as far
-            // as the user is concerned, and the history being kept is what the next question will
-            // continue from rather than something still in progress.
-            return "忙完了"
+            return "忙完了" + conversationRemainingDescription(of: progress, at: now)
         }
         return "正在忙 · 第 \(progress.stepInTheRoundInProgress) 步"
+    }
+
+    /// How long the task that is over has left before it resets, and then which question resets it.
+    ///
+    /// Nothing is dropped at the moment the countdown runs out — the history goes when the next
+    /// question arrives and finds it too old — so this says when the reset comes rather than
+    /// announcing one that has not happened. The card keeps its shape either way.
+    private func conversationRemainingDescription(of progress: TaskProgress, at now: Date) -> String {
+        guard let secondsLeft = progress.secondsBeforeTheNextQuestionStartsANewConversation(from: now) else {
+            return ""
+        }
+        guard secondsLeft > 0 else {
+            return " · 再问就重置"
+        }
+
+        if secondsLeft >= 60 {
+            // Rounded up, so most of a minute reads as that minute rather than as the one below it.
+            return " · \(Int(ceil(secondsLeft / 60))) 分钟后重置"
+        }
+        return " · \(Int(secondsLeft)) 秒后重置"
     }
 
     /// How full Kiki's head is, said the way a person would say it rather than the way the
@@ -872,6 +907,42 @@ struct CompanionPanelView: View {
             Toggle("", isOn: Binding(
                 get: { companionManager.isAutomaticClickingEnabled },
                 set: { companionManager.setAutomaticClickingEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// The switch for the other way Kiki reaches the machine.
+    ///
+    /// A row of its own rather than folded into the mouse's, because they are two permissions in the
+    /// user's mind as much as in the code: typing into a field and pressing a combination are felt as
+    /// "Kiki has my keyboard", which is a different thing from "Kiki has my mouse", and someone who
+    /// wants to watch it point and click without ever touching the keyboard must be able to say so.
+    ///
+    /// Off, a `[TYPE:…]` or `[KEY:…]` means what a `[CLICK:…]` means with the mouse switch off: the
+    /// cursor still flies to the element and the bubble still says 「看这里」.
+    private var automaticKeyboardToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "keyboard")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("允许 Kiki 用键盘操作")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isAutomaticKeyboardEnabled },
+                set: { companionManager.setAutomaticKeyboardEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

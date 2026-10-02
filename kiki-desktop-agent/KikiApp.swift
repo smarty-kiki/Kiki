@@ -33,8 +33,8 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         // on purpose — the in-flight flag belongs to the dead process and reads false here.
         PointerCarrier.reattachTheMouseUnconditionally()
 
-        print("🎯 Kiki: Starting...")
-        print("🎯 Kiki: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
+        print("Kiki: Starting...")
+        print("Kiki: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 

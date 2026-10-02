@@ -236,7 +236,7 @@ final class AppleTTSClient {
         // thing to happen is a buffer going into it — scheduling into a stopped engine fails
         // silently, which would be the rest of the reply going quiet with no fault reported anywhere.
         if isPlaybackEngineRunning, !playbackEngine.isRunning {
-            print("🔊 TTS: the playback engine had stopped, rebuilding it before this segment")
+            print("TTS: the playback engine had stopped, rebuilding it before this segment")
             disconnectThePlaybackGraph()
         }
 
@@ -262,7 +262,7 @@ final class AppleTTSClient {
             // Reported rather than swallowed, but not fatal to the reply:
             // `handlePlaybackHeadTick` finds no playback position, runs out its missing readings
             // and ends the segment, which releases the rest of it.
-            print("⚠️ TTS playback engine failed to start: \(error)")
+            print("TTS playback engine failed to start: \(error)")
         }
     }
 
@@ -348,7 +348,7 @@ final class AppleTTSClient {
               let playbackTime = playbackPlayerNode.playerTime(forNodeTime: lastRenderTime) else {
             consecutiveMissingPlaybackReadings += 1
             if consecutiveMissingPlaybackReadings >= Self.consecutiveMissingPlaybackReadingsBeforeGivingUp {
-                print("🔇 TTS: the playback position went missing — segment \(currentlyPlayingSegment?.segmentIndex ?? -1) is written off as played, so the rest of this reply is silent")
+                print("TTS: the playback position went missing — segment \(currentlyPlayingSegment?.segmentIndex ?? -1) is written off as played, so the rest of this reply is silent")
                 finishCurrentSegmentPlayback()
             }
             return
@@ -402,9 +402,6 @@ final class AppleTTSClient {
         // The gap before the next segment is silent, and the timer that would have reported the
         // silence is stopped here — so the last sound of the segment is reported over by this.
         onVoiceLoudness?(0)
-        // TEMPORARY, with the 🔇/🔊 lines above: what this voice measures, to check the glow's
-        // scale against it. Comes out with them.
-        print("🔊 TTS: segment peak \(String(format: "%.3f", playbackLoudnessMeasurement.peakRootMeanSquare)) rms")
         onPlaybackFinished?()
     }
 
@@ -456,7 +453,6 @@ private nonisolated final class PlaybackLoudnessMeasurement {
 
     private let lock = NSLock()
     private var mostRecentRootMeanSquare: Float = 0
-    private var highestRootMeanSquareSinceReset: Float = 0
 
     /// The most recent buffer's level, which is what a tick reports.
     var rootMeanSquare: Float {
@@ -465,17 +461,9 @@ private nonisolated final class PlaybackLoudnessMeasurement {
         return mostRecentRootMeanSquare
     }
 
-    /// The loudest level since the last reset, which nothing but the diagnostic read uses.
-    var peakRootMeanSquare: Float {
-        lock.lock()
-        defer { lock.unlock() }
-        return highestRootMeanSquareSinceReset
-    }
-
     func record(rootMeanSquare: Float) {
         lock.lock()
         mostRecentRootMeanSquare = rootMeanSquare
-        highestRootMeanSquareSinceReset = max(highestRootMeanSquareSinceReset, rootMeanSquare)
         lock.unlock()
     }
 
@@ -484,7 +472,6 @@ private nonisolated final class PlaybackLoudnessMeasurement {
     func reset() {
         lock.lock()
         mostRecentRootMeanSquare = 0
-        highestRootMeanSquareSinceReset = 0
         lock.unlock()
     }
 }

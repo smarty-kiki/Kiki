@@ -49,7 +49,7 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
         let temporaryToken = try await fetchTemporaryToken()
-        print("🎙️ AssemblyAI: fetched temporary token (\(temporaryToken.prefix(20))...)")
+        print("AssemblyAI: fetched temporary token (\(temporaryToken.prefix(20))...)")
 
         let session = AssemblyAIStreamingTranscriptionSession(
             apiKey: nil,
@@ -415,11 +415,11 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             if self.isAwaitingExplicitFinalTranscript
                 && !self.hasDeliveredFinalTranscript
                 && !latestTranscriptText.isEmpty {
-                print("[AssemblyAI] ⚠️ WebSocket error during active session, delivering partial transcript as fallback: \(error.localizedDescription)")
+                print("[AssemblyAI] WebSocket error during active session, delivering partial transcript as fallback: \(error.localizedDescription)")
                 self.deliverFinalTranscriptIfNeeded(latestTranscriptText)
                 return
             }
-            print("[AssemblyAI] ❌ Session failed with error: \(error.localizedDescription)")
+            print("[AssemblyAI] Session failed with error: \(error.localizedDescription)")
 
             self.onError(error)
         }

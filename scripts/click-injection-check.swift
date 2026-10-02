@@ -298,7 +298,7 @@ final class ClickInjectionCheck {
 
     static func run(repetitions: Int, onlyMethod: ClickInjectionMethod?) async {
         guard AXIsProcessTrusted() else {
-            print("❌ 没有辅助功能权限，事件发不出去。")
+            print("没有辅助功能权限，事件发不出去。")
             print("   权限判给的是「为这个进程负责的那个 app」——从终端跑，要授权的是终端本身。")
             print("   打开「系统设置 → 隐私与安全性 → 辅助功能」，把你的终端加进去再跑一次。")
             exit(1)
@@ -670,20 +670,20 @@ private func parseArguments() -> (repetitions: Int, onlyMethod: ClickInjectionMe
         switch argument {
         case "--repetitions":
             guard let parsed = arguments.first.flatMap(Int.init) else {
-                print("❌ --repetitions 需要一个数字"); exit(1)
+                print("--repetitions 需要一个数字"); exit(1)
             }
             repetitions = parsed
             arguments.removeFirst()
         case "--only":
             guard let name = arguments.first, let method = ClickInjectionMethod(rawValue: name) else {
-                print("❌ --only 需要一个方式名，可选：")
+                print("--only 需要一个方式名，可选：")
                 ClickInjectionMethod.allCases.forEach { print("     \($0.rawValue)") }
                 exit(1)
             }
             onlyMethod = method
             arguments.removeFirst()
         default:
-            print("❌ 不认识的参数 \(argument)")
+            print("不认识的参数 \(argument)")
             print("   可选：--repetitions N | --only <方式名>")
             ClickInjectionMethod.allCases.forEach { print("     方式名：\($0.rawValue)") }
             exit(1)

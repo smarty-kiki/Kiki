@@ -222,7 +222,7 @@ class DeepSeekAPI {
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
         let payloadMB = Double(bodyData.count) / 1_048_576.0
-        print("🌐 DeepSeek streaming request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
+        print("DeepSeek streaming request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
         let (byteStream, response) = try await session.bytes(for: request)
 

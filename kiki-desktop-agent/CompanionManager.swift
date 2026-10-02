@@ -59,8 +59,8 @@ enum RecordedActionsPhase: Equatable {
 
 /// Where the task in progress stands, as the settings panel reads it out.
 ///
-/// One value rather than four numbers written separately, for the reason the pointing flight is one
-/// value: the panel re-draws on every chunk of the reply, so four properties written one at a time
+/// One value rather than numbers written separately, for the reason the pointing flight is one
+/// value: the panel re-draws on every chunk of the reply, so properties written one at a time
 /// would let it draw a round count from one moment beside a context figure from another — a task
 /// that never existed.
 struct TaskProgress: Equatable {
@@ -77,10 +77,25 @@ struct TaskProgress: Equatable {
     let estimatedTokenCountOfTheContext: Int
     /// The cost at which the oldest steps are compressed into a summary and the context is reclaimed.
     let tokenCountThatStartsCompression: Int
+    /// When the task stops being the task: the last activity plus the idle gap that ends a
+    /// conversation. Nil until the session has had any activity at all.
+    ///
+    /// The moment rather than a countdown, because the countdown moves with the clock and this moves
+    /// only with the conversation — so the panel draws the one and the manager publishes the other.
+    let dateTheNextQuestionStartsANewConversation: Date?
 
     /// The task on the record at all — asked about, whether or not Kiki is still working on it.
     var hasATask: Bool {
         roundCount > 0 || isRunning
+    }
+
+    /// How long the task has left before the next question starts a new one — nil while there has
+    /// been no activity at all, and negative once that moment has passed.
+    ///
+    /// The subtraction lives here rather than at the panel, for the reason the distance to the
+    /// compression does: the two numbers it is made of are this value's own.
+    func secondsBeforeTheNextQuestionStartsANewConversation(from now: Date) -> TimeInterval? {
+        dateTheNextQuestionStartsANewConversation.map { $0.timeIntervalSince(now) }
     }
 
     /// How much of the room before the compression the context has used.
@@ -112,10 +127,18 @@ final class CompanionManager: ObservableObject {
     ///
     /// Written as one value because the five facts in it are one answer, and read as one because a
     /// flight that picked up the last flight's bubble text or click kind would point at the right
-    /// place for the wrong reason. The overlay watches `screenLocation` alone, which is what lets
-    /// `endPointingTour` withdraw the press of a stop the cursor is still standing on without
-    /// sending it back to the spot it never left.
+    /// place for the wrong reason.
     @Published var pointingTarget: PointingTarget?
+
+    /// Bumped by every flight the cursor is sent on, and what the overlay flies on.
+    ///
+    /// Not the target's location: two stops of one tour can name the same point — a `[TYPE:…]` and
+    /// the `[KEY:…:return]` right after it are written at one coordinate — and a flight keyed on
+    /// the location is never made for the second of them, whose action is then reported by nobody
+    /// and written off by the arrival timeout. Nothing else that writes `pointingTarget` bumps it,
+    /// which is what keeps `endPointingTour`'s withdrawal of a press, and the re-park after a
+    /// narration that stopped, from flying the cursor back to the spot it never left.
+    @Published private(set) var pointingFlightRequestCount = 0
 
     /// Where a drag has the pointer right now, in global AppKit screen coordinates, while one is
     /// running — nil at every other moment.
@@ -301,7 +324,7 @@ final class CompanionManager: ObservableObject {
         /// Where the cursor will be sent, in the screenshot's own pixel space: the centre of the text box
         /// the label matched, or the model's own estimate when the label matched nothing.
         let screenshotCoordinate: CGPoint
-        /// The coordinate the model itself wrote, kept for the `🎯` log line.
+        /// The coordinate the model itself wrote, kept for the pointing log line.
         ///
         /// It is the only way to see a match that landed on the wrong occurrence: the two numbers are
         /// thrown apart by a label that occurs more than once on the screen.
@@ -403,9 +426,9 @@ final class CompanionManager: ObservableObject {
     /// The way in for `kiki command`. Its accept loop, reads and writes all run on a queue of its
     /// own, so nothing here has to be held off the main actor.
     ///
-    /// `lazy` because it is handed the four things the app does with what arrives as it is built,
-    /// and a closure capturing the manager cannot be written before the manager exists. Read once,
-    /// by `startCommandSocketServer`.
+    /// `lazy` because it is handed the things the app does with what arrives as it is built, and a
+    /// closure capturing the manager cannot be written before the manager exists. Read once, by
+    /// `startCommandSocketServer`.
     private lazy var commandSocketServer = CompanionCommandSocketServer(
         commandHandler: { [weak self] commandText, speakReply in
             self?.runCommandFromTerminal(commandText, speakReply: speakReply)
@@ -416,6 +439,12 @@ final class CompanionManager: ObservableObject {
         clickHandler: { [weak self] clickRequest, terminalIdentifier in
             self?.runActionFromTerminal(clickRequest, fromTheTerminalWith: terminalIdentifier)
         },
+        screenshotHandler: { [weak self] screenshotRequest, terminalIdentifier in
+            self?.captureScreenshotForTerminal(screenshotRequest, fromTheTerminalWith: terminalIdentifier)
+        },
+        locateHandler: { [weak self] locateRequest, terminalIdentifier in
+            self?.locateTextForTerminal(locateRequest, fromTheTerminalWith: terminalIdentifier)
+        },
         readinessProvider: { [weak self] in
             self?.commandReadiness()
                 ?? KikiCommandReadiness(
@@ -424,7 +453,11 @@ final class CompanionManager: ObservableObject {
                     understandsScrolling: true,
                     understandsTripleClick: true,
                     understandsDragging: true,
-                    understandsFractionalScreenfuls: true
+                    understandsFractionalScreenfuls: true,
+                    understandsTyping: true,
+                    understandsPressingKeys: true,
+                    understandsScreenshots: true,
+                    understandsLocatingText: true
                 )
         }
     )
@@ -462,9 +495,10 @@ final class CompanionManager: ObservableObject {
     private var hasWrittenTheCurrentTurnIntoHistory = false
 
     /// What the settings panel shows about the task in progress: how many rounds and steps it has
-    /// taken, whether Kiki is still working on it, and how close the context is to being compressed.
+    /// taken, whether Kiki is still working on it, how close the context is to being compressed, and
+    /// when the next question would start a new task rather than continue this one.
     ///
-    /// Refreshed at the points where one of those four answers changes rather than computed where it
+    /// Refreshed at the points where one of those answers changes rather than computed where it
     /// is read. The estimate walks every character of the history, and the panel re-draws on every
     /// chunk of the reply — so a read-through computation would put that walk on the main actor
     /// hundreds of times per reply, on the same thread the overlay is animating on.
@@ -474,7 +508,8 @@ final class CompanionManager: ObservableObject {
         isRunning: false,
         stepInTheRoundInProgress: 0,
         estimatedTokenCountOfTheContext: 0,
-        tokenCountThatStartsCompression: CompanionManager.tokenCountThatStartsCompression
+        tokenCountThatStartsCompression: CompanionManager.tokenCountThatStartsCompression,
+        dateTheNextQuestionStartsANewConversation: nil
     )
 
     // MARK: - The Turn As A Run Of Steps
@@ -768,9 +803,22 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "isAutomaticClickingEnabled")
     }
 
-    /// The sound that goes out with a click Kiki posts, built once at launch because where it
-    /// is needed is inside a stop's one-second dwell.
-    private let elementClickSoundPlayer = ElementClickSoundPlayer()
+    /// Whether Kiki may type into or press keys on the element the model asked it to operate. Off
+    /// means a keyboard tag only points, the same way the mouse's own switch leaves it. Its own
+    /// switch rather than sharing the one above: typing into a field and pressing its button are
+    /// different amounts of trust.
+    @Published var isAutomaticKeyboardEnabled: Bool = UserDefaults.standard.object(forKey: "isAutomaticKeyboardEnabled") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "isAutomaticKeyboardEnabled")
+
+    func setAutomaticKeyboardEnabled(_ enabled: Bool) {
+        isAutomaticKeyboardEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isAutomaticKeyboardEnabled")
+    }
+
+    /// The sounds that go out with the gestures Kiki performs — a press, a key combination — built
+    /// once at launch because where they are needed is inside a stop's one-second dwell.
+    private let elementActionSoundPlayer = ElementActionSoundPlayer()
 
     /// Whether the user has completed onboarding at least once.
     var hasCompletedOnboarding: Bool {
@@ -801,7 +849,7 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         refreshAllPermissions()
-        print("🔑 Kiki start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), speech: \(hasSpeechRecognitionPermission), onboarded: \(hasCompletedOnboarding)")
+        print("Kiki start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), speech: \(hasSpeechRecognitionPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         startObservingDisplayConfigurationChanges()
         bindVoiceStateObservation()
@@ -847,7 +895,7 @@ final class CompanionManager: ObservableObject {
             problems.append("还没有填 DeepSeek API Key。在菜单栏图标里打开设置填一个。")
         }
         if !hasScreenRecordingPermission {
-            problems.append("没有屏幕录制权限。在「系统设置 → 隐私与安全性 → 屏幕录制」里给 Kiki 打开。")
+            problems.append(Self.sentenceForTheMissingScreenRecordingGrant)
         }
 
         // What a gesture a build did not have is answered by the build rather than by the moment: a
@@ -860,7 +908,11 @@ final class CompanionManager: ObservableObject {
             understandsScrolling: true,
             understandsTripleClick: true,
             understandsDragging: true,
-            understandsFractionalScreenfuls: true
+            understandsFractionalScreenfuls: true,
+            understandsTyping: true,
+            understandsPressingKeys: true,
+            understandsScreenshots: true,
+            understandsLocatingText: true
         )
     }
 
@@ -914,7 +966,7 @@ final class CompanionManager: ObservableObject {
         callOffTheActionBeingWaitedOn(because: "这次操作被打断了：另一个终端发了新命令。")
 
         lastTranscript = commandText
-        print("⌨️ Companion received command: \(commandText)")
+        print("Companion received command: \(commandText)")
 
         // Before the capture rather than after it: what follows is several seconds of screenshot
         // and recognition with nothing to show for it, and a terminal with no way to tell a turn
@@ -935,6 +987,164 @@ final class CompanionManager: ObservableObject {
         writeTheCurrentTurnIntoHistory(interruption: .theUserStartedANewQuestion)
         abandonSpeakingReply()
         clearDetectedElementLocation()
+    }
+
+    // MARK: - Reading The Screen For A Terminal
+
+    /// Sends a terminal a picture of one screen.
+    ///
+    /// The one request here that is answered with bytes rather than with a sentence. Nothing on the
+    /// machine changes, nothing is spoken, no model is asked and no history is written: it is the
+    /// capture a turn would have been sent, handed to the terminal instead.
+    ///
+    /// Refused for the grant and for a screen that is not there, and gated on nothing else — not on a
+    /// turn being in flight, because reading a screen takes nothing away from one.
+    private func captureScreenshotForTerminal(
+        _ screenshotRequest: KikiScreenshotRequest,
+        fromTheTerminalWith terminalIdentifier: CommandTerminalIdentifier
+    ) {
+        guard hasScreenRecordingPermission else {
+            commandSocketServer.send(
+                .failed(message: Self.sentenceForTheMissingScreenRecordingGrant, isRefusal: true),
+                toTheTerminalWith: terminalIdentifier
+            )
+            return
+        }
+
+        // Carries no sentence, because a capture is a fraction of a second and has no wait to be told
+        // about. `locate` is the one of the two that spends seconds reading what it took.
+        commandSocketServer.send(.accepted(message: nil), toTheTerminalWith: terminalIdentifier)
+
+        // The screen the user is looking at when none was named: a picture is one screen's worth by
+        // construction, and the cursor's screen is the first in capture order.
+        let screenNumber = screenshotRequest.screenNumber ?? 1
+
+        Task {
+            guard let screenCaptures = await captureScreensForTerminal(terminalIdentifier) else { return }
+
+            guard let screenIndex = Self.checkedScreenIndex(forScreenNumber: screenNumber, among: screenCaptures) else {
+                commandSocketServer.send(
+                    .failed(message: Self.sentenceForTheMissingScreen(screenNumber: screenNumber, among: screenCaptures), isRefusal: true),
+                    toTheTerminalWith: terminalIdentifier
+                )
+                return
+            }
+
+            let screenCapture = screenCaptures[screenIndex]
+            commandSocketServer.send(
+                .captured(
+                    message: "已截取第 \(screenIndex + 1) 块屏幕（共 \(screenCaptures.count) 块），"
+                        + "\(screenCapture.screenshotWidthInPixels)x\(screenCapture.screenshotHeightInPixels) 像素。",
+                    screenshotJPEGBase64: screenCapture.imageData.base64EncodedString(),
+                    screenNumber: screenIndex + 1
+                ),
+                toTheTerminalWith: terminalIdentifier
+            )
+        }
+    }
+
+    /// Answers a terminal with where a piece of text is on screen — every appearance of it, one point
+    /// each, in reading order.
+    ///
+    /// Reading rather than acting, and so allowed in the middle of a turn: nothing on the machine
+    /// changes, and there is nothing for anything else to conflict with. The points come back in the
+    /// global screen space a posted event lands in, which is what lets a script hand one straight back
+    /// as `kiki click -x -y`.
+    private func locateTextForTerminal(
+        _ locateRequest: KikiLocateRequest,
+        fromTheTerminalWith terminalIdentifier: CommandTerminalIdentifier
+    ) {
+        let textToFind = locateRequest.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !textToFind.isEmpty else {
+            commandSocketServer.send(.failed(message: "要找的文字是空的。", isRefusal: true), toTheTerminalWith: terminalIdentifier)
+            return
+        }
+
+        guard hasScreenRecordingPermission else {
+            commandSocketServer.send(
+                .failed(message: Self.sentenceForTheMissingScreenRecordingGrant, isRefusal: true),
+                toTheTerminalWith: terminalIdentifier
+            )
+            return
+        }
+
+        // The seconds of this path are the capture and the recognition, and both are still ahead, so
+        // the terminal is told before either rather than after.
+        commandSocketServer.send(.accepted(message: Self.sentenceForReadingTheScreen), toTheTerminalWith: terminalIdentifier)
+
+        Task {
+            guard let screenCaptures = await captureScreensForTerminal(terminalIdentifier) else { return }
+
+            if let screenNumber = locateRequest.screenNumber, Self.checkedScreenIndex(forScreenNumber: screenNumber, among: screenCaptures) == nil {
+                commandSocketServer.send(
+                    .failed(message: Self.sentenceForTheMissingScreen(screenNumber: screenNumber, among: screenCaptures), isRefusal: true),
+                    toTheTerminalWith: terminalIdentifier
+                )
+                return
+            }
+
+            let matches = await Self.boxesOfTextOnScreens(
+                matchingText: textToFind,
+                among: screenCaptures,
+                onScreenNumber: locateRequest.screenNumber
+            )
+
+            guard !matches.isEmpty else {
+                commandSocketServer.send(
+                    .failed(
+                        message: Self.sentenceForTheMissingText(textToFind, onScreenNumber: locateRequest.screenNumber),
+                        isRefusal: true
+                    ),
+                    toTheTerminalWith: terminalIdentifier
+                )
+                return
+            }
+
+            let primaryScreenHeightInPoints = NSScreen.screens.first?.frame.maxY ?? 0
+            let locatedPoints = matches.map { match -> KikiLocatedPoint in
+                let screenLocation = CompanionManager.screenLocation(
+                    forScreenshotCoordinate: CGPoint(x: match.box.midX, y: match.box.midY),
+                    on: screenCaptures[match.screenIndex]
+                ).screenLocation
+
+                let globalScreenPoint = ElementClicker.accessibilityPoint(
+                    fromAppKitScreenLocation: screenLocation,
+                    primaryScreenHeightInPoints: primaryScreenHeightInPoints
+                )
+
+                return KikiLocatedPoint(
+                    globalScreenX: globalScreenPoint.x,
+                    globalScreenY: globalScreenPoint.y,
+                    screenNumber: match.screenIndex + 1
+                )
+            }
+
+            let onThatScreen = locateRequest.screenNumber.map { "第 \($0) 块屏幕上" } ?? "屏幕上"
+            commandSocketServer.send(
+                .located(
+                    message: "\(onThatScreen)有 \(locatedPoints.count) 处「\(textToFind)」。",
+                    locatedPoints: locatedPoints
+                ),
+                toTheTerminalWith: terminalIdentifier
+            )
+        }
+    }
+
+    /// Takes the pictures both of the reading commands are made of, or answers the terminal with the
+    /// reason there are none.
+    ///
+    /// Shared because the failure is one failure said one way; what each command does with the
+    /// pictures afterwards is the whole of the difference between them.
+    private func captureScreensForTerminal(_ terminalIdentifier: CommandTerminalIdentifier) async -> [CompanionScreenCapture]? {
+        do {
+            return try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+        } catch {
+            commandSocketServer.send(
+                .failed(message: "看不到屏幕：\(error.localizedDescription)", isRefusal: true),
+                toTheTerminalWith: terminalIdentifier
+            )
+            return nil
+        }
     }
 
     // MARK: - Doing What A Terminal Asked
@@ -1042,6 +1252,15 @@ final class CompanionManager: ObservableObject {
         case KikiCommandProtocol.Gesture.scrollRight:
             return .scroll(.right, distance: .screenfuls(CGFloat(clickRequest.screenfuls ?? 1)))
         case KikiCommandProtocol.Gesture.drag: return .drag
+        // A gesture this build knows whose payload is missing reads as one it does not know, because
+        // there is no action to build: the tool refuses a request with no text or no combination
+        // before sending it, so what is left here is a request written by hand.
+        case KikiCommandProtocol.Gesture.typeText:
+            guard let typedText = clickRequest.typedText else { return nil }
+            return .keyboard(.text(typedText))
+        case KikiCommandProtocol.Gesture.pressKey:
+            guard let keyCombination = clickRequest.keyCombination else { return nil }
+            return .keyboard(.combination(name: keyCombination))
         default: return nil
         }
     }
@@ -1074,9 +1293,20 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        guard isAutomaticClickingEnabled else {
-            commandSocketServer.send(.failed(message: "「允许 Kiki 用鼠标操作」没打开，Kiki 现在动不了。", isRefusal: true), toTheTerminalWith: terminalIdentifier)
-            return
+        // The switch is asked by the kind of action rather than as one gate over all of them: the
+        // three mouse gestures share one row in the panel and the keyboard has its own, and a
+        // request is refused by the one that covers what it asked for.
+        switch action {
+        case .press, .scroll, .drag:
+            guard isAutomaticClickingEnabled else {
+                commandSocketServer.send(.failed(message: Self.sentenceForTheSwitchThatIsOff(action), isRefusal: true), toTheTerminalWith: terminalIdentifier)
+                return
+            }
+        case .keyboard:
+            guard isAutomaticKeyboardEnabled else {
+                commandSocketServer.send(.failed(message: Self.sentenceForTheSwitchThatIsOff(action), isRefusal: true), toTheTerminalWith: terminalIdentifier)
+                return
+            }
         }
 
         // Asked before the capture, and only for the half of it that has an opinion: a press naming
@@ -1107,6 +1337,23 @@ final class CompanionManager: ObservableObject {
             if let refusal = ElementDragger.refusalOfDrag(
                 toAppKitScreenLocation: Self.dragDestinationAppKitScreenLocation(in: clickRequest)
             ) {
+                commandSocketServer.send(.failed(message: Self.sentenceForAnActionOutcome(refusal.outcome), isRefusal: true), toTheTerminalWith: terminalIdentifier)
+                return
+            }
+        case .keyboard(.text(let typedText)):
+            if let refusal = ElementKeyboard.refusalOfTyping(
+                typedText,
+                matchingElementLabel: clickRequest.elementText,
+                origin: .theUsersOwnCommand
+            ) {
+                commandSocketServer.send(.failed(message: Self.sentenceForAnActionOutcome(refusal.outcome), isRefusal: true), toTheTerminalWith: terminalIdentifier)
+                return
+            }
+        case .keyboard(.combination(let keyCombination)):
+            // The dangerous table is not consulted by the tool, deliberately: a table in two places
+            // is two answers to what Kiki will not press. The terminal hears it as a refusal, which
+            // is the exit code it would have got from asking before sending anyway.
+            if let refusal = ElementKeyboard.refusalOfCombination(named: keyCombination) {
                 commandSocketServer.send(.failed(message: Self.sentenceForAnActionOutcome(refusal.outcome), isRefusal: true), toTheTerminalWith: terminalIdentifier)
                 return
             }
@@ -1326,7 +1573,7 @@ final class CompanionManager: ObservableObject {
             performing: actionInFlight.action
         )
 
-        print("🖱 Action: flying to (\(Int(actionInFlight.appKitScreenLocation.x)), \(Int(actionInFlight.appKitScreenLocation.y)))")
+        print("Action: flying to (\(Int(actionInFlight.appKitScreenLocation.x)), \(Int(actionInFlight.appKitScreenLocation.y)))")
         schedulePointingTourArrivalTimeout()
     }
 
@@ -1368,7 +1615,7 @@ final class CompanionManager: ObservableObject {
                 matchingElementLabel: actionInFlight.elementText,
                 origin: .theUsersOwnCommand
             ) == nil {
-                elementClickSoundPlayer.playClickSound()
+                elementActionSoundPlayer.playClickSound()
             }
 
             let clickOutcome = await ElementClicker.clickElement(
@@ -1378,7 +1625,7 @@ final class CompanionManager: ObservableObject {
                 kind: clickKind,
                 origin: .theUsersOwnCommand
             )
-            print("🖱 Action: \(clickOutcome)")
+            print("Action: \(clickOutcome)")
 
             switch clickOutcome {
             case .clicked:
@@ -1400,7 +1647,7 @@ final class CompanionManager: ObservableObject {
                 distance: distance,
                 displayFrame: actionInFlight.displayFrame
             )
-            print("🖱 Action: \(direction) \(distance): \(scrollOutcome)")
+            print("Action: \(direction) \(distance): \(scrollOutcome)")
 
             switch scrollOutcome {
             case .scrolled:
@@ -1420,7 +1667,7 @@ final class CompanionManager: ObservableObject {
                 toAppKitScreenLocation: actionInFlight.dragDestinationAppKitScreenLocation,
                 primaryScreenHeightInPoints: primaryScreenHeightInPoints
             )
-            print("🖱 Action: \(dragOutcome)")
+            print("Action: \(dragOutcome)")
 
             switch dragOutcome {
             case .dragged:
@@ -1432,6 +1679,55 @@ final class CompanionManager: ObservableObject {
                 // or the grant did.
                 endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .failed(message: Self.sentenceForAnActionOutcome(dragOutcome), isRefusal: true))
             }
+
+        case .keyboard(let keyboardInput):
+            let keyboardOutcome: ElementKeyboardOutcome
+            switch keyboardInput {
+            case .text(let typedText):
+                // Asked again here, as the click's is: the sound says "I am about to press this", and
+                // it is the focus click's sound, because a focus click is exactly what typing begins
+                // with. A run of text that will not begin with one must not make it.
+                if ElementKeyboard.refusalOfTyping(
+                    typedText,
+                    matchingElementLabel: actionInFlight.elementText,
+                    origin: .theUsersOwnCommand
+                ) == nil {
+                    elementActionSoundPlayer.playClickSound()
+                }
+
+                keyboardOutcome = await ElementKeyboard.typeText(
+                    typedText,
+                    atAppKitScreenLocation: actionInFlight.appKitScreenLocation,
+                    primaryScreenHeightInPoints: primaryScreenHeightInPoints,
+                    matchingElementLabel: actionInFlight.elementText,
+                    origin: .theUsersOwnCommand
+                )
+            case .combination(let keyCombination):
+                // The key-press sound and not the click's — a combination presses no mouse button —
+                // and asked first for the click's reason: the sound says "I am about to press this",
+                // so a combination that will be refused must not make it.
+                if ElementKeyboard.refusalOfCombination(named: keyCombination) == nil {
+                    elementActionSoundPlayer.playKeyPressSound()
+                }
+
+                keyboardOutcome = ElementKeyboard.pressCombination(named: keyCombination)
+            }
+            print("Action: \(keyboardOutcome)")
+
+            switch keyboardOutcome {
+            case .postedTheKeystrokes:
+                endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .clicked(message: actionInFlight.successMessage))
+            case .failedToPostTheKeystrokes:
+                endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .failed(message: Self.sentenceForAnActionOutcome(keyboardOutcome), isRefusal: false))
+            case .refusedBecauseTheElementCannotBeClicked,
+                 .refusedBecauseTheCombinationIsADangerousOne,
+                 .refusedBecauseTheCombinationIsNotOneKikiKnows,
+                 .refusedBecauseTheTextIsLongerThanKikiWillType,
+                 .refusedBecauseAccessibilityIsNotEnabled:
+                // Only reachable if the grant went away between the question above and the keys, as
+                // with the other three.
+                endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .failed(message: Self.sentenceForAnActionOutcome(keyboardOutcome), isRefusal: true))
+            }
         }
     }
 
@@ -1441,6 +1737,29 @@ final class CompanionManager: ObservableObject {
     /// done. Written here rather than in the tool because it is a sentence of Kiki's, and every one
     /// of those is written in this file; the tool prints what it is sent.
     private static let sentenceForReadingTheScreen = "Kiki 正在看屏幕…"
+
+    /// What is missing when the screen cannot be read at all, said once for every path that reads it:
+    /// a command, a click asked for by word, a picture asked for and a search asked for.
+    ///
+    /// A capture without the grant is a picture of the wallpaper rather than an error, so a path that
+    /// went ahead regardless would answer with a screen nobody is looking at — the one failure here
+    /// that is silent from Kiki's side.
+    private static let sentenceForTheMissingScreenRecordingGrant =
+        "没有屏幕录制权限。在「系统设置 → 隐私与安全性 → 屏幕录制」里给 Kiki 打开。"
+
+    /// Which switch is off, said in the terms of the row the user would go and turn back on.
+    ///
+    /// Two sentences rather than one covering both, because they are two rows in the panel and
+    /// 「动不了」 does not describe a keyboard. A `switch` over every case, so a fourth kind of action
+    /// has to be given its row rather than inheriting the mouse's.
+    private static func sentenceForTheSwitchThatIsOff(_ action: ElementActionOnArrival) -> String {
+        switch action {
+        case .press, .scroll, .drag:
+            return "「允许 Kiki 用鼠标操作」没打开，Kiki 现在动不了。"
+        case .keyboard:
+            return "「允许 Kiki 用键盘操作」没打开，Kiki 现在打不了字。"
+        }
+    }
 
     /// What to tell the terminal about a click, in the terms it thinks in: a refusal is Kiki saying
     /// it will not do this, a failure is one that was meant to go out and did not.
@@ -1486,6 +1805,32 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// The same for the keyboard, whose refusals are its own.
+    ///
+    /// The first one is the click's, carried through rather than restated: typing puts the input focus
+    /// in by clicking the landing point, so being unable to click is being unable to type, and the
+    /// sentence for it is already written above.
+    private static func sentenceForAnActionOutcome(_ keyboardOutcome: ElementKeyboardOutcome) -> String {
+        switch keyboardOutcome {
+        case .postedTheKeystrokes:
+            // Not reached: a successful keystroke is answered with the action's own completion phrase,
+            // which is where 「已输入」 and 「已按 ⌘S」 can differ. Here for the switch to be whole.
+            return "键已发出。"
+        case .failedToPostTheKeystrokes:
+            return "按键没能发出去。"
+        case .refusedBecauseTheElementCannotBeClicked(let clickRefusal):
+            return sentenceForAnActionOutcome(clickRefusal.outcome)
+        case .refusedBecauseTheCombinationIsADangerousOne(let matchedName):
+            return "\(matchedName) 这类快捷键 Kiki 不按，你自己来吧。"
+        case .refusedBecauseTheCombinationIsNotOneKikiKnows(let name):
+            return "「\(name)」这个组合键 Kiki 不认识，没按。"
+        case .refusedBecauseTheTextIsLongerThanKikiWillType(let characterCount):
+            return "一次最多打 \(ElementKeyboard.maximumCharacterCountKikiWillType) 个字，这次有 \(characterCount) 个，没打。"
+        case .refusedBecauseAccessibilityIsNotEnabled:
+            return "没有辅助功能权限，Kiki 按不了键。在「系统设置 → 隐私与安全性 → 辅助功能」里给 Kiki 打开。"
+        }
+    }
+
     /// A drag that named no destination, said once: the terminal path reaches this by asking
     /// `ElementDragger` about the request and the resolution path reaches it on its way to converting
     /// the point, and the two must not explain the same refusal in two different ways.
@@ -1497,6 +1842,20 @@ final class CompanionManager: ObservableObject {
     /// their own point, so one starting on a display and releasing over another is a press and a release
     /// in two places no app receives as a drag — and the thing being moved is left pressed.
     private static let sentenceForADragBetweenTwoScreens = "拖拽的起点和终点不在同一块屏幕上，这次没做。"
+
+    /// A screen that was named and is not there, said once for everything that can name one — the
+    /// click by word, `kiki screenshot` and `kiki locate`.
+    private static func sentenceForTheMissingScreen(screenNumber: Int, among screenCaptures: [CompanionScreenCapture]) -> String {
+        "只有 \(screenCaptures.count) 块屏幕，没有第 \(screenNumber) 块。"
+    }
+
+    /// A piece of text that was named and is not on the screen, said once for the two things that can
+    /// name one — the click by word and `kiki locate`. Both asked the same question, so both hear the
+    /// same answer, and the tool has one sentence to match on.
+    private static func sentenceForTheMissingText(_ textToFind: String, onScreenNumber screenNumber: Int?) -> String {
+        let onThatScreen = screenNumber.map { "第 \($0) 块屏幕上" } ?? "屏幕上"
+        return "\(onThatScreen)没有「\(textToFind)」。"
+    }
 
     /// Where a drag lets go, as the terminal gave it: a point in the global screen space, or nil for
     /// the two cases that have no destination — a request that named none, and one for an action that
@@ -1563,15 +1922,16 @@ final class CompanionManager: ObservableObject {
     }
 
     /// The opening of the sentence the terminal is answered with — 「已点击」, 「已双击」, 「已三击」,
-    /// 「已右键点击」, 「已往下滚 3 屏：」 or 「已拖动」 — the one part of it that depends on the action.
+    /// 「已右键点击」, 「已往下滚 3 屏：」, 「已拖动」, 「已输入「季度报告」到」 or 「已按 ⌘S：」 — the one
+    /// part of it that depends on the action.
     ///
     /// Named rather than left for the terminal to infer from which subcommand it sent, because the
     /// tool and the app can disagree about a gesture and the sentence has to describe the action that
     /// was actually made.
     ///
-    /// The scroll form ends in a colon and the press forms do not, so that the object of the sentence
-    /// reads the same either way: 「已往下滚 3 屏：屏幕坐标 (720, 450)。」 parses and 「已往下滚 3 屏
-    /// 屏幕坐标 (720, 450)。」 does not.
+    /// The scroll and combination forms end in a colon and the others do not, so that the object of
+    /// the sentence reads the same either way: 「已往下滚 3 屏：屏幕坐标 (720, 450)。」 parses and
+    /// 「已往下滚 3 屏 屏幕坐标 (720, 450)。」 does not.
     private static func completionPhraseForTheAction(_ action: ElementActionOnArrival) -> String {
         switch action {
         case .press(.singleClick): return "已点击"
@@ -1580,6 +1940,8 @@ final class CompanionManager: ObservableObject {
         case .press(.rightClick): return "已右键点击"
         case .scroll(let direction, let distance): return "已\(Self.phraseForScrolling(direction, distance: distance))："
         case .drag: return "已拖动"
+        case .keyboard(.text(let typedText)): return "已输入「\(typedText)」到"
+        case .keyboard(.combination(let name)): return "已按 \(ElementKeyboard.phraseForPressingKey(name))："
         }
     }
 
@@ -1651,6 +2013,37 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+    /// Where a piece of text is on the screens: every appearance of it, screen by screen and in
+    /// reading order within each.
+    ///
+    /// One implementation for the two things that look for text — a click asked for by word, which
+    /// wants one of these, and `kiki locate`, which wants all of them. A second copy would be a second
+    /// answer to "where is this text", and the two would disagree about which occurrence an ordinal
+    /// lands on.
+    private static func boxesOfTextOnScreens(
+        matchingText textToFind: String,
+        among screenCaptures: [CompanionScreenCapture],
+        onScreenNumber screenNumber: Int?
+    ) async -> [(screenIndex: Int, box: CGRect)] {
+        // One recognition per screen, started together: it is the whole cost of this path, and no
+        // screen's reading depends on another's.
+        let recognizedTextLinesTasks = screenCaptures.map { screenCapture in
+            Task { await ScreenshotTextRecognizer.recognizedLines(in: screenCapture.imageData) }
+        }
+
+        var matches: [(screenIndex: Int, box: CGRect)] = []
+        for screenIndex in screenCaptures.indices {
+            guard screenNumber == nil || screenNumber == screenIndex + 1 else { continue }
+            let recognizedTextLines = await recognizedTextLinesTasks[screenIndex].value
+            let matchingBoxes = ScreenshotTextElementMatcher.elementBoxesInReadingOrder(
+                matchingElementLabel: textToFind,
+                amongRecognizedLines: recognizedTextLines
+            )
+            matches.append(contentsOf: matchingBoxes.map { (screenIndex: screenIndex, box: $0) })
+        }
+        return matches
+    }
+
     /// The point where the text the terminal named was found on screen.
     ///
     /// Screens are counted the way the model's own screenshots are numbered — the pointer's screen
@@ -1675,30 +2068,18 @@ final class CompanionManager: ObservableObject {
             return .refused(reason: "看不到屏幕。")
         }
 
-        if let screenNumber, !(1...screenCaptures.count).contains(screenNumber) {
-            return .refused(reason: "只有 \(screenCaptures.count) 块屏幕，没有第 \(screenNumber) 块。")
+        if let screenNumber, Self.checkedScreenIndex(forScreenNumber: screenNumber, among: screenCaptures) == nil {
+            return .refused(reason: Self.sentenceForTheMissingScreen(screenNumber: screenNumber, among: screenCaptures))
         }
 
-        // One recognition per screen, started together: it is the whole cost of this path, and no
-        // screen's reading depends on another's.
-        let recognizedTextLinesTasks = screenCaptures.map { screenCapture in
-            Task { await ScreenshotTextRecognizer.recognizedLines(in: screenCapture.imageData) }
-        }
-
-        var matches: [(screenIndex: Int, box: CGRect)] = []
-        for screenIndex in screenCaptures.indices {
-            guard screenNumber == nil || screenNumber == screenIndex + 1 else { continue }
-            let recognizedTextLines = await recognizedTextLinesTasks[screenIndex].value
-            let matchingBoxes = ScreenshotTextElementMatcher.elementBoxesInReadingOrder(
-                matchingElementLabel: elementText,
-                amongRecognizedLines: recognizedTextLines
-            )
-            matches.append(contentsOf: matchingBoxes.map { (screenIndex: screenIndex, box: $0) })
-        }
+        let matches = await Self.boxesOfTextOnScreens(
+            matchingText: elementText,
+            among: screenCaptures,
+            onScreenNumber: screenNumber
+        )
 
         guard !matches.isEmpty else {
-            let onThatScreen = screenNumber.map { "第 \($0) 块屏幕上" } ?? "屏幕上"
-            return .refused(reason: "\(onThatScreen)没有「\(elementText)」。")
+            return .refused(reason: Self.sentenceForTheMissingText(elementText, onScreenNumber: screenNumber))
         }
 
         guard occurrenceNumber >= 1, occurrenceNumber <= matches.count else {
@@ -1829,7 +2210,7 @@ final class CompanionManager: ObservableObject {
     private func startOnboardingMusic() {
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Kiki: ff.mp3 not found in bundle")
+            print("Kiki: ff.mp3 not found in bundle")
             return
         }
 
@@ -1844,7 +2225,7 @@ final class CompanionManager: ObservableObject {
                 self?.fadeOutOnboardingMusic()
             }
         } catch {
-            print("⚠️ Kiki: Failed to play onboarding music: \(error)")
+            print("Kiki: Failed to play onboarding music: \(error)")
         }
     }
 
@@ -1977,7 +2358,7 @@ final class CompanionManager: ObservableObject {
             || previouslyHadScreenRecording != hasScreenRecordingPermission
             || previouslyHadMicrophone != hasMicrophonePermission
             || previouslyHadSpeechRecognition != hasSpeechRecognitionPermission {
-            print("🔑 Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), speech: \(hasSpeechRecognitionPermission)")
+            print("Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), speech: \(hasSpeechRecognitionPermission)")
         }
 
         // Screen content permission is persisted — once the SCShareableContent picker has been
@@ -2013,7 +2394,7 @@ final class CompanionManager: ObservableObject {
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
                 // A 0x0 or empty image means the user denied the prompt.
                 let didCapture = image.width > 0 && image.height > 0
-                print("🔑 Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
+                print("Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
                 await MainActor.run {
                     isRequestingScreenContent = false
                     guard didCapture else { return }
@@ -2027,7 +2408,7 @@ final class CompanionManager: ObservableObject {
                     }
                 }
             } catch {
-                print("⚠️ Screen content permission request failed: \(error)")
+                print("Screen content permission request failed: \(error)")
                 await MainActor.run { isRequestingScreenContent = false }
             }
         }
@@ -2138,7 +2519,29 @@ final class CompanionManager: ObservableObject {
         // still be waiting on its own synthesis. A turn that is not read aloud never hears anything,
         // so it leaves this state when a segment is reached instead.
         if isWaitingForTheFirstSoundOfTheReply { return .processing }
+        // The same wait one step further on: at a step boundary the model has been asked for the next
+        // step and has not written a word of it yet. Left to fall through to the line below, that wait
+        // is 回复中 over a still cursor with no sound around it.
+        if isWaitingForTheFirstSegmentOfTheStepNowStreaming { return .processing }
         return isSpeakingReply ? .responding : .processing
+    }
+
+    /// Whether the voice has said everything it has been given and the step now streaming has not
+    /// reached it yet.
+    ///
+    /// `isSpeakingReply` covers a whole turn, so it goes on being true over the wait between two
+    /// steps — where the cursor has nothing left to do either, and the model is the only one still
+    /// working. A turn of one step is never in this state, so the ordinary reply is unaffected.
+    private var isWaitingForTheFirstSegmentOfTheStepNowStreaming: Bool {
+        // The index only ever moves forward and this step's segments begin at the count the step
+        // started with, so the last test is true only while the voice stands before this step's own
+        // narration — which is to say only between two steps. Inside a step the narration is owed the
+        // segment after the one being spoken, and that test is already false.
+        isSpeakingReply
+            && !isReplyStreamComplete
+            && hasCurrentSpeechSegmentFinishedSpeaking
+            && hasPointerFinishedWithCurrentSpeechSegment()
+            && currentSpeechSegmentIndex < speechSegmentCountBeforeTheStepNowStreaming
     }
 
     /// What the microphone side of Kiki is doing, if anything.
@@ -2244,7 +2647,7 @@ final class CompanionManager: ObservableObject {
                     },
                     submitDraftText: { [weak self] finalTranscript in
                         self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
+                        print("Companion received transcript: \(finalTranscript)")
                         self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
                     }
                 )
@@ -2327,7 +2730,7 @@ final class CompanionManager: ObservableObject {
         recordedUserActions = []
         recordedActionsPhase = .recordingWhatTheUserIsDoing
         userActionRecorder.startRecording()
-        print("⏺ Companion is recording what the user does")
+        print("Companion is recording what the user does")
     }
 
     /// Ends the recording and starts replaying it — or gives up quietly when it holds nothing, because
@@ -2336,7 +2739,7 @@ final class CompanionManager: ObservableObject {
         let recordedUserActions = userActionRecorder.stopRecording()
         guard !recordedUserActions.isEmpty else {
             recordedActionsPhase = .neitherRecordingNorReplaying
-            print("⏺ Companion: nothing was recorded")
+            print("Companion: nothing was recorded")
             return
         }
 
@@ -2361,7 +2764,7 @@ final class CompanionManager: ObservableObject {
         self.recordedUserActions = recordedUserActions
         indexOfTheNextRecordedActionToReplay = 0
         recordedActionsPhase = .replayingWhatTheUserDid
-        print("⏺ Companion is replaying \(recordedUserActions.count) recorded action(s)")
+        print("Companion is replaying \(recordedUserActions.count) recorded action(s)")
         // The same hop the arrival takes to reach the performance: a step reads the screen, and this
         // is a shortcut press that has to return before it can.
         Task { await takeTheNextStepOfTheReplay() }
@@ -2517,6 +2920,10 @@ final class CompanionManager: ObservableObject {
 
     write [DRAG:x,y:label>X,Y] when what the user wants is something carried from one place to another — a file into a folder, an icon onto the desktop, a slider dragged to the other end, a window moved out of the way. this is the only tag with two points: x,y is the element, which is where the drag starts, and X,Y after the > is where it is let go. kiki presses on the element once the cursor lands, carries it across and releases it there, so the whole movement happens on their screen. tag the thing being moved, never the place it is going — the element is still what the label names and what your coordinate has to be in the neighbourhood of. the drop point is a point and nothing else: there is no text there for kiki to find it by, so unlike the element's coordinate it has to be measured properly rather than estimated. it is read off the same screenshot the element is, so both points are on one screen; if that screen is not the cursor's, the :screenN goes after the label and before the >, as in [DRAG:420,330:季度报告:screen2>1100,600]. the label must never contain a >, and nothing but the label goes before it: everything up to the > is read as the element's name and everything after it as the point, so a :screenN written on the wrong side of the > is swallowed into the label, finds nothing on screen, and leaves the drag with nowhere to go.
 
+    write [TYPE:x,y:label:text] when what the user asked for is words put into something — a search box, a message field, a filename, a cell. kiki clicks the element once the cursor lands, which is what puts the typing into it, and then types the text a character at a time; the characters go in as keystrokes, so chinese works, no input method is involved and nothing touches the clipboard. the label is the element typed into and the text is what goes in it, and both are required: [TYPE:420,330:搜索框:季度报告] types 季度报告 into the search box. the text is the last thing before any :screenN, so it may not contain a colon itself — [TYPE:400,300:搜索框:季度报告:screen2] is that same search box on the second screen. there is a ceiling on it, \(ElementKeyboard.maximumCharacterCountKikiWillType) characters, because every one of them is a key kiki presses and a longer run would be a paste — which kiki does not do. a paragraph of prose is not this tag's work. everything else you know about [CLICK:x,y:label] holds here: kiki is doing it, so only where the user asked for those words to go in, and never into anything the user cannot take back — a field whose name reads like 删除, 格式化 or 卸载 stays a [POINT:x,y:label] and the user types in it themselves. typing gives way to nothing, so it is also worth saying out loud what you are putting there, because the user watches it go in one character at a time.
+
+    write [KEY:x,y:label:combination] when what the user needs is a keyboard shortcut pressed — a menu command with no button to press, or one that is quicker typed than clicked. kiki presses the combination once the cursor lands and clicks nothing: a click moves the insertion point, and no shortcut wants the caret somewhere else. write the combination with + between the parts, names and symbols both read — [KEY:640,420:季度报告.txt:cmd+s] and [KEY:640,420:季度报告.txt:⌘S] press the same keys, and so do cmd+shift+t and command+shift+t. one key with any of cmd, shift, option and control around it, one plain key at most: cmd+s, cmd+shift+t and ⌃⌘Q are combinations, cmd+shift is not one and neither is a bare letter. the element you tag is the one the shortcut acts on, so the user can see where it is going — but the keys land at whatever has the focus, which is not something you can see from a screenshot, so reach for this when the user named the shortcut or when what it does is plain from the words around it. kiki refuses the combinations that take the screen away or throw work out — clearing the trash, logging out, restarting, forcing an app to quit, locking the screen — so never write those.
+
     write [LOOK] on its own, at the very end of your reply, when you need to see the screen again after doing what you tagged. everything you tagged happens first, in the order you wrote it, and only then does kiki take a fresh screenshot and ask you again with the result — so [LOOK] is how you find out what your own actions actually did, and how you keep looking when the user has sent you searching for something. it is the one tag that names no element; it is never read aloud and never left in what the user hears.
 
     reach for it where you would otherwise be guessing: a menu you just right-clicked open, a dialog a click brought up, a page that has to load, a folder you just opened, a list a scroll moved. say what you are doing, write [LOOK], and your next reply can read what is really on screen and name the item to press. all of this is written the same way as any other reply — it is still spoken to the user, so talk to them and not to this machinery.
@@ -2551,6 +2958,8 @@ final class CompanionManager: ObservableObject {
     - element is on screen 2 (not where cursor is): "在你另一块屏幕上，看到那个 [POINT:400,300:terminal:screen2] 终端窗口了吗？"
     - user asks what else is in a list that runs off the bottom of the screen, worth two tags and the scroll last: "再往下还有两栏，先看 [POINT:400,279:腾讯新闻] 腾讯新闻。剩下那两栏我把 [SCROLLDOWN:640,420:侧边栏:x2] 侧边栏往下滚两屏，你接着看就行。"
     - user asks you to file a document away, worth one drag: "我把桌面那个 [DRAG:420,330:季度报告>1160,640] 季度报告拖到右边的项目文件夹里，你看它过去就行。"
+    - user asks you to look something up in an app, which takes words and then a key — two tags, the typing first, because the return would otherwise be pressed before the text is in: "我在 [TYPE:420,330:搜索框:季度报告] 搜索框里打上「季度报告」，再按一下 [KEY:420,330:搜索框:return] 回车。 [LOOK]"
+    - user asks how to save their work, and would rather have it done than told: "在 [KEY:640,420:季度报告.txt:cmd+s] 这个文档上按一下 command s，就存上了。"
     """
 
     /// Forgets the conversation when the user has been away long enough that this turn starts a new
@@ -2564,7 +2973,7 @@ final class CompanionManager: ObservableObject {
         if let dateOfTheLastActivityInTheConversation {
             let gapSinceTheLastActivitySeconds = Date().timeIntervalSince(dateOfTheLastActivityInTheConversation)
             if gapSinceTheLastActivitySeconds > Self.maximumGapBetweenTurnsInTheSameConversationSeconds {
-                print("🧠 New conversation — \(Int(gapSinceTheLastActivitySeconds))s since the last "
+                print("New conversation — \(Int(gapSinceTheLastActivitySeconds))s since the last "
                       + "activity, dropping \(conversationHistory.count) exchange(s)")
                 // The two histories are two faces of one task and are emptied together. A summary
                 // left behind would be read as the record of a task the user has since walked away
@@ -2688,12 +3097,17 @@ final class CompanionManager: ObservableObject {
             isRunning: isRunningARound,
             stepInTheRoundInProgress: isRunningARound ? numberOfStepsStartedInTheTurnBeingAnswered : 0,
             estimatedTokenCountOfTheContext: estimatedTokenCountOfTheContextAsItStands(includingThePrompt: prompt),
-            tokenCountThatStartsCompression: Self.tokenCountThatStartsCompression
+            tokenCountThatStartsCompression: Self.tokenCountThatStartsCompression,
+            // The one place the idle gap becomes a moment. The rule itself stays in the constant the
+            // reset fires on, so the panel counts down to the same moment that reset happens at.
+            dateTheNextQuestionStartsANewConversation: dateOfTheLastActivityInTheConversation.map {
+                $0.addingTimeInterval(Self.maximumGapBetweenTurnsInTheSameConversationSeconds)
+            }
         )
     }
 
     /// Takes the panel's reading of the task again, for the callers that have just changed one of
-    /// the four answers in it: a step starting, a compression landing, a round closing out, and the
+    /// the answers in it: a step starting, a compression landing, a round closing out, and the
     /// idle gap emptying both histories.
     ///
     /// Guarded like `settleVoiceState`, and for the same reason: this is written whenever a step
@@ -2753,7 +3167,7 @@ final class CompanionManager: ObservableObject {
             .map { "用户：\($0.userTranscript)\n助手：\($0.assistantResponse)" }
             .joined(separator: "\n\n")
 
-        print("🗜️ Context at \(tokenCountOfTheContextAsItStands) tokens — compressing "
+        print("Context at \(tokenCountOfTheContextAsItStands) tokens — compressing "
               + "\(stepsToCompress.count) step(s)")
 
         do {
@@ -2769,7 +3183,7 @@ final class CompanionManager: ObservableObject {
 
             summaryOfTheStepsCompressedOutOfTheContext = summary
             numberOfHistoryEntriesTheSummaryStandsInFor = indexWhereTheContextWouldStartAt
-            print("🗜️ Compressed into \(summary.count) 字, steps 0..<\(indexWhereTheContextWouldStartAt) now "
+            print("Compressed into \(summary.count) 字, steps 0..<\(indexWhereTheContextWouldStartAt) now "
                   + "stand on the summary")
 
             // The panel has been counting down to this moment, and the count has just gone back up:
@@ -2778,7 +3192,7 @@ final class CompanionManager: ObservableObject {
         } catch {
             // Not fatal: the request goes out over its own budget, which is what it would have done
             // anyway. The next step tries again with more of the conversation behind it.
-            print("⚠️ Context compression failed: \(error)")
+            print("Context compression failed: \(error)")
         }
     }
 
@@ -2960,7 +3374,7 @@ final class CompanionManager: ObservableObject {
                 ttsClient.discardPreparedSegments()
                 writeTheCurrentTurnIntoHistory(interruption: .theReplyFailedPartWayThrough)
                 abandonSpeakingReply()
-                print("⚠️ Companion response error: \(error)")
+                print("Companion response error: \(error)")
                 // A terminal watching this turn is owed an ending rather than a wait it cannot
                 // resolve — nothing else about this turn will reach it.
                 commandSocketServer.send(.failed(message: "这一轮没能跑完：\(error.localizedDescription)", isRefusal: false))
@@ -3102,15 +3516,16 @@ final class CompanionManager: ObservableObject {
     }
 
     /// What the cursor is doing at the element it just pointed at, from the tag the model wrote:
-    /// locating it, operating it with one press, two or three, opening its menu, or scrolling it.
+    /// locating it, operating it with one press, two or three, opening its menu, scrolling it, or
+    /// typing into it.
     ///
     /// One case per gesture rather than one carrying a count and a button: a button takes one press,
     /// asking for two on it is asking for a different action, and a right click opens something
     /// neither of the others does.
     ///
-    /// The scroll case is the one that carries anything, and it carries the distance because the
-    /// distance is the tag's own: `:x3` belongs to the element it was written on, and has to travel
-    /// with that stop to the flight, the bubble and the events that go out.
+    /// Two cases carry something, and both carry it because it is the tag's own: a scroll's distance,
+    /// because `:x3` belongs to the element it was written on, and a keyboard action's input, because
+    /// ⌘S and ⌘T are different actions and 「帮你按 ⌘S！」 has to be the bubble over the right one.
     enum PointingBubbleInvitation: Equatable {
         /// The model is only locating the element for the user.
         case lookAtElement
@@ -3132,6 +3547,9 @@ final class CompanionManager: ObservableObject {
         /// The distance is not always the model's: this is also the invitation a recorded scroll
         /// replays under, and that one was measured off the user's own hand.
         case scrollElement(ElementScrollDirection, distance: ElementScrollDistance)
+        /// The model is telling the user the element is where words are to be put in — a run of text
+        /// to type, or a combination to press with the element as the thing being pointed at.
+        case keyboardElement(ElementKeyboardInput)
 
         /// What the cursor should do on arrival, or nil when there is nothing to do but hover.
         var actionToPerformOnArrival: ElementActionOnArrival? {
@@ -3143,6 +3561,7 @@ final class CompanionManager: ObservableObject {
             case .rightClickElement: return .press(.rightClick)
             case .dragElement: return .drag
             case .scrollElement(let direction, let distance): return .scroll(direction, distance: distance)
+            case .keyboardElement(let keyboardInput): return .keyboard(keyboardInput)
             }
         }
 
@@ -3178,6 +3597,7 @@ final class CompanionManager: ObservableObject {
             case .press(let clickKind): return .describing(clickKind)
             case .drag: return .dragElement
             case .scroll(let direction, let distance): return .describing(direction, distance: distance)
+            case .keyboard(let keyboardInput): return .keyboardElement(keyboardInput)
             }
         }
 
@@ -3192,6 +3612,8 @@ final class CompanionManager: ObservableObject {
             case .rightClickElement: return "rightClickElement"
             case .dragElement: return "dragElement"
             case .scrollElement(let direction, _): return "scrollElement \(direction)"
+            case .keyboardElement(.text): return "keyboardElement text"
+            case .keyboardElement(.combination(let name)): return "keyboardElement combination \(name)"
             }
         }
     }
@@ -3264,8 +3686,9 @@ final class CompanionManager: ObservableObject {
 
     /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag out of the model's response, and the
     /// same shapes written as [CLICK:...], [DOUBLECLICK:...], [RIGHTCLICK:...], the four
-    /// [SCROLL…:...] names, each of which may also carry a `:xN` distance, and [DRAG:...], which
-    /// carries a second pair of coordinates after a `>`. Returns the spoken text with every tag
+    /// [SCROLL…:...] names, each of which may also carry a `:xN` distance, [DRAG:...], which carries
+    /// a second pair of coordinates after a `>`, [TYPE:x,y:label:text] to type that text, and
+    /// [KEY:x,y:label:combination] to press that combination. Returns the spoken text with every tag
     /// stripped, plus the coordinate, label and screen number of the last one.
     ///
     /// The tag is looked for anywhere in the response and the last one wins rather than being required
@@ -3301,7 +3724,18 @@ final class CompanionManager: ObservableObject {
         // but a request for another step, written on its own. Its capture groups are none, so it
         // leaves every group number below it untouched — and it is stripped from the spoken text
         // like any other tag, which the loop over the matches does before anything reads them.
-        let pattern = #"\[(?i:POINT|CLICK|DOUBLECLICK|TRIPLECLICK|RIGHTCLICK|SCROLLUP|SCROLLDOWN|SCROLLLEFT|SCROLLRIGHT|DRAG):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]\s][^\]]*?))?(?::x(\d+(?:\.\d+)?))?(?::screen(\d+))?(?:\s*>\s*(\d+)\s*,\s*(\d+))?)\]|\[(?i:LOOK)\]"#
+        //
+        // `TYPE` and `KEY` are alternatives of their own, after `LOOK`, and that is the one thing here
+        // that must not be tidied up: each carries what to type or which combination to press, and a
+        // payload group appended to the shared body above would be read as the *label* of every tag
+        // that body matches — the label is lazy, so it prefers to capture nothing, and `[POINT:400,213:
+        // 新华网]` would arrive as a label of nil and a payload of 新华网. Every tag's coordinate
+        // sharpening would fail silently and the cursor would fall back to the model's own estimate.
+        // Their groups therefore sit after every group the other tags use: TYPE reads 8–12 and KEY
+        // 13–17, and nothing above reads past 7. The screen number is last within each of them, as it
+        // is for every other tag, and the payload is required: a keyboard tag written without one does
+        // not match at all and is left in the text to be spoken, which is noisy rather than silent.
+        let pattern = #"\[(?i:POINT|CLICK|DOUBLECLICK|TRIPLECLICK|RIGHTCLICK|SCROLLUP|SCROLLDOWN|SCROLLLEFT|SCROLLRIGHT|DRAG):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]\s][^\]]*?))?(?::x(\d+(?:\.\d+)?))?(?::screen(\d+))?(?:\s*>\s*(\d+)\s*,\s*(\d+))?)\]|\[(?i:LOOK)\]|\[(?i:TYPE):(\d+)\s*,\s*(\d+):([^\]\s][^\]]*?):(.+?)(?::screen(\d+))?\]|\[(?i:KEY):(\d+)\s*,\s*(\d+):([^\]\s][^\]]*?):(.+?)(?::screen(\d+))?\]"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
             return PointingParseResult(spokenText: responseText, coordinate: nil, elementLabel: nil, screenNumber: nil, tourStops: [], hasAskedToLookAgain: false)
@@ -3410,24 +3844,65 @@ final class CompanionManager: ObservableObject {
 
     /// The coordinate inside a [POINT:...] tag, in the screenshot's own pixel space, or nil
     /// for a [POINT:none] tag.
+    ///
+    /// A TYPE or KEY tag keeps its coordinate in groups of its own, so the shared groups are asked
+    /// first and a tag whose own groups are the ones that captured is answered by them. The order is
+    /// the only thing that makes one lookup serve every tag; the groups are never both populated,
+    /// because a match belongs to one alternative.
     private static func screenshotCoordinate(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> CGPoint? {
-        guard tagMatch.numberOfRanges >= 3,
-              let xRange = Range(tagMatch.range(at: 1), in: responseText),
-              let yRange = Range(tagMatch.range(at: 2), in: responseText),
-              let x = Double(responseText[xRange]),
-              let y = Double(responseText[yRange]) else {
-            return nil
+        for (xGroupNumber, yGroupNumber) in [(1, 2), (8, 9), (13, 14)] where tagMatch.numberOfRanges > yGroupNumber {
+            guard let xRange = Range(tagMatch.range(at: xGroupNumber), in: responseText),
+                  let yRange = Range(tagMatch.range(at: yGroupNumber), in: responseText),
+                  let x = Double(responseText[xRange]),
+                  let y = Double(responseText[yRange]) else { continue }
+            return CGPoint(x: x, y: y)
         }
-        return CGPoint(x: x, y: y)
+        return nil
     }
 
-    /// The short English label inside a [POINT:...] tag, e.g. "save button".
+    /// The element's own text inside a tag, e.g. "保存" — the label the app looks for on the picture,
+    /// which is why the prompt asks for it verbatim. Read from the tag's own groups, for the reason
+    /// the coordinate is.
     private static func elementLabel(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> String? {
-        guard tagMatch.numberOfRanges >= 4,
-              let labelRange = Range(tagMatch.range(at: 3), in: responseText) else {
+        for labelGroupNumber in [3, 10, 15] where tagMatch.numberOfRanges > labelGroupNumber {
+            guard let labelRange = Range(tagMatch.range(at: labelGroupNumber), in: responseText) else { continue }
+            return String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    /// What a [TYPE:...] or [KEY:...] tag is to do with its element — the text to type, or the name
+    /// of the combination to press — or nil for every other tag.
+    ///
+    /// Read off the tag's own name rather than by trying both groups, because the two alternatives are
+    /// told apart by that name: the payload group of the one a tag did not match is empty, and reading
+    /// it would be reading a group that says nothing about this tag. The name is the one thing a
+    /// keyboard tag has in common with the gestures, and its payload is the one thing they do not.
+    private static func keyboardInput(
+        fromTagMatch tagMatch: NSTextCheckingResult,
+        in responseText: String
+    ) -> ElementKeyboardInput? {
+        guard let tagRange = Range(tagMatch.range, in: responseText) else { return nil }
+        let uppercasedTag = responseText[tagRange].uppercased()
+
+        let payloadGroupNumber: Int
+        if uppercasedTag.hasPrefix("[TYPE:") {
+            payloadGroupNumber = 11
+        } else if uppercasedTag.hasPrefix("[KEY:") {
+            payloadGroupNumber = 16
+        } else {
             return nil
         }
-        return String(responseText[labelRange]).trimmingCharacters(in: .whitespaces)
+
+        guard tagMatch.numberOfRanges > payloadGroupNumber,
+              let payloadRange = Range(tagMatch.range(at: payloadGroupNumber), in: responseText) else {
+            return nil
+        }
+
+        let payload = String(responseText[payloadRange])
+        // A combination travels as the name the model wrote, not as a decoded value: a name nothing
+        // recognizes has to reach the refusal that says so, and a decoded one could not be reported.
+        return uppercasedTag.hasPrefix("[TYPE:") ? .text(payload) : .combination(name: payload)
     }
 
     /// Where a [DRAG:...] tag lets go, in the screenshot's own pixel space, or nil when that tag
@@ -3457,7 +3932,8 @@ final class CompanionManager: ObservableObject {
     /// What the arrival bubble should invite the user to do, read off the tag the model wrote:
     /// [CLICK:...] for a click, [DOUBLECLICK:...] for two, [TRIPLECLICK:...] for three,
     /// [RIGHTCLICK:...] for the element's menu, [DRAG:...] for a drag, [SCROLLUP:...] and its three
-    /// siblings for a scroll, [POINT:...] for locating it.
+    /// siblings for a scroll, [TYPE:...] for a run of text and [KEY:...] for a combination,
+    /// [POINT:...] for locating it.
     ///
     /// Looking is the default: inviting someone to look is never wrong, while 「点这里」 reads as an
     /// instruction a user who only asked where a setting lives never asked for.
@@ -3476,6 +3952,13 @@ final class CompanionManager: ObservableObject {
         // Upper-cased before the comparison because the pattern accepts the tag name in any case. The
         // names are told apart by their whole prefix, so the order they are tested in cannot matter.
         let uppercasedTag = responseText[tagRange].uppercased()
+
+        // Asked first and separately, because the two keyboard tags are the ones that carry what to
+        // do with the element rather than only which gesture it is, and that payload is not a prefix.
+        if let keyboardInput = Self.keyboardInput(fromTagMatch: tagMatch, in: responseText) {
+            return .keyboardElement(keyboardInput)
+        }
+
         let screenfuls = Self.screenfuls(fromTagMatch: tagMatch, in: responseText)
         if uppercasedTag.hasPrefix("[DOUBLECLICK:") {
             return .doubleClickElement
@@ -3508,13 +3991,14 @@ final class CompanionManager: ObservableObject {
     }
 
     /// The 1-based screen number inside a tag, or nil when it named none — which means
-    /// "wherever the cursor already is".
+    /// "wherever the cursor already is". Read from the tag's own groups, for the reason the
+    /// coordinate is; a keyboard tag's sits last within its alternative, as it does for every other.
     private static func screenNumber(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> Int? {
-        guard tagMatch.numberOfRanges >= 6,
-              let screenRange = Range(tagMatch.range(at: 5), in: responseText) else {
-            return nil
+        for screenGroupNumber in [5, 12, 17] where tagMatch.numberOfRanges > screenGroupNumber {
+            guard let screenRange = Range(tagMatch.range(at: screenGroupNumber), in: responseText) else { continue }
+            return Int(responseText[screenRange])
         }
-        return Int(responseText[screenRange])
+        return nil
     }
 
     /// How many screenfuls a scroll tag asked for, clamped, defaulting to one for a tag that named
@@ -3768,6 +4252,17 @@ final class CompanionManager: ObservableObject {
         return screenCaptures.firstIndex(where: { $0.isCursorScreen })
     }
 
+    /// The position of the screen somebody else named, or nil when there is no such screen.
+    ///
+    /// A refusal rather than a fallback, which is the whole difference between this and the function
+    /// above: the model's own `:screenN` falls back to the cursor's screen because a reply should not
+    /// fail over a number written wrong, while a terminal named a screen it wants and would otherwise
+    /// be answered about a different one without being told.
+    private static func checkedScreenIndex(forScreenNumber screenNumber: Int, among screenCaptures: [CompanionScreenCapture]) -> Int? {
+        guard screenNumber >= 1, screenNumber <= screenCaptures.count else { return nil }
+        return screenNumber - 1
+    }
+
     /// The coordinate to fly to for a stop — the centre of the on-screen text the model named, or the
     /// model's own coordinate when it named something with no text there — together with the rectangle
     /// that coordinate came from.
@@ -3967,7 +4462,7 @@ final class CompanionManager: ObservableObject {
         // which is what lets the voice finish its last sentence and go straight on into this step's
         // first one. Nothing is cut and nothing waits for anything but the audio itself.
         if isSpeakingReply, !isWaitingForTheFirstSoundOfTheReply {
-            print("⏩ Step \(numberOfStepsStartedInTheTurnBeingAnswered) starts with \(speechSegmentsOfTheTurnBeingSpoken.count - currentSpeechSegmentIndex) segment(s) of narration still owed")
+            print("Step \(numberOfStepsStartedInTheTurnBeingAnswered) starts with \(speechSegmentsOfTheTurnBeingSpoken.count - currentSpeechSegmentIndex) segment(s) of narration still owed")
         }
 
         stepInProgress.hasBeenClosedOut = true
@@ -4005,12 +4500,12 @@ final class CompanionManager: ObservableObject {
         // screenshot that reply was written against, so another look would come back with the same
         // picture and earn the same reply — a loop with nothing moving in it.
         guard stepInProgress.didAnyActionReachTheScreen else {
-            print("🔁 Step asked to look again but nothing on the screen changed — the turn ends here.")
+            print("Step asked to look again but nothing on the screen changed — the turn ends here.")
             return false
         }
 
         guard numberOfStepsStartedInTheTurnBeingAnswered < Self.maximumStepsInTheTurnBeingAnswered else {
-            print("🔁 Turn stopped after \(numberOfStepsStartedInTheTurnBeingAnswered) steps.")
+            print("Turn stopped after \(numberOfStepsStartedInTheTurnBeingAnswered) steps.")
             return false
         }
 
@@ -4033,7 +4528,7 @@ final class CompanionManager: ObservableObject {
 
         let spokenTextOfTheWholeTurn = spokenTextOfTheStepsBeforeTheOneInProgress + spokenTextOfTheStepInProgress
 
-        print("🔁 Turn closed out after \(numberOfStepsStartedInTheTurnBeingAnswered) step(s), "
+        print("Turn closed out after \(numberOfStepsStartedInTheTurnBeingAnswered) step(s), "
               + "\(spokenTextOfTheWholeTurn.count) 字")
 
         commandSocketServer.send(.done(spokenText: spokenTextOfTheWholeTurn))
@@ -4120,7 +4615,7 @@ final class CompanionManager: ObservableObject {
             }
 
             for newlyResolvedStop in ingest.newlyResolvedPointingTourStops {
-                print("🎯 Element pointing: (\(Int(newlyResolvedStop.screenshotCoordinate.x)), \(Int(newlyResolvedStop.screenshotCoordinate.y))) → \"\(newlyResolvedStop.elementLabel ?? "element")\""
+                print("Element pointing: (\(Int(newlyResolvedStop.screenshotCoordinate.x)), \(Int(newlyResolvedStop.screenshotCoordinate.y))) → \"\(newlyResolvedStop.elementLabel ?? "element")\""
                       + " · model said (\(Int(newlyResolvedStop.modelScreenshotCoordinate.x)), \(Int(newlyResolvedStop.modelScreenshotCoordinate.y)))"
                       + (newlyResolvedStop.didTheLabelMatchTextOnScreen
                          ? " · label matched screen text"
@@ -4460,6 +4955,10 @@ final class CompanionManager: ObservableObject {
         lastNarrationProgressDate = nil
         lastPointingTourStopArrivalDate = nil
         shouldReturnBuddyToCursorAfterPointing = false
+        // The tour going away is one of the ways the cursor stops having anything left to do about
+        // the segment being spoken, and the wait the panel shows on the step now streaming is
+        // settled by it.
+        settleVoiceState()
         // No stop is left to be pressed, so the press is withdrawn from the target the cursor is
         // standing on. Only that field: clearing the target outright would read as a flight to nil.
         pointingTarget?.actionToPerformOnArrival = nil
@@ -4512,6 +5011,10 @@ final class CompanionManager: ObservableObject {
     /// question asked in a fixed order: the cursor has first refusal on every word, and only once it is
     /// finished with the current segment is the next one handed over.
     private func continuePointingTourIfPossible() {
+        // Settled here because the cursor's half of the question is not only answered by writes: a
+        // stop's dwell runs out on its own, and this call is the only thing that hears about it. The
+        // wait the panel shows on the step now streaming begins and ends on what this call decides.
+        settleVoiceState()
         if let pointingTourStopTheNarrationHasReached = stopTheNarrationHasReachedInCurrentSpeechSegment() {
             startFlightToPointingTourStop(pointingTourStopTheNarrationHasReached)
             return
@@ -4740,14 +5243,14 @@ final class CompanionManager: ObservableObject {
             conversationHistory.removeFirst()
         }
 
-        print("🧠 History \(conversationHistory.count) exchange(s) — 问 "
+        print("History \(conversationHistory.count) exchange(s) — 问 "
               + "\(transcriptOfTheTurnBeingAnswered.count) 字 / 答 \(replyAsItStands.count) 字"
               + (interruption == nil ? "" : "（中断）"))
 
         // The step's own words, tags and all: the raw text is the only account of why a turn stopped asking
         // to look again, and a tag the parser did not recognise is invisible in the spoken text the history
         // keeps — the step would read as having had nothing to ask for.
-        print("💬 Step reply as the model wrote it: \(replyAsTheModelWroteIt)")
+        print("Step reply as the model wrote it: \(replyAsTheModelWroteIt)")
     }
 
     /// Writes off the reply being spoken. For a reply that was replaced, or one the app is done with — the
@@ -4850,7 +5353,7 @@ final class CompanionManager: ObservableObject {
             performing: actionThatWillActuallyBePerformed(at: pointingTourStop)
         )
 
-        print("🎯 Pointing tour: flying to (\(Int(pointingTourStop.screenshotCoordinate.x)), \(Int(pointingTourStop.screenshotCoordinate.y))) → \"\(pointingTourStop.elementLabel ?? "element")\"")
+        print("Pointing tour: flying to (\(Int(pointingTourStop.screenshotCoordinate.x)), \(Int(pointingTourStop.screenshotCoordinate.y))) → \"\(pointingTourStop.elementLabel ?? "element")\"")
 
         schedulePointingTourArrivalTimeout()
     }
@@ -4883,6 +5386,10 @@ final class CompanionManager: ObservableObject {
             bubbleText: bubbleText,
             actionToPerformOnArrival: actionToPerformOnArrival
         )
+
+        // And the flight itself, after the target it is to be made to: the overlay reads the target
+        // when the count changes, so a bump ahead of the write would fly it to the one before.
+        pointingFlightRequestCount += 1
     }
 
     /// Called by the cursor overlay once it has arrived at a tour stop, or at a point a terminal asked
@@ -4892,18 +5399,22 @@ final class CompanionManager: ObservableObject {
         // a second time would skip the next stop.
         guard isFlyingToPointingTourStop else { return }
 
-        // Whether this arrival begins a drag, which is the one action that outlives it: a press and a
-        // scroll are over the moment the cursor is standing on the element, while a drag still has
-        // the button down and half a second of movement to go. Closing the flight out here would
-        // send the cursor on to the next stop mid-drag, letting go of what it was carrying.
+        // Whether this arrival begins something that is still running when the cursor lands: a drag,
+        // which has the button down and half a second of movement to go, and a run of typed
+        // characters, which has a landing click, a character every eighth of a second and quite
+        // possibly a combination queued behind it. Closing the flight out here would move the tour on
+        // mid-gesture — letting go of what it was carrying, or pressing a second element before the
+        // first has been typed into.
         //
         // Asked of `requestedActionForArrival` rather than of the action that will actually happen,
-        // because a refused drag is performed too — it performs nothing and says so — and it is the
-        // performing task, not the refusal, that closes the flight afterwards.
-        let isStartingADrag = nextPointingTourStop.flatMap { requestedActionForArrival(at: $0) } == ElementActionOnArrival.drag
-            || actionInFlight?.action == ElementActionOnArrival.drag
+        // because a refused drag and a refused run of text are performed too — they perform nothing
+        // and say so — and it is the performing task, not the refusal, that closes the flight
+        // afterwards.
+        let isStartingAnActionThatOutlivesTheArrival = doesTheActionOutliveTheArrival(
+            nextPointingTourStop.flatMap { requestedActionForArrival(at: $0) }
+        ) || doesTheActionOutliveTheArrival(actionInFlight?.action)
 
-        if isStartingADrag {
+        if isStartingAnActionThatOutlivesTheArrival {
             // Nothing is flying any more, so the watchdog for a flight that never reports back has
             // nothing left to watch. Left armed it would fire part way through the drag and move the
             // tour on with the button still down — through the other door from the one above.
@@ -4915,7 +5426,7 @@ final class CompanionManager: ObservableObject {
         if let pointingTourStop = nextPointingTourStop {
             performTheActionTheModelAskedForItIfAny(
                 at: pointingTourStop,
-                isClosingTheArrivalFlightAfterwards: isStartingADrag
+                isClosingTheArrivalFlightAfterwards: isStartingAnActionThatOutlivesTheArrival
             )
         }
 
@@ -4926,13 +5437,30 @@ final class CompanionManager: ObservableObject {
             Task {
                 await performTheActionInFlight(
                     actionThatJustArrived,
-                    isClosingTheArrivalFlightAfterwards: isStartingADrag
+                    isClosingTheArrivalFlightAfterwards: isStartingAnActionThatOutlivesTheArrival
                 )
             }
         }
 
-        guard !isStartingADrag else { return }
+        guard !isStartingAnActionThatOutlivesTheArrival else { return }
         finishCurrentPointingTourFlight()
+    }
+
+    /// Whether an action is still going when the cursor has landed: a drag is moving to a second
+    /// point, and a run of text is a landing click and then a character at a time.
+    ///
+    /// A combination is not one of them. It is a press and a release a few microseconds apart, with
+    /// nothing to wait for and nothing the tour should hold the next stop behind — and holding it
+    /// would leave the flight open for a gesture that has already finished.
+    ///
+    /// A `switch` over every case, so a fourth kind of action fails to build here instead of being
+    /// quietly treated as over on arrival — which for a drag means letting go of what it was carrying
+    /// and for a typed run means clicking the next element mid-word.
+    private func doesTheActionOutliveTheArrival(_ action: ElementActionOnArrival?) -> Bool {
+        switch action {
+        case .drag, .keyboard(.text): return true
+        case .keyboard(.combination), .press, .scroll, .none: return false
+        }
     }
 
     /// The action the cursor just landed on, when the model asked for the element to be operated or
@@ -4942,9 +5470,18 @@ final class CompanionManager: ObservableObject {
     /// Reached from the cursor *arriving* and from nowhere else: the other way a flight ends, the arrival
     /// timeout, means no cursor view accepted the target, so the cursor is not on the element.
     private func requestedActionForArrival(at pointingTourStop: ResolvedPointingTourStop) -> ElementActionOnArrival? {
-        guard isAutomaticClickingEnabled,
-              let action = pointingTourStop.pointingBubbleInvitation.actionToPerformOnArrival
-        else { return nil }
+        guard let action = pointingTourStop.pointingBubbleInvitation.actionToPerformOnArrival else { return nil }
+
+        // The switch is asked by the kind of action rather than as one gate over all of them: the three
+        // mouse gestures share the panel's row and the keyboard has one of its own, and a stop is held
+        // back by the one covering what it asked for. A `switch` over every case, so a fourth family
+        // has to be given its row here rather than inheriting the mouse's.
+        switch action {
+        case .press, .scroll, .drag:
+            guard isAutomaticClickingEnabled else { return nil }
+        case .keyboard:
+            guard isAutomaticKeyboardEnabled else { return nil }
+        }
 
         return action
     }
@@ -4957,7 +5494,8 @@ final class CompanionManager: ObservableObject {
     ///
     /// The two halves of the question are the two gesture axes, and each is asked of the thing that owns
     /// it: a press is refused by the words on the element, a scroll by the grant alone, a drag by where
-    /// its destination is, and none of them answers for another.
+    /// its destination is, a run of text by the click that would put the focus in it and by its length,
+    /// a combination by the table of ones Kiki will not press, and none of them answers for another.
     private func actionThatWillActuallyBePerformed(at pointingTourStop: ResolvedPointingTourStop) -> ElementActionOnArrival? {
         guard let requestedAction = requestedActionForArrival(at: pointingTourStop) else { return nil }
         switch requestedAction {
@@ -4969,6 +5507,16 @@ final class CompanionManager: ObservableObject {
             guard ElementDragger.refusalOfDrag(
                 toAppKitScreenLocation: pointingTourStop.dragDestinationScreenLocation
             ) == nil else { return nil }
+        case .keyboard(.text(let typedText)):
+            // Typing is refused for the focus click's reasons as well as its own, because the click is
+            // how the words get somewhere to land.
+            guard ElementKeyboard.refusalOfTyping(
+                typedText,
+                matchingElementLabel: pointingTourStop.elementLabel,
+                origin: .theModelsTag
+            ) == nil else { return nil }
+        case .keyboard(.combination(let keyCombination)):
+            guard ElementKeyboard.refusalOfCombination(named: keyCombination) == nil else { return nil }
         }
         return requestedAction
     }
@@ -5011,7 +5559,7 @@ final class CompanionManager: ObservableObject {
                 // first keeps the sound from announcing a click that was declined, and playing it here makes the
                 // sound land with the events.
                 if ElementClicker.refusalOfClick(matchingElementLabel: elementLabel, origin: .theModelsTag) == nil {
-                    elementClickSoundPlayer.playClickSound()
+                    elementActionSoundPlayer.playClickSound()
                 }
 
                 let clickOutcome = await ElementClicker.clickElement(
@@ -5022,7 +5570,7 @@ final class CompanionManager: ObservableObject {
                     origin: .theModelsTag
                 )
 
-                print("🖱 \(clickKind) at stop \(stopIndex): \(clickOutcome)")
+                print("\(clickKind) at stop \(stopIndex): \(clickOutcome)")
                 recordWhatAnActionOfTheStepDid(
                     clickOutcome,
                     action: action,
@@ -5041,7 +5589,7 @@ final class CompanionManager: ObservableObject {
                     displayFrame: displayFrame
                 )
 
-                print("🖱 \(direction) \(distance) at stop \(stopIndex): \(scrollOutcome)")
+                print("\(direction) \(distance) at stop \(stopIndex): \(scrollOutcome)")
                 recordWhatAnActionOfTheStepDid(
                     scrollOutcome,
                     action: action,
@@ -5057,7 +5605,7 @@ final class CompanionManager: ObservableObject {
                     primaryScreenHeightInPoints: primaryScreenHeightInPoints
                 )
 
-                print("🖱 drag at stop \(stopIndex): \(dragOutcome)")
+                print("Drag at stop \(stopIndex): \(dragOutcome)")
                 recordWhatAnActionOfTheStepDid(
                     dragOutcome,
                     action: action,
@@ -5068,6 +5616,55 @@ final class CompanionManager: ObservableObject {
                 // The one place a model-asked-for drag ends, and the only action that ends after the
                 // arrival rather than at it: the flight the arrival deliberately left open is closed
                 // here, with the button up and the cursor standing where the drag put it.
+                if isClosingTheArrivalFlightAfterwards, isFlyingToPointingTourStop {
+                    finishCurrentPointingTourFlight()
+                }
+
+            case .keyboard(let keyboardInput):
+                let keyboardOutcome: ElementKeyboardOutcome
+                switch keyboardInput {
+                case .text(let typedText):
+                    // Played for the focus click, which is a press and goes out before the first
+                    // character does — the same question the click's own branch asks, because a run of
+                    // text that will not begin with one must not make its sound.
+                    if ElementKeyboard.refusalOfTyping(
+                        typedText,
+                        matchingElementLabel: elementLabel,
+                        origin: .theModelsTag
+                    ) == nil {
+                        elementActionSoundPlayer.playClickSound()
+                    }
+
+                    keyboardOutcome = await ElementKeyboard.typeText(
+                        typedText,
+                        atAppKitScreenLocation: screenLocation,
+                        primaryScreenHeightInPoints: primaryScreenHeightInPoints,
+                        matchingElementLabel: elementLabel,
+                        origin: .theModelsTag
+                    )
+                case .combination(let keyCombination):
+                    // The key-press sound and not the click's, and asked first for the reason the
+                    // click's own branch gives: a combination that will be refused must not be
+                    // announced as one that is about to happen.
+                    if ElementKeyboard.refusalOfCombination(named: keyCombination) == nil {
+                        elementActionSoundPlayer.playKeyPressSound()
+                    }
+
+                    keyboardOutcome = ElementKeyboard.pressCombination(named: keyCombination)
+                }
+
+                print("\(keyboardInput) at stop \(stopIndex): \(keyboardOutcome)")
+                recordWhatAnActionOfTheStepDid(
+                    keyboardOutcome,
+                    action: action,
+                    elementLabel: elementLabel,
+                    identifiedBy: thisStepIdentifier
+                )
+
+                // A typed run is the other action that outlives the arrival — the flight stays open
+                // across however many seconds the words take, so the next stop cannot be flown to
+                // mid-word — and closing it belongs here, once the last character is in. A combination
+                // is over at the arrival, which is what the flag is false for.
                 if isClosingTheArrivalFlightAfterwards, isFlyingToPointingTourStop {
                     finishCurrentPointingTourFlight()
                 }
@@ -5127,12 +5724,25 @@ final class CompanionManager: ObservableObject {
     }
 
     private func recordWhatAnActionOfTheStepDid(
+        _ outcome: ElementKeyboardOutcome,
+        action: ElementActionOnArrival,
+        elementLabel: String?,
+        identifiedBy stepIdentifier: UUID
+    ) {
+        recordWhatAnActionOfTheStepDid(
+            sentence: sentenceTellingTheModelWhatItsActionDid(action, toElementLabel: elementLabel, orTheFailure: outcome.isASuccess ? nil : Self.sentenceForAnActionOutcome(outcome)),
+            didItReachTheScreen: outcome.isASuccess,
+            identifiedBy: stepIdentifier
+        )
+    }
+
+    private func recordWhatAnActionOfTheStepDid(
         sentence: String,
         didItReachTheScreen: Bool,
         identifiedBy stepIdentifier: UUID
     ) {
         guard isStillTheStepIdentifiedBy(stepIdentifier) else {
-            print("🔁 An action reported back after its step was over: \(sentence)")
+            print("An action reported back after its step was over: \(sentence)")
             return
         }
 
@@ -5302,7 +5912,7 @@ final class CompanionManager: ObservableObject {
         pointingTourNarrationResumeTimeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.pointingTourArrivalTimeoutSeconds * 1_000_000_000))
             guard !Task.isCancelled, let self, self.isFlyingToPointingTourStop else { return }
-            print("🎯 Pointing tour: no arrival after \(Self.pointingTourArrivalTimeoutSeconds)s, writing the flight off")
+            print("Pointing tour: no arrival after \(Self.pointingTourArrivalTimeoutSeconds)s, writing the flight off")
             self.finishCurrentPointingTourFlight()
         }
     }
@@ -5321,7 +5931,7 @@ final class CompanionManager: ObservableObject {
             // would be a different question, with a wrong answer for any reply that talks about something
             // else before its first tagged element.
             guard !self.hasNarrationReportedAnyWords else { return }
-            print("🎯 Pointing tour: narration reported no words, the cursor paces the tour from here")
+            print("Pointing tour: narration reported no words, the cursor paces the tour from here")
             self.hasTheNarrationGoneSilent = true
             self.continuePointingTourIfPossible()
         }
@@ -5355,7 +5965,7 @@ final class CompanionManager: ObservableObject {
                     continue
                 }
 
-                print("🎯 Pointing tour: neither a word nor a finished segment for \(Self.pointingTourStallTimeoutSeconds)s, the narration has stopped")
+                print("Pointing tour: neither a word nor a finished segment for \(Self.pointingTourStallTimeoutSeconds)s, the narration has stopped")
 
                 // Read before the tour is ended, which clears both of them.
                 let stopToParkOn = self.nextPointingTourStop ?? self.resolvedPointingTourStops.last
@@ -5389,7 +5999,7 @@ final class CompanionManager: ObservableObject {
         // Bundled rather than streamed: fetching the intro put the first thing a new user ever sees behind
         // a network round trip, and its failure was silent.
         guard let videoURL = Bundle.main.url(forResource: "kiki-intro", withExtension: "mp4") else {
-            print("⚠️ Onboarding video: kiki-intro.mp4 is missing from the bundle")
+            print("Onboarding video: kiki-intro.mp4 is missing from the bundle")
             return
         }
 
@@ -5567,7 +6177,7 @@ final class CompanionManager: ObservableObject {
                 // Only the cursor screen, so the model can't pick something on a monitor we can't
                 // point at.
                 guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
-                    print("🎯 Onboarding demo: no cursor screen found")
+                    print("Onboarding demo: no cursor screen found")
                     return
                 }
 
@@ -5610,7 +6220,7 @@ final class CompanionManager: ObservableObject {
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
 
                 guard let modelPointCoordinate = parseResult.coordinate else {
-                    print("🎯 Onboarding demo: no element to point at")
+                    print("Onboarding demo: no element to point at")
                     return
                 }
 
@@ -5654,9 +6264,13 @@ final class CompanionManager: ObservableObject {
                     bubbleText: parseResult.spokenText,
                     actionToPerformOnArrival: nil
                 )
-                print("🎯 Onboarding demo: pointing at \"\(parseResult.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")
+                // The demo builds its target here rather than through `beginFlightOfTheCursor`,
+                // because that function takes the tour's bookkeeping with it — so this is the second
+                // of the two places a flight is asked for, and it bumps the count itself.
+                pointingFlightRequestCount += 1
+                print("Onboarding demo: pointing at \"\(parseResult.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")
             } catch {
-                print("⚠️ Onboarding demo error: \(error)")
+                print("Onboarding demo error: \(error)")
             }
         }
     }
