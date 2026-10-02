@@ -4,7 +4,7 @@
 
 ## 环境
 
-- macOS 14.2+，Xcode 16+（工程用的是 Xcode 16 的文件夹同步组格式，老版本 Xcode 打不开）
+- macOS 14.2+，Xcode 26+（工程按 Xcode 26 的 Swift 并发默认隔离写就，Xcode 16 的编译器构建不过）
 - 一个 DeepSeek API Key，只在自测时需要；仓库里没有任何密钥，key 只进你本机的钥匙串
 
 ## 构建与运行

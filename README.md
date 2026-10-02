@@ -51,7 +51,7 @@ open Kiki.app
 
 ### 从源码构建
 
-额外需要 **Xcode 16+**（工程用的是 Xcode 16 的文件夹同步组格式，老版本打不开）。
+额外需要 **Xcode 26+**（工程按 Xcode 26 的 Swift 并发默认隔离写就，Xcode 16 的编译器构建不过）。
 
 ```bash
 xcodebuild -project kiki-desktop-agent.xcodeproj -scheme kiki-desktop-agent \
