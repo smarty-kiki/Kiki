@@ -2,6 +2,9 @@
 *.xcuserstate
 xcuserdata/
 build/
+DerivedData/
+*.xcresult
+.swiftpm/
 releases/
 default.profraw
 .claude/

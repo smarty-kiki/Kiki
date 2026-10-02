@@ -31,16 +31,33 @@
 
 ## 试试看
 
-需要 **macOS 14.2+**、**Xcode 16+**，和一个 **DeepSeek API Key**（[platform.deepseek.com](https://platform.deepseek.com)）。
+需要 **macOS 14.2+**，和一个 **DeepSeek API Key**（[platform.deepseek.com](https://platform.deepseek.com)）。
+
+### 安装
+
+从 [Releases](https://github.com/smarty-kiki/Kiki/releases) 下载最新的包，解压出来是 `Kiki.app` 和命令行工具 `kiki`：
+
+```bash
+unzip Kiki-*.zip
+xattr -dr com.apple.quarantine Kiki.app   # 安装包没有公证，去掉隔离标记
+open Kiki.app
+```
+
+要把 `kiki` 装进 PATH：`ln -s "$PWD/kiki" /usr/local/bin/kiki`。
+
+### 从源码构建
+
+额外需要 **Xcode 16+**（工程用的是 Xcode 16 的文件夹同步组格式，老版本打不开）。
 
 ```bash
 xcodebuild -project kiki-desktop-agent.xcodeproj -scheme kiki-desktop-agent \
-  -configuration Debug \
-  CODE_SIGN_IDENTITY="Smarty Kiki Signing" \
-  CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" build
+  -configuration Debug -derivedDataPath build \
+  CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" build
 
-open ~/Library/Developer/Xcode/DerivedData/kiki-desktop-agent-*/Build/Products/Debug/Kiki.app
+open build/Build/Products/Debug/Kiki.app
 ```
+
+`CODE_SIGN_IDENTITY="-"` 是 ad-hoc 签名，谁都能跑；代价是每次重新构建都要重新授权一遍五项权限。想授权跨构建保留，在「钥匙串访问 → 证书助理」里给自己创建一个代码签名证书，把命令里的 `-` 换成证书的名字。
 
 一条命令同时构建 `Kiki.app` 和命令行工具 `kiki`，两个产物落在同一个目录下。
 
@@ -110,10 +127,10 @@ Kiki 没在运行时它们会**自己把它拉起来**。这些动作没有模�
 
 打字和按快捷键同样受管：面板上的「允许 Kiki 用键盘操作」关掉就一律不打，⌘⇧⌫ 这种会清空废纸篓、注销、强制退出的组合键它从来不按，会直接告诉你让你自己来。
 
-装到 `PATH` 上：
+装到 `PATH` 上（安装包解压出来、构建产物目录里都有这个 `kiki`）：
 
 ```bash
-ln -s ~/Library/Developer/Xcode/DerivedData/kiki-desktop-agent-*/Build/Products/Debug/kiki /usr/local/bin/kiki
+ln -s "$PWD/kiki" /usr/local/bin/kiki
 ```
 
 不装也行，写全路径调用就好。敲一个不带参数的 `kiki` 会打印全部用法。
@@ -124,6 +141,7 @@ ln -s ~/Library/Developer/Xcode/DerivedData/kiki-desktop-agent-*/Build/Products/
 - 工程里都有什么：同一份文档的 Key Files 表，一个文件一行。
 - 踩了会疼的坑，以及每一处决定背后的理由：也在 [`AGENTS.md`](AGENTS.md)。
 - [`scripts/`](scripts) 里三个量测工具：模型读坐标准不准、点击怎么注入、滚轮哪个符号是往下。
+- 想参与贡献：[`CONTRIBUTING.md`](CONTRIBUTING.md)；安全漏洞别开公开 issue，走 [`SECURITY.md`](SECURITY.md)；每个版本发了什么，见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 `CLAUDE.md` 是指向 `AGENTS.md` 的符号链接，读哪个拿到的都是同一份文档。
 

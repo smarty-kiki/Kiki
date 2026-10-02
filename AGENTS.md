@@ -267,9 +267,11 @@ The `kiki-desktop-agent` scheme is a **shared** scheme and builds both targets i
 
 **Running `xcodebuild` from the terminal is safe.** It used to invalidate TCC permissions on every rebuild, which was a consequence of ad-hoc signing: an ad-hoc signature's Designated Requirement is a bare `cdhash`, so every rebuild produced a different identity as far as TCC was concerned. The self-signed certificate below replaced that with a certificate-anchored requirement that is stable across rebuilds, so grants survive. **Launch with `open …/Kiki.app` when the permission state matters** — see "Rules That Bite If Broken" for why running the binary from a shell breaks it.
 
+**Two GitHub Actions workflows cover the public flow, and both build ad-hoc** (`CODE_SIGN_IDENTITY="-"`, because no runner holds a certificate): `.github/workflows/ci.yml` runs the same build on every push to main and every pull request, as a build check only — the test targets are template stubs and UI tests are unreliable headless, so nothing is *run*. `.github/workflows/release.yml` fires on a `v*` tag, builds Release, and attaches a zip of `Kiki.app` plus the `kiki` CLI, with SHA256 checksums, to a **draft** GitHub Release. Those artifacts are ad-hoc and unnotarized, so the release notes carry the `xattr` command that strips the quarantine flag. The self-signed certificate lives only in the maintainer's login keychain and reaches neither workflow.
+
 ### Code Signing (self-signed certificate)
 
-The app is signed with a local self-signed certificate named `Smarty Kiki Signing` rather than a real Apple Developer certificate. Nothing requires a Developer certificate — the app is never distributed and needs no provisioning profile — and the self-signed one is what makes TCC grants stick:
+The app is signed with a local self-signed certificate named `Smarty Kiki Signing` rather than a real Apple Developer certificate. Nothing requires a Developer certificate — the app is not on the App Store and needs no provisioning profile — and the self-signed one is what makes TCC grants stick:
 
 ```
 designated => identifier "com.smarty.kiki" and certificate root = H"ee5a2ca6f89d8ca593a7ccf0582da31449acaa83"
@@ -340,7 +342,7 @@ IMPORTANT: Follow these naming rules strictly. Clarity is the top priority.
 - Do not try to fix the known non-blocking warnings (Swift 6 concurrency, deprecated onChange)
 - Do not delete logic on the grounds that the configuration it serves is not the one you are running — see "Rules That Bite If Broken"
 - Do not rename `PRODUCT_NAME` away from `Kiki`, and do not rename `PRODUCT_BUNDLE_IDENTIFIER` away from `com.smarty.kiki` — the Keychain item holding the user's DeepSeek key is keyed on the identifier, so changing it orphans the stored key. The project directory and scheme being `kiki-desktop-agent` while the product is `Kiki` is deliberate, not a mismatch to tidy up
-- Do not sign with an ad-hoc identity, and do not remove `ENABLE_DEBUG_DYLIB = NO` — see "Code Signing" for what it breaks
+- Do not sign with an ad-hoc identity, and do not remove `ENABLE_DEBUG_DYLIB = NO` — see "Code Signing" for what it breaks. The CI and release workflows are the deliberate exception: a runner holds no certificate, and artifacts nobody rebuilds in place have no TCC persistence to lose
 
 ## Git Workflow
 

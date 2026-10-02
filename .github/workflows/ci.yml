@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Kiki.app and kiki
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner holds no signing certificate, so both targets are built ad-hoc.
+      # A local build usually wants a real identity instead — see README for why.
+      - name: Build
+        run: |
+          xcodebuild \
+            -project kiki-desktop-agent.xcodeproj \
+            -scheme kiki-desktop-agent \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            DEVELOPMENT_TEAM="" \
+            build

@@ -1,0 +1,49 @@
+name: Bug 报告
+description: Kiki 的行为和预期不一样
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 提交前先看看已有 issue 里有没有同样的报告。
+  - type: dropdown
+    id: macos-version
+    attributes:
+      label: macOS 版本
+      options:
+        - "26 (Tahoe)"
+        - "15 (Sequoia)"
+        - "14 (Sonoma)"
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: kiki-version
+    attributes:
+      label: Kiki 版本
+      description: Release 下载的写版本号（如 v1.0.0）；自己构建的写「自构建」加构建日期
+    validations:
+      required: true
+  - type: checkboxes
+    id: permissions
+    attributes:
+      label: 五项权限的状态（面板里显示的）
+      description: 涉及权限的 bug 请把每一项的实际状态都勾出来，缺一不可
+      options:
+        - label: 麦克风已授权
+        - label: 语音识别已授权
+        - label: 辅助功能已授权
+        - label: 屏幕录制已授权
+        - label: 屏幕内容（ScreenCaptureKit）已授权
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 复现步骤、期望的行为、实际的行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 终端里 `open` 启动 app 时打印的日志，或 Console.app 里 Kiki 的输出；没有可以留空
+      render: shell

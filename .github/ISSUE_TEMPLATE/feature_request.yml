@@ -1,0 +1,17 @@
+name: 功能请求
+description: 想让 Kiki 多做一件事
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: 想要什么
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: 为什么
+      description: 什么场景下现在的 Kiki 做不到，或者做起来别扭
+    validations:
+      required: true

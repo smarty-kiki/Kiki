@@ -452,10 +452,10 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = "kiki-desktop-agent/kiki-desktop-agent.entitlements";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 2UDAY4J48G;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -466,7 +466,7 @@
 				INFOPLIST_FILE = "kiki-desktop-agent/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Kiki;
 				INFOPLIST_KEY_CFBundleName = Kiki;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "© 2026 Yao Yang";
 				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "Kiki needs screen recording access to see your screen and help you.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -491,10 +491,10 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = "kiki-desktop-agent/kiki-desktop-agent.entitlements";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 2UDAY4J48G;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -504,7 +504,7 @@
 				INFOPLIST_FILE = "kiki-desktop-agent/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Kiki;
 				INFOPLIST_KEY_CFBundleName = Kiki;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "© 2026 Yao Yang";
 				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "Kiki needs screen recording access to see your screen and help you.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
