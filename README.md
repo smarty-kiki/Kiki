@@ -39,15 +39,14 @@
 
 ### 安装
 
-从 [Releases](https://github.com/smarty-kiki/Kiki/releases) 下载最新的包，解压出来是 `Kiki.app` 和命令行工具 `kiki`：
+从 [Releases](https://github.com/smarty-kiki/Kiki/releases) 下载最新的 **dmg**，打开后把 **Kiki.app** 拖进「应用程序」：
 
 ```bash
-unzip Kiki-*.zip
-xattr -dr com.apple.quarantine Kiki.app   # 安装包没有公证，去掉隔离标记
-open Kiki.app
+xattr -dr com.apple.quarantine /Applications/Kiki.app   # 安装包没有公证，去掉隔离标记
+open /Applications/Kiki.app
 ```
 
-要把 `kiki` 装进 PATH：`ln -s "$PWD/kiki" /usr/local/bin/kiki`。
+不想用 dmg 也有 zip：解压出来是 `Kiki.app`，对它做同样两件事。命令行工具 `kiki` 就在 app 里面，打开面板点一下「安装命令行工具」就进 PATH 了——会弹一次系统授权，因为 `/usr/local/bin` 属于 root。
 
 ### 从源码构建
 
@@ -63,7 +62,7 @@ open build/Build/Products/Debug/Kiki.app
 
 `CODE_SIGN_IDENTITY="-"` 是 ad-hoc 签名，谁都能跑；代价是每次重新构建都要重新授权一遍五项权限。想授权跨构建保留，在「钥匙串访问 → 证书助理」里给自己创建一个代码签名证书，把命令里的 `-` 换成证书的名字。
 
-一条命令同时构建 `Kiki.app` 和命令行工具 `kiki`，两个产物落在同一个目录下。
+一条命令同时构建 `Kiki.app` 和命令行工具 `kiki`，两个产物落在同一个目录下（app 里也嵌了一份，和它是同一个二进制）。
 
 然后：菜单栏点出面板 → 把 key 粘进去 → 按面板上的提示给五项权限。设置一完成，光标会在你屏幕上把引导演一遍，最后打出「嗨！我是 Kiki」——它演的就是它自己；如果你先粘了 key 再授权，它会等权限到位再放，不会跳过。那段视频就在仓库里：[`kiki-desktop-agent/kiki-intro.mp4`](kiki-desktop-agent/kiki-intro.mp4)。
 
@@ -131,11 +130,15 @@ Kiki 没在运行时它们会**自己把它拉起来**。这些动作没有模�
 
 打字和按快捷键同样受管：面板上的「允许 Kiki 用键盘操作」关掉就一律不打，⌘⇧⌫ 这种会清空废纸篓、注销、强制退出的组合键它从来不按，会直接告诉你让你自己来。
 
-装到 `PATH` 上（安装包解压出来、构建产物目录里都有这个 `kiki`）：
+命令行工具 `kiki` 住在 app 里面（`Kiki.app/Contents/Resources/kiki`），装到 `PATH` 上用这一份，它和 app 永远同版本。面板的「命令行」卡片上点**安装命令行工具**：它建一条 `/usr/local/bin/kiki` 的软链指向 app 里这一份，会弹一次系统授权（`/usr/local/bin` 属于 root）；装好了那行会变成绿色的「已装好」。app 挪了地方也没关系——重新点一次就是，链接跟着 app 走。
+
+不想点按钮就手动来，效果一样：
 
 ```bash
-ln -s "$PWD/kiki" /usr/local/bin/kiki
+ln -s /Applications/Kiki.app/Contents/Resources/kiki /usr/local/bin/kiki
 ```
+
+从源码构建时，构建产物目录里另有一个独立的 `kiki`，和 app 是同一个二进制。
 
 不装也行，写全路径调用就好。敲一个不带参数的 `kiki` 会打印全部用法。
 

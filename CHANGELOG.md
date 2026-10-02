@@ -17,4 +17,5 @@
 - `kiki command`：同一条流水线的终端入口，回复流回终端，默认不出声
 - `kiki click`、`doubleclick`、`tripleclick`、`rightclick`、`scrollup`、`scrolldown`、`scrollleft`、`scrollright`、`drag`、`type`、`key`：十一条不问模型、不出声的手势，给脚本和快捷键用
 - `kiki screenshot`、`kiki locate`：两条只读屏幕的命令，什么也不动
+- 命令行工具就住在 app 里，和 app 永远同版本：面板上点一下**安装命令行工具**、系统授权一次就装进 PATH
 - 该不动的时候不动：读起来像「删除」「卸载」「格式化」的东西不点，权限没给不动，⌘⇧⌫ 这类清空废纸篓的组合键从不按

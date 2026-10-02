@@ -70,49 +70,74 @@ jobs:
             exit 1
           fi
 
-      # ditto cannot take two sources into one archive, so the zip is built with
-      # Info-ZIP from inside the staging directory: -y keeps symlinks, and the
-      # zip's top level ends up as Kiki.app/ and kiki side by side.
-      - name: Package
+      # The app is the whole product: the `kiki` tool rides inside it at
+      # `Kiki.app/Contents/Resources/kiki`, put there by the app target's own copy phase, so
+      # there is no second file to install or to go stale beside it. The dmg is what a
+      # person installs from; the zip is the same app for scripts and for anything that
+      # would rather not mount a disk image. The Applications symlink is added after the
+      # zip is written so it lands only in the dmg, on the leading edge of the drag.
+      - name: Package the app as a dmg and a zip
         env:
           version: ${{ steps.version.outputs.version }}
         run: |
           stage="Kiki-$version"
           mkdir "$stage"
           cp -R build/Build/Products/Release/Kiki.app "$stage/Kiki.app"
-          cp build/Build/Products/Release/kiki "$stage/kiki"
-          (cd "$stage" && zip -qry "../Kiki-$version.zip" Kiki.app kiki)
-          shasum -a 256 "Kiki-$version.zip" > SHA256SUMS.txt
+          (cd "$stage" && zip -qry "../Kiki-$version.zip" Kiki.app)
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname "Kiki" -srcfolder "$stage" -ov -format UDZO "Kiki-$version.dmg"
+          shasum -a 256 "Kiki-$version.zip" "Kiki-$version.dmg" > SHA256SUMS.txt
 
       # Attestations need a public repository; a private one needs GitHub Enterprise
       # Cloud for this step to succeed.
-      - name: Attest the build provenance of the zip
+      - name: Attest the build provenance of the dmg and the zip
         uses: actions/attest@v4
         with:
-          subject-path: Kiki-${{ steps.version.outputs.version }}.zip
+          subject-path: |
+            Kiki-${{ steps.version.outputs.version }}.zip
+            Kiki-${{ steps.version.outputs.version }}.dmg
 
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           version: ${{ steps.version.outputs.version }}
         run: |
+          # Re-pushing a tag whose draft release already exists would fail at `gh release
+          # create`; the stale draft is replaced. A published release is never touched —
+          # re-tagging one would swap artifacts people have already downloaded.
+          existing_release_is_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft -q .isDraft 2>/dev/null || true)
+          case "$existing_release_is_draft" in
+            true) gh release delete "$GITHUB_REF_NAME" --yes ;;
+            false)
+              echo "::error::$GITHUB_REF_NAME already has a published release — bump the version instead of re-tagging"
+              exit 1
+              ;;
+          esac
+
           cat > release-notes.md <<EOF
           ## 安装
 
+          下载 **Kiki-$version.dmg**，打开，把 **Kiki.app** 拖进「应用程序」：
+
           \`\`\`bash
-          unzip Kiki-$version.zip
-          xattr -dr com.apple.quarantine Kiki.app
-          open Kiki.app
+          xattr -dr com.apple.quarantine /Applications/Kiki.app
+          open /Applications/Kiki.app
+          \`\`\`
+
+          不想用 dmg 就用 zip：解压后对 \`Kiki.app\` 做同样两件事。命令行工具 \`kiki\` 就在 app 里面，和 app 永远同版本——打开面板，在「命令行」卡片上点**安装命令行工具**，会弹一次系统授权（\`/usr/local/bin\` 属于 root），装好的那行变绿。不想点按钮就手动，效果一样：
+
+          \`\`\`bash
+          ln -s /Applications/Kiki.app/Contents/Resources/kiki /usr/local/bin/kiki
           \`\`\`
 
           1. 安装包没有公证，macOS 会拦未公证的 app——\`xattr\` 那条把隔离标记去掉；
           2. 用 \`open\` 启动，**别直接双击二进制**：从终端跑可执行文件会把「屏幕录制」授权算在终端头上；
-          3. 首次启动按面板提示授权五项权限，把自己的 DeepSeek API key 粘进去；
-          4. 要用 \`kiki\` 命令行：\`ln -s "\$(pwd)/kiki" /usr/local/bin/kiki\`。
+          3. 首次启动按面板提示授权五项权限，把自己的 DeepSeek API key 粘进去。
 
           这个包附有 GitHub 来源证明，可以核对它确实由本仓库的发布流程构建：
 
           \`\`\`bash
+          gh attestation verify Kiki-$version.dmg --repo ${GITHUB_REPOSITORY}
           gh attestation verify Kiki-$version.zip --repo ${GITHUB_REPOSITORY}
           \`\`\`
 
@@ -134,4 +159,4 @@ jobs:
             --draft $prerelease \
             --title "Kiki $version" \
             --notes-file release-notes.md \
-            "Kiki-$version.zip" SHA256SUMS.txt
+            "Kiki-$version.zip" "Kiki-$version.dmg" SHA256SUMS.txt

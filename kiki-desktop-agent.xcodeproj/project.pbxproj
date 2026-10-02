@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		BB00CC0C2F6500010039DA55 /* kiki in Embed the kiki command line tool */ = {isa = PBXBuildFile; fileRef = BB00CC012F6500010039DA55 /* kiki */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		28F22CCD2F56440300A0FC59 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -21,7 +25,28 @@
 			remoteGlobalIDString = 28F22CBE2F56440300A0FC59;
 			remoteInfo = "kiki-desktop-agent";
 		};
+		BB00CC0F2F6500010039DA55 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 28F22CB72F56440300A0FC59 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = BB00CC042F6500010039DA55;
+			remoteInfo = kiki;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		BB00CC0D2F6500010039DA55 /* Embed the kiki command line tool */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 7;
+			files = (
+				BB00CC0C2F6500010039DA55 /* kiki in Embed the kiki command line tool */,
+			);
+			name = "Embed the kiki command line tool";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		28F22CBF2F56440300A0FC59 /* Kiki.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Kiki.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -123,10 +148,12 @@
 				28F22CBB2F56440300A0FC59 /* Sources */,
 				28F22CBC2F56440300A0FC59 /* Frameworks */,
 				28F22CBD2F56440300A0FC59 /* Resources */,
+				BB00CC0D2F6500010039DA55 /* Embed the kiki command line tool */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				BB00CC0E2F6500010039DA55 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				28F22CC12F56440300A0FC59 /* kiki-desktop-agent */,
@@ -320,6 +347,11 @@
 			isa = PBXTargetDependency;
 			target = 28F22CBE2F56440300A0FC59 /* kiki-desktop-agent */;
 			targetProxy = 28F22CD72F56440300A0FC59 /* PBXContainerItemProxy */;
+		};
+		BB00CC0E2F6500010039DA55 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = BB00CC042F6500010039DA55 /* kiki */;
+			targetProxy = BB00CC0F2F6500010039DA55 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 

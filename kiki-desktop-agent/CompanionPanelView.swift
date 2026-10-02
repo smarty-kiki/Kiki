@@ -407,9 +407,54 @@ struct CompanionPanelView: View {
             title: "命令行",
             description: "打字提要求，回复流回终端；默认不出声，加了 --speak 才念出来"
         ) {
-            Text("kiki command '…'")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(DS.Colors.codeText)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("kiki command '…'")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(DS.Colors.codeText)
+
+                commandLineToolInstallRow
+            }
+        }
+    }
+
+    /// Whether the `kiki` command is in PATH, and the way to put it there.
+    ///
+    /// The install costs one system authorisation prompt — `/usr/local/bin` belongs to root, so
+    /// there is no way to write it without one — which is why it is a button the user presses
+    /// rather than something that happens at launch.
+    ///
+    /// Absent for a build that carries no tool inside it: there is nothing to install, and the
+    /// command above is then the build-product copy the README's `ln -s` is about.
+    @ViewBuilder
+    private var commandLineToolInstallRow: some View {
+        if KikiCommandLineInstaller.toolInsideTheRunningApp != nil {
+            if companionManager.commandLineToolIsInstalled {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(DS.Colors.success)
+                        .frame(width: 6, height: 6)
+                    Text("已装好，终端里直接输 kiki")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.success)
+                }
+            } else {
+                Button(action: {
+                    Task { await companionManager.installTheCommandLineTool() }
+                }) {
+                    Text(companionManager.isInstallingTheCommandLineTool ? "安装中…" : "安装命令行工具")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textOnAccent)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule()
+                                .fill(companionManager.isInstallingTheCommandLineTool ? DS.Colors.accent.opacity(0.4) : DS.Colors.accent)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursor(isEnabled: !companionManager.isInstallingTheCommandLineTool)
+                .disabled(companionManager.isInstallingTheCommandLineTool)
+            }
         }
     }
 

@@ -336,6 +336,11 @@ final class MenuBarPanelManager: NSObject {
     // MARK: - Panel Lifecycle
 
     private func showPanel() {
+        // The command line tool's link can be made or broken while the app is up — by the README's
+        // own `ln -s`, or by `Kiki.app` being moved — so the question the install row draws is
+        // asked again at every open rather than once per launch.
+        companionManager.refreshCommandLineToolInstallation()
+
         if panel == nil {
             createPanel()
         }

@@ -871,6 +871,38 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - The Command Line Tool
 
+    /// Whether the `kiki` in PATH is this app's own tool, and whether an install is in flight.
+    ///
+    /// Read off the filesystem rather than remembered, and refreshed where the question is asked
+    /// afresh — every open of the panel, which is the only place the answer is drawn. The link can
+    /// be made or broken outside the app, by the README's own `ln -s` or by `Kiki.app` being
+    /// moved, so a remembered answer would be a stale one.
+    @Published private(set) var commandLineToolIsInstalled = false
+
+    @Published private(set) var isInstallingTheCommandLineTool = false
+
+    func refreshCommandLineToolInstallation() {
+        commandLineToolIsInstalled = KikiCommandLineInstaller.isInstalled
+    }
+
+    /// Puts the command into PATH, behind the one system authorisation prompt that writing to
+    /// `/usr/local/bin` costs. Whether it landed is read off the disk afterwards rather than
+    /// reported by the installer: the link itself is the answer.
+    func installTheCommandLineTool() async {
+        guard !isInstallingTheCommandLineTool else { return }
+
+        // The row can be showing 安装 over a link that is already ours — the panel was drawn
+        // before one was made by hand — and re-making it would ask for an authorisation there is
+        // nothing to authorise.
+        refreshCommandLineToolInstallation()
+        guard !commandLineToolIsInstalled else { return }
+
+        isInstallingTheCommandLineTool = true
+        await KikiCommandLineInstaller.install()
+        refreshCommandLineToolInstallation()
+        isInstallingTheCommandLineTool = false
+    }
+
     /// Starts the socket listening. What it does with each thing that arrives was given to it when
     /// it was built, so this is the whole of starting it.
     private func startCommandSocketServer() {

@@ -211,10 +211,25 @@ private func printNewText(inReplyText replyTextSoFar: String) {
 
 /// The `Kiki.app` this tool belongs to.
 private func locateKikiApplication() -> URL? {
-    // Sibling of this executable: both products are built into the same `Build/Products/<config>/`.
     // Resolving symlinks first is required — being symlinked into `/usr/local/bin` is the normal
     // way this binary is put on `PATH`, and `argv[0]` is then the symlink's own directory.
     let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+
+    // A copy embedded in the app — `Kiki.app/Contents/Resources/kiki` — belongs to the bundle that
+    // holds it. That is the copy a release ships, and taking it first is what keeps an installed
+    // tool from starting some other Kiki that LaunchServices happens to know about. The walk goes
+    // up through every ancestor rather than a fixed number of levels, so the tool can be moved
+    // inside the bundle without this quietly falling through to the LaunchServices guess below.
+    var ancestorDirectoryURL = executableURL.deletingLastPathComponent()
+    while ancestorDirectoryURL.pathComponents.count > 1 {
+        if ancestorDirectoryURL.pathExtension == "app",
+           Bundle(url: ancestorDirectoryURL)?.bundleIdentifier == "com.smarty.kiki" {
+            return ancestorDirectoryURL
+        }
+        ancestorDirectoryURL = ancestorDirectoryURL.deletingLastPathComponent()
+    }
+
+    // Sibling of this executable: both products are built into the same `Build/Products/<config>/`.
     let siblingApplicationURL = executableURL
         .deletingLastPathComponent()
         .appendingPathComponent("Kiki.app")
