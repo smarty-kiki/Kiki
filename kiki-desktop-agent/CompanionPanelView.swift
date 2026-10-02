@@ -145,7 +145,7 @@ struct CompanionPanelView: View {
                     .frame(width: 20, height: 20)
                     .background(
                         Circle()
-                            .fill(Color.white.opacity(0.08))
+                            .fill(Color.black.opacity(0.05))
                     )
             }
             .buttonStyle(.plain)
@@ -182,14 +182,14 @@ struct CompanionPanelView: View {
     ///
     /// Tinted and outlined in the accent rather than filled with `surface1` like the cards below it,
     /// because those three describe ways of talking to Kiki that are always available while this one
-    /// is the task happening now — and it is the blue thing on a panel of grey ones.
+    /// is the task happening now — and it is the coloured thing on a panel of grey ones.
     private var taskStatusCard: some View {
         let progress = companionManager.taskProgress
 
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(progress.isRunning ? DS.Colors.blue400 : DS.Colors.textTertiary)
+                    .fill(progress.isRunning ? DS.Colors.accentText : DS.Colors.textTertiary)
                     .frame(width: 6, height: 6)
 
                 // The clock is read here rather than on the manager: what moves every second is the
@@ -227,7 +227,7 @@ struct CompanionPanelView: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                .stroke(DS.Colors.blue500.opacity(0.35), lineWidth: 0.5)
+                .stroke(DS.Colors.purple500.opacity(0.35), lineWidth: 0.5)
         )
     }
 
@@ -333,7 +333,7 @@ struct CompanionPanelView: View {
 
                 Text("Kiki 不会在后台常驻，只在你按下快捷键的那一刻截一次屏，所以这个权限可以放心给。要是你还是不放心……那我也没办法了。")
                     .font(.system(size: 11))
-                    .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
+                    .foregroundColor(Color(red: 0.72, green: 0.29, blue: 0.29))
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -431,11 +431,11 @@ struct CompanionPanelView: View {
             if companionManager.commandLineToolIsInstalled {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已装好，终端里直接输 kiki")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 Button(action: {
@@ -517,7 +517,7 @@ struct CompanionPanelView: View {
         .padding(.vertical, 2)
         .background(
             RoundedRectangle(cornerRadius: 4, style: .continuous)
-                .fill(Color.white.opacity(0.07))
+                .fill(Color.black.opacity(0.05))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 4, style: .continuous)
@@ -582,11 +582,11 @@ struct CompanionPanelView: View {
             if isGranted {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已授权")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 HStack(spacing: 6) {
@@ -658,11 +658,11 @@ struct CompanionPanelView: View {
             if isGranted {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已授权")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 Button(action: {
@@ -712,11 +712,11 @@ struct CompanionPanelView: View {
             if isGranted {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已授权")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 Button(action: {
@@ -759,11 +759,11 @@ struct CompanionPanelView: View {
             if isGranted {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已授权")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 Button(action: {
@@ -813,11 +813,11 @@ struct CompanionPanelView: View {
             if isGranted {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已授权")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 Button(action: {
@@ -863,11 +863,11 @@ struct CompanionPanelView: View {
             if isGranted {
                 HStack(spacing: 4) {
                     Circle()
-                        .fill(DS.Colors.success)
+                        .fill(DS.Colors.accentText)
                         .frame(width: 6, height: 6)
                     Text("已授权")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
+                        .foregroundColor(DS.Colors.accentText)
                 }
             } else {
                 Button(action: {
@@ -1051,7 +1051,7 @@ struct CompanionPanelView: View {
 
                 Text("已保存")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(DS.Colors.success)
+                    .foregroundColor(DS.Colors.accentText)
 
                 Button(action: {
                     isReplacingDeepSeekAPIKey.toggle()
@@ -1085,7 +1085,7 @@ struct CompanionPanelView: View {
 
             Text(companionManager.hasDeepSeekAPIKey ? "已保存" : "未设置")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundColor(companionManager.hasDeepSeekAPIKey ? DS.Colors.success : DS.Colors.warning)
+                .foregroundColor(companionManager.hasDeepSeekAPIKey ? DS.Colors.accentText : DS.Colors.warning)
         }
     }
 
@@ -1107,7 +1107,7 @@ struct CompanionPanelView: View {
                     .padding(.vertical, 6)
                     .background(
                         RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                            .fill(Color.white.opacity(0.08))
+                            .fill(DS.Colors.surface1)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
@@ -1167,7 +1167,7 @@ struct CompanionPanelView: View {
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
+                    .fill(Color.black.opacity(0.05))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -1189,7 +1189,7 @@ struct CompanionPanelView: View {
                 .padding(.vertical, 5)
                 .background(
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                        .fill(isSelected ? Color.white : Color.clear)
                 )
         }
         .buttonStyle(.plain)
@@ -1249,26 +1249,26 @@ struct CompanionPanelView: View {
     private var panelBackground: some View {
         RoundedRectangle(cornerRadius: 12, style: .continuous)
             .fill(DS.Colors.background)
-            .shadow(color: Color.black.opacity(0.5), radius: 20, x: 0, y: 10)
-            .shadow(color: Color.black.opacity(0.3), radius: 4, x: 0, y: 2)
+            .shadow(color: Color.black.opacity(0.28), radius: 20, x: 0, y: 10)
+            .shadow(color: Color.black.opacity(0.14), radius: 4, x: 0, y: 2)
     }
 
     private var statusDotColor: Color {
         if companionManager.isRestingInTheStatusItemIcon {
             return DS.Colors.textTertiary
         }
-        // Blue like the other working states: waking is something Kiki is doing, where resting is
-        // something it is not.
+        // The accent like the other working states: waking is something Kiki is doing, where
+        // resting is something it is not.
         if companionManager.isWakingFromTheStatusItemIcon {
-            return DS.Colors.blue400
+            return DS.Colors.accentText
         }
         // The red of the record dot itself while the user is working, so the panel and the cursor
-        // are recognizably the same state; blue while Kiki is the one doing the work.
+        // are recognizably the same state; the accent while Kiki is the one doing the work.
         if companionManager.recordedActionsPhase == .recordingWhatTheUserIsDoing {
             return DS.Colors.overlayCursorClickRed
         }
         if companionManager.recordedActionsPhase == .replayingWhatTheUserDid {
-            return DS.Colors.blue400
+            return DS.Colors.accentText
         }
         if !companionManager.isOverlayVisible {
             return DS.Colors.textTertiary
@@ -1277,9 +1277,9 @@ struct CompanionPanelView: View {
         case .idle:
             return DS.Colors.success
         case .listening:
-            return DS.Colors.blue400
+            return DS.Colors.accentText
         case .processing, .responding:
-            return DS.Colors.blue400
+            return DS.Colors.accentText
         }
     }
 

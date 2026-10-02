@@ -2,7 +2,7 @@
 //  DesignSystem.swift
 //  kiki-desktop-agent
 //
-//  Design system: a blue accent palette on dark surfaces, plus the shared button styles.
+//  Design system: a purple accent palette on light surfaces, plus the shared button styles.
 
 import SwiftUI
 import AppKit
@@ -18,117 +18,123 @@ enum DS {
     enum Colors {
 
         // ── Backgrounds ──────────────────────────────────────────────
-        // Layered surfaces from deepest to most elevated.
-        // Higher surfaces are lighter, creating a sense of depth.
+        // Layered surfaces from the panel's plate up to its cards.
+        // The plate is the grey one and the cards are white, so a card reads as raised; hover
+        // and pressed states step darker rather than lighter, which is the direction that reads
+        // as "under the finger" on a light surface.
 
-        /// The deepest background — used for the main app window fill.
-        static let background = Color(hex: "#101211")
+        /// The panel's own plate — everything else sits on it.
+        static let background = Color(hex: "#F1F1F5")
 
-        /// First elevation layer — used for cards, sidebar, top bar backgrounds.
-        static let surface1 = Color(hex: "#171918")
+        /// First elevation layer — used for cards and raised rows.
+        static let surface1 = Color(hex: "#FFFFFF")
 
-        /// Second elevation layer — used for input fields, elevated cards, chat bubbles.
-        static let surface2 = Color(hex: "#202221")
+        /// Second elevation layer — used for fills that should read as recessed rather than
+        /// raised, such as input fields.
+        static let surface2 = Color(hex: "#F7F7FA")
 
         /// Third elevation layer — used for hover backgrounds on interactive elements.
-        static let surface3 = Color(hex: "#272A29")
+        static let surface3 = Color(hex: "#E9E9EF")
 
         /// Fourth elevation layer — used for active/pressed states on interactive elements.
-        static let surface4 = Color(hex: "#2E3130")
+        static let surface4 = Color(hex: "#DFDFE7")
 
         // ── Borders ──────────────────────────────────────────────────
 
         /// Subtle border — used for card outlines, dividers, input field borders.
-        static let borderSubtle = Color(hex: "#373B39")
+        static let borderSubtle = Color(hex: "#D9D9E1")
 
         /// Strong border — used for focused inputs, hovered card outlines.
-        static let borderStrong = Color(hex: "#444947")
+        static let borderStrong = Color(hex: "#B9B9C5")
 
         // ── Text ─────────────────────────────────────────────────────
 
         /// Primary text — main body text, titles, headings.
-        static let textPrimary = Color(hex: "#ECEEED")
+        static let textPrimary = Color(hex: "#1B1B1F")
 
         /// Secondary text — descriptions, hints, muted labels.
-        static let textSecondary = Color(hex: "#ADB5B2")
+        static let textSecondary = Color(hex: "#55555E")
 
         /// Tertiary text — very muted, used for section labels, timestamps, disabled text.
-        static let textTertiary = Color(hex: "#6B736F")
+        static let textTertiary = Color(hex: "#7E7E88")
 
-        /// Text used on top of the accent fill (#2563eb blue), like the primary button label.
-        /// White on #2563eb achieves ~5.1:1 contrast — WCAG AA compliant.
-        /// White on #1d4ed8 hover achieves ~6.5:1 — also WCAG AA compliant.
+        /// Text used on top of the accent fill (#8F46EB purple), like the primary button label.
+        /// White on #8f46eb achieves ~5.0:1 contrast — WCAG AA compliant.
+        /// White on #7b34d9 hover achieves ~6.3:1 — also WCAG AA compliant.
         static let textOnAccent: Color = .white
 
-        // ── Tailwind Blue Scale ─────────────────────────────────────
-        // Full Tailwind CSS v4 blue palette. 50–200 for tinted backgrounds and disabled
-        // states, 300–400 for text and accents, 500–700 for fills, 800–950 for deep surfaces.
+        // ── Purple Scale ────────────────────────────────────────────
+        // The app's purple ramp, built around the purple the cursor already wears (#bd79ff).
+        // 50–200 for tinted backgrounds and disabled states, 300–400 for the cursor and the
+        // lighter accents, 500–700 for fills and accent text, 800–950 for deep surfaces.
 
-        static let blue50  = Color(hex: "#eff6ff")
-        static let blue100 = Color(hex: "#dbeafe")
-        static let blue200 = Color(hex: "#bfdbfe")
-        static let blue300 = Color(hex: "#93c5fd")
-        static let blue400 = Color(hex: "#60a5fa")
-        static let blue500 = Color(hex: "#3b82f6")
-        static let blue600 = Color(hex: "#2563eb")
-        static let blue700 = Color(hex: "#1d4ed8")
-        static let blue800 = Color(hex: "#1e40af")
-        static let blue900 = Color(hex: "#1e3a8a")
-        static let blue950 = Color(hex: "#172554")
+        static let purple50  = Color(hex: "#f8f4ff")
+        static let purple100 = Color(hex: "#f1e7ff")
+        static let purple200 = Color(hex: "#e3ceff")
+        static let purple300 = Color(hex: "#d2acff")
+        static let purple400 = Color(hex: "#bd79ff")
+        static let purple500 = Color(hex: "#a855f7")
+        static let purple600 = Color(hex: "#9333ea")
+        static let purple700 = Color(hex: "#8f46eb")
+        static let purple800 = Color(hex: "#7b34d9")
+        static let purple900 = Color(hex: "#6326b0")
+        static let purple950 = Color(hex: "#3c1870")
 
-        // ── Accent (derived from blue scale) ───────────────────────
-        // The primary fill is Blue 600; hover darkens to Blue 700.
+        // ── Accent (derived from the purple scale) ──────────────────
+        // The primary fill is Purple 700 — the purple the floating button already wore; hover
+        // darkens to Purple 800.
 
         /// Accent fill — used for solid button backgrounds.
-        /// #2563eb → ~5.1:1 contrast with white text (WCAG AA).
-        static let accent = blue600
+        /// #8f46eb → ~5.0:1 contrast with white text (WCAG AA).
+        static let accent = purple700
 
-        /// Accent hover — slightly darker blue for hover state.
-        /// #1d4ed8 → ~6.5:1 contrast with white text (WCAG AA+).
-        static let accentHover = blue700
+        /// Accent hover — slightly darker purple for hover state.
+        /// #7b34d9 → ~6.3:1 contrast with white text (WCAG AA+).
+        static let accentHover = purple800
 
-        /// Accent text — bright blue used for accent-colored text and icons
-        /// on dark backgrounds (links, active nav items, highlighted labels).
-        static let accentText = blue400
+        /// Accent text — purple used for accent-colored text, icons and status dots
+        /// on light backgrounds (links, active rows, highlighted labels).
+        static let accentText = purple600
 
-        /// Very subtle accent tint — used for selected item backgrounds (e.g. current step
-        /// in the sidebar). Low opacity so it doesn't overpower.
-        static let accentSubtle = blue500.opacity(0.10)
+        /// Very subtle accent tint — used for selected item backgrounds (e.g. the card holding
+        /// the task in progress). Low opacity so it doesn't overpower.
+        static let accentSubtle = purple500.opacity(0.10)
 
         // ── Semantic Colors ──────────────────────────────────────────
 
         /// Destructive/error actions — delete buttons, error messages, close button hover.
-        static let destructive = Color(hex: "#E5484D")        // Radix Red 9
+        static let destructive = Color(hex: "#D93A3F")
 
         /// Destructive hover state.
-        static let destructiveHover = Color(hex: "#F2555A")   // Radix Red 10
+        static let destructiveHover = Color(hex: "#C02F34")
 
-        /// Destructive used for text on dark backgrounds (brighter for readability).
-        static let destructiveText = Color(hex: "#FF6369")    // Radix Red 11
+        /// Destructive used for text (darker than the fill for readability on light backgrounds).
+        static let destructiveText = Color(hex: "#C2262B")
 
         /// Success — checkmarks, granted status, completion indicators.
-        /// Independent green so success states are visually distinct from the blue accent.
-        static let success = Color(hex: "#34D399")      // Tailwind Emerald 400
+        /// Independent green so success states are visually distinct from the purple accent.
+        static let success = Color(hex: "#0A7452")
 
         /// Warning — caution messages, manual verification failure explanations.
-        static let warning = Color(hex: "#FFB224")            // Radix Amber 9
+        static let warning = Color(hex: "#9C5D00")
 
-        /// Warning text — brighter variant for text on dark backgrounds.
-        static let warningText = Color(hex: "#F1A10D")        // Radix Amber 11
+        /// Warning text — darker variant for text on light backgrounds.
+        static let warningText = Color(hex: "#8A5200")
 
         /// Info/feature highlight — used for prompt card headers, code highlights.
-        /// Lighter than accentText so informational elements are visually distinct
+        /// A blue rather than the purple, so informational elements stay distinct
         /// from interactive accent-colored elements.
-        static let info = Color(hex: "#70B8FF")               // Radix Blue 9
+        static let info = Color(hex: "#1D6FD0")
 
-        /// Inline code text color — slightly brighter blue for monospace code snippets.
-        static let codeText = Color(hex: "#9DC2FF")           // Radix Blue 11 variant
+        /// Inline code text color — deep purple for monospace code snippets.
+        static let codeText = Color(hex: "#7C3AED")
 
         // ── Overlay Cursor ───────────────────────────────────────────
 
         /// The cursor/bubble color used in OverlayWindow — the triangle, the waveform bars,
-        /// the spinner's arc and the bubble fills. Kept distinct from the accent on purpose:
-        /// it is the screen overlay's colour, not the in-app UI's.
+        /// the spinner's arc and the bubble fills. The accent is drawn from the same purple,
+        /// but this stays a token of its own: it is the screen overlay's colour, and it is
+        /// what the app icon draws.
         static let overlayCursorPurple = Color(hex: "#BD79FF")
 
         /// The color the cursor turns while it is carrying the user's mouse to a click.
@@ -137,6 +143,20 @@ enum DS {
         /// that the pointer in their hand is Kiki's for the moment. One colour, one meaning,
         /// which is why the bubble fills below deliberately avoid it.
         static let overlayCursorClickRed = Color(hex: "#FF878D")
+
+        // ── Overlay Response Bubble ──────────────────────────────────
+        // The bubble that follows the cursor stays dark while the panel goes light: it is read
+        // over whatever happens to be on screen rather than on the panel's plate, and dark is
+        // the fill that holds up over a white window and a black terminal alike.
+
+        /// The bubble's fill.
+        static let responseBubbleBackground = Color(hex: "#171918")
+
+        /// The reply's own text.
+        static let responseBubbleText = Color(hex: "#ECEEED")
+
+        /// The bubble's hairline outline.
+        static let responseBubbleBorder = Color(hex: "#373B39")
 
         // ── Floating Button Gradient ─────────────────────────────────
 
@@ -150,17 +170,17 @@ enum DS {
         // ── Help Chat ──────────────────────────────────────────────
 
         /// User message bubble background in the help chat.
-        /// Blue 800 — deep blue that's clearly distinct from the dark surface
-        /// while keeping white text highly readable (~9:1 contrast).
-        static let helpChatUserBubble = blue800
+        /// Purple 900 — deep purple that's clearly distinct from the surface behind it
+        /// while keeping white text highly readable.
+        static let helpChatUserBubble = purple900
 
         /// Slightly lighter variant for hover/pressed states on user bubbles.
-        static let helpChatUserBubbleHover = blue700
+        static let helpChatUserBubbleHover = purple800
 
         /// Footer/backdrop behind the floating help chat.
-        /// Slightly lighter than the main window background so the chat zone reads
-        /// as a distinct docked surface even before the pill input is visible.
-        static let helpChatBackdrop = Color(hex: "#212121")
+        /// A step greyer than the panel's plate so the chat zone reads as a distinct
+        /// docked surface even before the pill input is visible.
+        static let helpChatBackdrop = Color(hex: "#E9E9EF")
 
         // ── Disabled State ───────────────────────────────────────────
         // Following Material Design 3's disabled pattern:
