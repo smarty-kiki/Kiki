@@ -2,8 +2,7 @@
 //  CompanionManager.swift
 //  kiki-desktop-agent
 //
-//  Central state manager for the companion voice mode: owns the push-to-talk pipeline
-//  and the observable voice state the panel UI reads.
+//  Central state manager: the push-to-talk pipeline and the observable voice state the panel reads.
 //
 
 import AVFoundation
@@ -20,90 +19,49 @@ enum CompanionVoiceState: Equatable {
     case responding
 }
 
-/// What Kiki is doing at this moment, as one answer.
-///
-/// `CompanionVoiceState` and `StatusItemIconPhase` are two independent facts, and every way into the
-/// app has to combine them into "may this start now?" — with a different answer each time: a visit to
-/// the menu bar icon turns away everything, a reply in flight turns away a click but not a new
-/// question. Spelled out at each entry point that combination is a condition per site, and the sites
-/// can drift apart; named once, each entry point states only its own policy, and a state added later
-/// is a compile error at every one of them rather than a silent pass.
+/// One answer, combined with `StatusItemIconPhase` at every way into the app, so a state added
+/// later is a compile error rather than a silent pass.
 enum WhatKikiIsDoingRightNow {
-    /// Nothing in particular — what the panel shows as 等待中.
     case waiting
-    /// The cursor is in the menu bar icon's hands: on its way in, or already inside it.
     case restingInTheStatusItemIcon
-    /// The cursor is on its way back out of the icon.
     case wakingFromTheStatusItemIcon
-    /// Watching what the user does with the mouse, so it can be done again afterwards.
     case recordingWhatTheUserIsDoing
-    /// Doing the recorded actions back, in a loop.
     case replayingWhatTheUserDid
     case listeningToTheUser
-    /// Capturing, or waiting on the model — including the part of a turn that is not read aloud.
     case processingTheLastTurn
     case replyingToTheLastTurn
 }
 
-/// Which half of a recording — if either — Kiki is in.
-///
-/// One fact rather than two flags, because the three answers are exclusive by construction: a
-/// recording that has ended is what the replay begins from, and a tap that arrives during a replay
-/// ends it and starts a recording. Two booleans would admit a state where Kiki is doing both, and
-/// every reader would then have to decide which one it believes.
+/// One fact rather than two flags, which would admit a state where Kiki is doing both.
 enum RecordedActionsPhase: Equatable {
     case neitherRecordingNorReplaying
     case recordingWhatTheUserIsDoing
     case replayingWhatTheUserDid
 }
 
-/// Where the task in progress stands, as the settings panel reads it out.
-///
-/// One value rather than numbers written separately, for the reason the pointing flight is one
-/// value: the panel re-draws on every chunk of the reply, so properties written one at a time
-/// would let it draw a round count from one moment beside a context figure from another — a task
-/// that never existed.
+/// One value: separate properties would let the panel mix two moments as it re-draws per chunk.
 struct TaskProgress: Equatable {
-    /// How many rounds the task has taken, a round being one thing the user asked for and everything
-    /// Kiki did about it, however many steps that ran to.
     let roundCount: Int
-    /// How many steps the task has taken. A round that never acted on the screen is one step.
+    /// A round that never acted on the screen is one step.
     let stepCount: Int
-    /// Whether a round is being answered right now.
     let isRunning: Bool
-    /// Which step of the round in progress this is, counting from one. Zero when nothing is running.
     let stepInTheRoundInProgress: Int
-    /// What the context costs as it stands, by the same estimate the compression trigger reads.
+    /// Valued by the same estimate the compression trigger reads.
     let estimatedTokenCountOfTheContext: Int
-    /// The cost at which the oldest steps are compressed into a summary and the context is reclaimed.
     let tokenCountThatStartsCompression: Int
-    /// When the task stops being the task: the last activity plus the idle gap that ends a
-    /// conversation. Nil until the session has had any activity at all.
-    ///
-    /// The moment rather than a countdown, because the countdown moves with the clock and this moves
-    /// only with the conversation — so the panel draws the one and the manager publishes the other.
+    /// A moment rather than a countdown, which the panel computes as it draws.
     let dateTheNextQuestionStartsANewConversation: Date?
 
-    /// The task on the record at all — asked about, whether or not Kiki is still working on it.
     var hasATask: Bool {
         roundCount > 0 || isRunning
     }
 
-    /// How long the task has left before the next question starts a new one — nil while there has
-    /// been no activity at all, and negative once that moment has passed.
-    ///
-    /// The subtraction lives here rather than at the panel, for the reason the distance to the
-    /// compression does: the two numbers it is made of are this value's own.
+    /// Negative once past.
     func secondsBeforeTheNextQuestionStartsANewConversation(from now: Date) -> TimeInterval? {
         dateTheNextQuestionStartsANewConversation.map { $0.timeIntervalSince(now) }
     }
 
-    /// How much of the room before the compression the context has used.
-    ///
-    /// Measured against the trigger rather than against the model's whole window, because "how far
-    /// from being reclaimed" is the question the readout answers and the trigger is where that
-    /// distance reaches zero. Clamped, because the estimate can read past the trigger during the
-    /// step that is about to cause the compression.
+    /// Measured against the trigger and clamped, because the estimate can read past it mid-step.
     var fractionOfTheRoomBeforeCompressionUsed: Double {
         guard tokenCountThatStartsCompression > 0 else { return 0 }
         return min(1, Double(estimatedTokenCountOfTheContext) / Double(tokenCountThatStartsCompression))
@@ -119,239 +77,136 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
-    /// Speech Recognition is a TCC service of its own, separate from the microphone, and
-    /// macOS asks for it the first time the Speech framework runs.
+    /// Speech Recognition is a TCC service of its own, asked for the first time the Speech framework runs.
     @Published private(set) var hasSpeechRecognitionPermission = false
 
-    /// Where the cursor has been sent, and what it is to do when it gets there.
-    ///
-    /// Written as one value because the five facts in it are one answer, and read as one because a
-    /// flight that picked up the last flight's bubble text or click kind would point at the right
-    /// place for the wrong reason.
+    /// One value: a flight that picked up the last flight's bubble text or click kind would point
+    /// at the right place for the wrong reason.
     @Published var pointingTarget: PointingTarget?
 
-    /// Bumped by every flight the cursor is sent on, and what the overlay flies on.
-    ///
-    /// Not the target's location: two stops of one tour can name the same point — a `[TYPE:…]` and
-    /// the `[KEY:…:return]` right after it are written at one coordinate — and a flight keyed on
-    /// the location is never made for the second of them, whose action is then reported by nobody
-    /// and written off by the arrival timeout. Nothing else that writes `pointingTarget` bumps it,
-    /// which is what keeps `endPointingTour`'s withdrawal of a press, and the re-park after a
-    /// narration that stopped, from flying the cursor back to the spot it never left.
+    /// What the overlay flies on. Never the target's location: two stops can name one point — a
+    /// `[TYPE:…]` and the `[KEY:…:return]` after it — and a flight keyed on location misses the second.
     @Published private(set) var pointingFlightRequestCount = 0
 
-    /// Where a drag has the pointer right now, in global AppKit screen coordinates, while one is
-    /// running — nil at every other moment.
-    ///
-    /// A drag is the one action whose cursor position is not one of the two ends: the press and the
-    /// release are a flight's shape, while what a drag is doing is somewhere in between and moving.
-    /// Written a step at a time by `ElementDragger` and read by the overlay, which draws the cursor
-    /// there so it reads as the thing being carried rather than as a cursor that arrived and waited.
+    /// In global AppKit coordinates, written step by step by `ElementDragger` so the cursor is drawn
+    /// travelling with it.
     @Published var screenLocationOfTheDragInFlight: CGPoint?
 
-    /// Where the cursor is in its trip into the menu bar icon it was left resting on, and back out.
-    ///
-    /// Written by `MenuBarPanelManager` when either wait is over and by the overlay when the cursor
-    /// lands; read by the overlay to fly, by the manager to redraw the icon, and by
-    /// `isNotTakingInputBecauseOfTheStatusItemIcon` to close every way into the app.
     @Published private(set) var statusItemIconPhase: StatusItemIconPhase = .notInTheIcon
 
-    /// The turn being spoken, cut into the pieces the voice is handed one at a time.
-    ///
-    /// A segment runs to the end of the first sentence that names a tour stop, or of a sentence the
-    /// model terminated where a sentence names nothing. That boundary is what lets the words wait
-    /// for the cursor, by never handing over the next segment.
-    ///
-    /// This is the **turn's** list and not a step's: a step appends its own segments and leaves the
-    /// ones already behind the voice alone, so the narration runs on from one step into the next
-    /// without a seam. A step's indices are offset by `speechSegmentCountBeforeTheStepNowStreaming`
-    /// into this one, which is also the numbering `AppleTTSClient` files its prepared audio under.
+    /// The turn's list, not a step's: a step appends its own segments, offset by
+    /// `speechSegmentCountBeforeTheStepNowStreaming`, so a step boundary is not a seam.
     private var speechSegmentsOfTheTurnBeingSpoken: [CompanionSpeechSegment] = []
-    /// How many of `speechSegmentsOfTheTurnBeingSpoken` are beyond revision. The last one is the
-    /// segment the model may still be writing, held back because the voice cannot take words back.
+    /// How many are beyond revision; the last one is the segment the model may still be writing,
+    /// held back because the voice cannot take words back.
     private var finalizedSpeechSegmentCount = 0
-    /// How many segments the steps before the one now streaming contributed.
-    ///
-    /// A step cuts its own reply from zero, and this is what turns one of its indices into a
-    /// position in the turn's list — the same conversion the prepared audio is filed under, so a
-    /// step's first segment cannot collide with a step's before it.
+    /// Turns a step's from-zero index into a position in the turn's list.
     private var speechSegmentCountBeforeTheStepNowStreaming = 0
-    /// Whether the reply has stopped arriving. The voice reaching the end of the finalised segments
-    /// is not the end of the reply — the next one may not be written yet — so without this the rest
-    /// would never be heard.
+    /// Reaching the end of the finalised segments is not the end: the next may not be written yet.
     private var isReplyStreamComplete = false
-    /// Cuts the reply into segments as it arrives and resolves each tag the moment it
-    /// closes. Nil outside a streamed reply — the onboarding demo has none.
+    /// Nil outside a streamed reply — the onboarding demo has none.
     private var streamingReplySegmenter: StreamingReplySegmenter?
-    /// Index into `speechSegmentsOfTheTurnBeingSpoken` of the segment being spoken.
-    ///
-    /// The turn's numbering, so it is not reset at a step boundary: the step before this one may
-    /// still be being spoken, and this is what walks from its last segment into this one's first.
+    /// Index into the turn's numbering — never reset at a step boundary.
     private var currentSpeechSegmentIndex = 0
-    /// Whether the voice has reported the segment being spoken as spoken through.
     private var hasCurrentSpeechSegmentFinishedSpeaking = false
-    /// Whether the reply is still being spoken. Distinct from the TTS client's own
-    /// `isPlaying`, which goes false between segments.
-    ///
-    /// One of the facts `voiceState` depicts, which is why every write to it settles that state
-    /// rather than leaving each writer to remember to.
+    /// Distinct from the TTS client's own `isPlaying`, which goes false between segments.
     private var isSpeakingReply = false { didSet { settleVoiceState() } }
-    /// Whether this turn's reply is read aloud. A turn raised from the terminal is not, unless it
-    /// asked to be: with nothing to listen to, the cursor is what paces the pointing.
+    /// A terminal-raised turn is not, unless it asked to be: with nothing to listen to, the cursor paces.
     private var isReadingTheReplyAloud = true
-    /// Whether a voice was handed this turn's reply and never reported a word of it.
-    ///
-    /// No word is coming to release a stop, so the cursor paces the tour from there on — the pacing
-    /// a reply that is not read aloud gets from the start. Unlike `isReadingTheReplyAloud` the voice
-    /// is left alone: it may still be speaking, and only the pointing has to stop waiting on it.
+    /// No word is coming to release a stop, so the cursor paces the tour from there on.
     private var hasTheNarrationGoneSilent = false
-    /// Whether a reply is being produced and none of it has been heard yet — what the cursor's
-    /// spinner depicts. Wider than the dictation phase the voice-state observer knows about, since
-    /// the transcript lands long before the model writes a word, and it ends at the first *sound*,
-    /// which `AppleTTSClient` reports from its playback position rather than from a request to play.
+    /// What the cursor's spinner depicts; it ends at the first sound, reported from playback position.
     private var isWaitingForTheFirstSoundOfTheReply = false { didSet { settleVoiceState() } }
-    /// Whether a turn's reply is being produced, from the transcript being taken to the turn's voice
-    /// being done with it.
-    ///
-    /// Wider than `isWaitingForTheFirstSoundOfTheReply`, which is about what has been *heard*: a turn
-    /// that is not read aloud hears nothing and would otherwise read as 等待中 for its whole length —
-    /// during which a click from the terminal would be let through into the middle of it.
+    /// Wider than `isWaitingForTheFirstSoundOfTheReply`, which is about what has been *heard*: a
+    /// silent turn would otherwise read as 等待中 throughout, with a terminal click let through.
     private var isProducingAReply = false { didSet { settleVoiceState() } }
-    /// How far into the reply's spoken text the narration has got. The voice reports offsets
-    /// within the segment it was handed, so this is where they are converted to the reply's.
+    /// The voice reports offsets within the segment it was handed; this is where they become the reply's.
     private var lastNarrationWordEndOffsetInSpokenText = 0
-    /// How far into the segment being spoken the narration has got, compared against the
-    /// segment's own length to tell a segment spoken through from one the voice abandoned.
+    /// Compared against the segment's own length to tell spoken-through from abandoned.
     private var lastSpokenWordEndOffsetInCurrentSpeechSegment = 0
 
     /// A run of the reply handed to the synthesizer as one utterance.
     private struct CompanionSpeechSegment {
-        /// The words this segment speaks, a slice of the reply's spoken text.
         let spokenText: String
-        /// Where that slice starts in the reply's spoken text.
         let startOffsetInSpokenText: Int
-        /// The tour stops whose elements this segment talks about, as a range into
-        /// `resolvedPointingTourStops`. Empty for a segment that names nothing.
-        ///
-        /// Written as well as read: a segment outlives the step that cut it, and
-        /// `resolvedPointingTourStops` is replaced by each step's own stops — so a segment cut for
-        /// a step that has ended has its range emptied, because the positions in it now name
-        /// elements of a reply this segment is not talking about.
+        /// Emptied when the step it was cut for ends, because `resolvedPointingTourStops` is
+        /// replaced per step — an old range would name elements of a reply it is not about.
         var stopIndexRange: Range<Int>
     }
 
     // MARK: - Pointing Tour State
 
-    /// The elements the reply being spoken tagged, in the order the model describes them and
-    /// already converted into screen locations. One tag is a one-stop tour, so pointing
-    /// follows the narration the same way either way.
     private var resolvedPointingTourStops: [ResolvedPointingTourStop] = []
-    /// Index into `resolvedPointingTourStops` of the next stop to fly to.
     private var nextPointingTourStopIndex = 0
-    /// True while the cursor is driven by a tour rather than by the overlay's own
-    /// single-point hold-and-return, which is what decides who receives the arrival.
+    /// What decides who receives the arrival.
     @Published var isPointingTourActive = false
-    /// Set when the narration has finished and the cursor should come home from the last stop it
-    /// was parked on. Read as state by the arrival path and by the predicates that ask whether the
-    /// voice still has a cursor to wait for; it is not how the cursor is told.
+    /// Set when the narration has finished and the cursor should come home from the last stop.
     @Published var shouldReturnBuddyToCursorAfterPointing = false
-    /// Bumped every time the cursor is told to come home and resume following, on every screen at
-    /// once. The view on the screen whose buddy is parked is the one that acts.
-    ///
-    /// A counter rather than a flag: coming home is driven by a `.onChange`, which fires on a
-    /// change, so a flag the same teardown writes `false` into takes the request away with it.
+    /// A counter rather than a flag: coming home is driven by a `.onChange`, so a flag written
+    /// `false` alongside would take the request away.
     @Published private(set) var buddyReturnHomeRequestCount = 0
-    /// True between triggering a flight and hearing that it arrived.
     private var isFlyingToPointingTourStop = false
     /// Writes off a flight that never reports back, so it cannot hold the tour for good.
     private var pointingTourNarrationResumeTimeoutTask: Task<Void, Never>?
-    /// Waits to see whether the narration reports any words; see
-    /// `schedulePointingTourFallbackIfNarrationIsSilent()`.
+    /// Waits to see whether the narration reports any words at all.
     private var pointingTourNarrationFallbackTask: Task<Void, Never>?
     /// Pokes the tour once the cursor has spent its minimum time on the stop it is on.
     private var pointingTourDwellCompletionTask: Task<Void, Never>?
     /// Brings the cursor home if the narration outlasts the last stop's dwell.
     private var pointingTourReturnHomeTimeoutTask: Task<Void, Never>?
-    /// Whether the voice has reported any words at all for the reply being spoken — direct
-    /// evidence that it reports, where "no flight has started yet" is not.
+    /// Direct evidence that the voice reports at all, where "no flight has started yet" is not.
     private var hasNarrationReportedAnyWords = false
-    /// When the narration last showed it was still moving. A reported word counts, and so does an
-    /// element sitting on a new sentence, which is what a later chunk moves.
+    /// When the narration last proved it was still moving: a word, or a stop on a new sentence.
     private var lastNarrationProgressDate: Date?
     /// Unsticks a tour whose narration has fallen silent partway through.
     private var pointingTourStallWatchdogTask: Task<Void, Never>?
     /// When the cursor last landed on a tour stop. The minimum dwell is measured from here.
     private var lastPointingTourStopArrivalDate: Date?
 
-    /// How long a pointing tour waits for a flight to report back before giving up on it.
     /// Comfortably longer than the slowest flight, so it only fires when nothing picked it up.
     private static let pointingTourArrivalTimeoutSeconds: Double = 3.0
 
-    /// How long the cursor stays on a stop before it may leave for the next one. The bubble it
-    /// writes there has to be readable, and the narration's next tagged sentence often is not.
+    /// How long the cursor stays on a stop before it may leave: the bubble it writes there has to be
+    /// readable, and the narration's next tagged sentence often is not.
     private static let minimumSpokenPointingTourStopDwellSeconds: Double = 1.0
 
-    /// The same hold for a reply nothing is reading aloud. Shorter, because there is no sentence the
-    /// bubble has to keep pace with: the terminal is where the reply is read, and the pointing is
-    /// watched rather than listened to.
+    /// The same hold where nothing reads aloud, so no sentence paces the bubble.
     private static let minimumSilentPointingTourStopDwellSeconds: Double = 0.4
 
-    /// How long the cursor holds a stop in this turn, which is the only thing pacing a tour that is
-    /// not being narrated.
     private var minimumPointingTourStopDwellSeconds: Double {
         isReadingTheReplyAloud
             ? Self.minimumSpokenPointingTourStopDwellSeconds
             : Self.minimumSilentPointingTourStopDwellSeconds
     }
 
-    /// How long the cursor waits on the last stop it will visit before flying home, while the
-    /// narration is still going. Matches the hold the overlay gives a single point.
+    /// How long the cursor waits on the last stop before flying home; the overlay holds a point as long.
     private static let pointingTourStopMaximumDwellSeconds: Double = 3.0
 
-    /// How long to wait for the first word of the narration before concluding this voice will
-    /// never report what it is saying.
+    /// How long to wait for the first word before concluding this voice never reports what it says.
     private static let pointingTourSilentNarrationFallbackSeconds: Double = 2.5
 
-    /// How long a tour may go without a reported word before its narration is treated as stopped for
-    /// good. Has to clear the longest legitimate silence between words, which is a dwell plus an
-    /// arrival timeout, plus a second of margin. The spoken dwell, because this watchdog only has
-    /// anything to watch when there is a narration.
+    /// The longest legitimate silence — a spoken dwell plus an arrival timeout — plus a second's margin.
     private static let pointingTourStallTimeoutSeconds: Double =
         pointingTourArrivalTimeoutSeconds + minimumSpokenPointingTourStopDwellSeconds + 1.0
 
     /// A tour stop with its screenshot coordinate already converted into a screen location.
     private struct ResolvedPointingTourStop {
-        /// Where the cursor will be sent, in the screenshot's own pixel space: the centre of the text box
-        /// the label matched, or the model's own estimate when the label matched nothing.
+        /// The centre of the text box the label matched, or the model's estimate when it matched nothing.
         let screenshotCoordinate: CGPoint
-        /// The coordinate the model itself wrote, kept for the pointing log line.
-        ///
-        /// It is the only way to see a match that landed on the wrong occurrence: the two numbers are
-        /// thrown apart by a label that occurs more than once on the screen.
+        /// The coordinate the model itself wrote, kept for the pointing log: a label occurring more
+        /// than once throws the two numbers apart, the only way to see a match on the wrong occurrence.
         let modelScreenshotCoordinate: CGPoint
-        /// Whether the label was found on screen at all.
-        ///
-        /// A label that is not verbatim matches nothing and the coordinate silently falls back to the
-        /// model's estimate, so a wrong click reads identically to a right one unless this is printed.
+        /// Whether the label was found on screen: a label that is not verbatim matches nothing and the
+        /// coordinate falls back to the estimate silently, so a wrong click reads like a right one here.
         let didTheLabelMatchTextOnScreen: Bool
-        /// Where the element is in global AppKit screen coordinates.
         let screenLocation: CGPoint
-        /// The display frame (global AppKit coords) of the screen the element is on.
         let displayFrame: CGRect
-        /// Short label describing the element (e.g. "run button").
         let elementLabel: String?
-        /// Offset into the spoken text of the sentence describing this element. A word
-        /// reaching it sends the cursor, and it decides which speech segment owns this stop.
+        /// A word reaching it sends the cursor, and it decides which speech segment owns this stop.
         let sentenceStartOffsetInSpokenText: Int
-        /// What this stop's arrival bubble should invite the user to do.
         let pointingBubbleInvitation: PointingBubbleInvitation
-        /// Where a drag from this stop lets go, in the same global AppKit screen coordinates as
-        /// `screenLocation`. Nil for every stop that is not a drag, and nil for a drag whose tag
-        /// named no destination — which is what the refusal is read from.
-        ///
-        /// Beside the point rather than inside `pointingBubbleInvitation`, because the invitation is
-        /// what the bubble's words are picked from and knows nothing about coordinates. The two
-        /// points are one answer, and they are read by the one call that posts the drag.
+        /// Where a drag from this stop lets go, in the same global AppKit coordinates — beside the point rather
+        /// than inside a type that knows nothing about coordinates. Nil for a non-drag or a named no destination.
         let dragDestinationScreenLocation: CGPoint?
     }
 
@@ -363,17 +218,13 @@ final class CompanionManager: ObservableObject {
     private var onboardingVideoEndObserver: NSObjectProtocol?
     private var onboardingDemoTimeObserver: Any?
 
-    /// Asks the player where it is, every step of the intro's narration, so the glow can read the
-    /// measured level for that moment. Holds the measurement itself as well as the player.
+    /// Asks the player where it is, every step of the narration, so the glow reads the level there.
     private var onboardingNarrationLoudnessObserver: Any?
 
-    /// Something the onboarding demo has already pointed at during this run.
-    ///
-    /// Each demo is a fresh request with no history, so the model sees a screen it has already
-    /// chosen something on with no way of knowing it. Both levers are needed: the next demo is told
-    /// what the last one picked, and the rectangle that label resolved to is claimed ground.
+    /// Each demo is a fresh request with no history, so the model would pick the same element again:
+    /// the next demo is told what the last picked, and that label's rectangle is claimed ground.
     struct OnboardingDemoTarget {
-        /// The label the model wrote, verbatim. This is what the next demo is told to avoid.
+        /// The label the model wrote, verbatim — what the next demo is told to avoid.
         let elementLabel: String
         /// The text rectangle the label resolved to, or nil when it matched nothing.
         let matchedTextBox: CGRect?
@@ -385,7 +236,7 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Onboarding Prompt Bubble
 
-    /// Text streamed character-by-character on the cursor after the onboarding video ends.
+    /// Streamed character-by-character on the cursor after the onboarding video ends.
     @Published var onboardingPromptText: String = ""
     @Published var onboardingPromptOpacity: Double = 0.0
     @Published var showOnboardingPrompt: Bool = false
@@ -402,20 +253,18 @@ final class CompanionManager: ObservableObject {
     /// What the cursor's glow widens and narrows by, whoever is speaking for Kiki.
     let voiceLoudnessMeter = VoiceLoudnessMeter()
 
-    /// Watches the mouse for a run of the user's own actions, and owns the shift+option tap that
-    /// starts and ends one.
+    /// Watches the mouse for a run of the user's own actions, and owns the shift+option tap for one.
     let userActionRecorder = UserActionRecorder()
 
 
     /// Where the user's DeepSeek API key lives, written by the panel and read by the client.
     let deepSeekAPIKeyStore = DeepSeekAPIKeyStore()
 
-    /// Whether a DeepSeek API key has been saved, so the panel can flip its status text
-    /// without reaching into the Keychain itself.
+    /// Whether a DeepSeek API key has been saved, so the panel need not read the store itself.
     @Published private(set) var hasDeepSeekAPIKey: Bool = false
 
-    /// Sends chat requests straight to DeepSeek. No proxy sits in front of it, so the key the
-    /// user pastes in is the only credential in play and nothing is baked into the binary.
+    /// Sends chat requests straight to DeepSeek: no proxy, the pasted key the only credential, and
+    /// nothing baked into the binary.
     private lazy var deepSeekAPI: DeepSeekAPI = {
         return DeepSeekAPI(apiKeyStore: deepSeekAPIKeyStore, model: selectedModel)
     }()
@@ -423,12 +272,8 @@ final class CompanionManager: ObservableObject {
     /// Speaks the companion's responses, on-device and with no API key.
     private lazy var ttsClient = AppleTTSClient()
 
-    /// The way in for `kiki command`. Its accept loop, reads and writes all run on a queue of its
-    /// own, so nothing here has to be held off the main actor.
-    ///
-    /// `lazy` because it is handed the things the app does with what arrives as it is built, and a
-    /// closure capturing the manager cannot be written before the manager exists. Read once, by
-    /// `startCommandSocketServer`.
+    /// Its accept loop and I/O run on a queue of its own so nothing lands on the main actor.
+    /// `lazy` because its closures capture the manager.
     private lazy var commandSocketServer = CompanionCommandSocketServer(
         commandHandler: { [weak self] commandText, speakReply in
             self?.runCommandFromTerminal(commandText, speakReply: speakReply)
@@ -462,46 +307,29 @@ final class CompanionManager: ObservableObject {
         }
     )
 
-    /// Conversation history, so the model remembers prior exchanges within a session.
-    ///
-    /// Carries the turn each entry belongs to, because a turn is entered on the record once per
-    /// step rather than once: trimming on the entry count alone would let one long search push out
-    /// the question it is searching for, and the earlier conversation along with it.
+    /// Carries the turn each entry belongs to: trimming on count alone would let a long search push
+    /// out the question it is searching for.
     private var conversationHistory: [(turnIdentifier: UUID,
                                        userTranscript: String,
                                        assistantResponse: String)] = []
 
-    /// What the steps the context no longer carries whole were compressed into, and how many of
-    /// `conversationHistory`'s entries it stands in for.
-    ///
-    /// The two are one fact and are written together: a summary whose count did not move with it
-    /// would either drop steps it never saw or send steps it already covers. The count runs from
-    /// the front of the history, so the context is the summary followed by the history from that
-    /// index on — a window over the history and the compressed image of what falls outside it,
-    /// rather than a second copy of the conversation that can drift from the first.
+    /// One fact, written together, counted from the front: the context is the summary followed by the
+    /// history from that index on, never a second copy of the conversation that can drift.
     private var summaryOfTheStepsCompressedOutOfTheContext: String?
     private var numberOfHistoryEntriesTheSummaryStandsInFor = 0
 
-    /// What the user said in the turn being answered now. Held rather than passed along
-    /// because the history is written from three call stacks that are not the same one.
+    /// Held, because the history is written from three call stacks that are not the same one.
     private var transcriptOfTheTurnBeingAnswered = ""
 
-    /// Which turn the entries being appended to the history belong to, so that trimming can drop
-    /// whole turns rather than the tail of one. Stamped where a turn begins, never per step.
+    /// So trimming drops whole turns rather than the tail of one; stamped where a turn begins,
+    /// never per step.
     private var turnIdentifierOfTheTurnBeingAnswered = UUID()
 
-    /// Whether the reply being spoken has already gone into `conversationHistory`. Every path
-    /// that writes it can run more than once for the same turn.
+    /// Every path that writes it can run more than once for the same turn.
     private var hasWrittenTheCurrentTurnIntoHistory = false
 
-    /// What the settings panel shows about the task in progress: how many rounds and steps it has
-    /// taken, whether Kiki is still working on it, how close the context is to being compressed, and
-    /// when the next question would start a new task rather than continue this one.
-    ///
-    /// Refreshed at the points where one of those answers changes rather than computed where it
-    /// is read. The estimate walks every character of the history, and the panel re-draws on every
-    /// chunk of the reply — so a read-through computation would put that walk on the main actor
-    /// hundreds of times per reply, on the same thread the overlay is animating on.
+    /// Refreshed where an answer changes, never computed where it is read: the estimate walks every
+    /// character of the history, and the panel re-draws on every chunk.
     @Published private(set) var taskProgress = TaskProgress(
         roundCount: 0,
         stepCount: 0,
@@ -514,198 +342,134 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - The Turn As A Run Of Steps
 
-    /// One step of the turn being answered: the reply the model wrote, and what the actions it asked
-    /// for then did.
-    ///
-    /// The actions are counted rather than flagged, because "this step's batch is over" is a join of
-    /// two ends that finish at different times — the tour running out of stops, and the last press
-    /// reporting back — and the arrival that starts an action is not the call that finishes it.
+    /// One step of the turn: the reply the model wrote and what its actions then did. Counted, not
+    /// flagged: the tour running out of stops and the last press reporting back finish at different times.
     private struct StepOfTheTurnBeingAnswered {
         var numberOfActionsAskedFor = 0
         var numberOfActionsThatHaveReportedBack = 0
-        /// What each action did, in the order the model asked for them, as the sentences the next
-        /// step is told. Empty while the step is still running.
+        /// What each action did, in the order asked, as the sentences the next step is told.
         var sentencesSayingWhatTheActionDid: [String] = []
-        /// Whether any of them reached the screen. A step whose actions were all refused has left
-        /// the screen exactly as the screenshot the model is already looking at.
+        /// All refused means the screen is exactly as the screenshot the model is already looking at.
         var didAnyActionReachTheScreen = false
-        /// Whether this step has been closed out, so the several things that can finish a step do
-        /// not report it more than once.
+        /// So the several things that can finish a step do not report it more than once.
         var hasBeenClosedOut = false
     }
 
     private var stepInProgress = StepOfTheTurnBeingAnswered()
 
-    /// How many steps of the turn being answered have been asked for, counting the one in progress.
-    /// One for a turn that never acts, which is most of them.
+    /// Counting the one in progress. One for a turn that never acts, which is most of them.
     private var numberOfStepsStartedInTheTurnBeingAnswered = 0
 
-    /// How many steps one turn may take before Kiki stops taking them.
-    ///
-    /// A model that answers every look with another [LOOK] would otherwise hold the turn open
-    /// indefinitely, one screenshot and one request at a time. Twenty is what a search costs: a
-    /// folder takes two steps to look inside, one to open it and one to come back out, so a reply
-    /// that means to go through the folders on screen needs room for about ten of them. The prompt
-    /// reads the number off this constant rather than restating it.
+    /// Without a ceiling, a model answering every look with another `[LOOK]` would hold the turn open
+    /// indefinitely; a folder costs two steps to look inside, and the prompt reads this constant.
     private static let maximumStepsInTheTurnBeingAnswered = 20
 
-    /// Whether the model's latest reply asked to see the screen again after acting — the `[LOOK]`
-    /// marker, which is the whole of what makes this a loop rather than one reply.
+    /// The `[LOOK]` marker, which is what makes this a loop rather than one reply.
     private var hasTheModelAskedToLookAgain = false
 
-    /// What the voice has already read out for the steps before the one in progress.
-    ///
-    /// Kept because the terminal is handed absolute snapshots rather than deltas: without it, the
-    /// second step's snapshot would take the place of the first step's instead of following it, and
-    /// a terminal watching a two-step turn would see the reply shrink.
+    /// The terminal gets absolute snapshots, not deltas, so without this the reply would appear to
+    /// shrink at every step boundary.
     private var spokenTextOfTheStepsBeforeTheOneInProgress = ""
 
-    /// Whether the terminal watching this turn has already been told it is over.
     private var hasClosedOutTheTurnBeingAnswered = false
 
-    /// Which turn the reply currently being streamed belongs to.
-    ///
-    /// A cancelled read is not a promise of silence: it can resume with one more chunk after the
-    /// next turn has begun, and by then such a chunk is legitimately the new turn's.
+    /// A cancelled read is not a promise of silence: it can resume with one more chunk after the next
+    /// turn has begun, and by then that chunk is legitimately the new turn's.
     private var turnIdentifierOfTheReplyBeingStreamed = UUID()
 
-    /// The action being waited on, while it is waited on: which action it is, so the work which
-    /// reads the screen for it can tell after each `await` whether it is still the action Kiki is
-    /// going to perform, and who asked, so the one answer it gets goes where it belongs. An action
-    /// is not protected from being taken over — a voice turn or a command from another terminal
-    /// goes ahead and starts — and this is how the action finds out that it has been.
-    ///
-    /// One value rather than two optionals, because they are written and cleared together: a stray
-    /// write to one of them would answer a terminal that never asked.
+    /// Which action is outstanding, so work that reads the screen for it can tell after each `await` whether it
+    /// is still the action Kiki will perform. One value rather than two optionals: written and cleared together, a stray write would answer a terminal that never asked.
     private var actionBeingWaitedOn: ActionBeingWaitedOn?
 
-    /// Which action is outstanding, and who hears the one answer it gets.
     private struct ActionBeingWaitedOn {
         let actionIdentifier: UUID
         let whoHearsTheAnswer: WhoHearsTheAnswer
     }
 
-    /// Where the one answer to an action goes.
-    ///
-    /// Two sources ask Kiki to do something at a point, and they are told about it in different
-    /// currencies: a terminal waits for a sentence, while the replay of the user's own recording
-    /// asked in order to move the loop along. Carrying that here rather than as a second field on
-    /// the action is what lets both reach the same performance and be answered by it.
+    /// Where the one answer to an action goes, carried here so all three askers reach one performance.
     private enum WhoHearsTheAnswer {
         case theTerminalThatAsked(CommandTerminalIdentifier)
         /// Nobody asked in words: the answer's only work is to start the next step.
         case theReplayOfTheUsersRecordedActions
+        /// The guide reads the outcome off the permission fact instead.
+        case theOnboardingGuideItself
     }
 
-    /// The same action once its point is known and the cursor is on its way there, or nil whenever
-    /// there is no such flight. Cleared by `endTheActionBeingWaitedOn` together with the identifier
-    /// above, so an action that has been answered is never performed on arrival.
+    /// Cleared together with the identifier above, so an answered action is never performed on arrival.
     private var actionInFlight: ActionInFlight?
 
-    /// Whether Kiki is watching the user's hands, doing again what they did, or neither.
-    ///
-    /// A fact of its own rather than a flag on the recorder, because it decides what every input
-    /// path does — the same question `statusItemIconPhase` and `voiceState` answer — and because
-    /// the panel and the cursor both draw it.
+    /// A fact of its own rather than a flag on the recorder: it decides what every input path does,
+    /// and the panel and the cursor both draw it.
     @Published private(set) var recordedActionsPhase: RecordedActionsPhase = .neitherRecordingNorReplaying
 
-    /// What the last recording holds. Emptied when the replay is forgotten, so the two are never
-    /// out of step in the one direction that matters: a list with no replay running is a recording
-    /// nobody asked for.
+    /// Emptied when the replay is forgotten: a list with no replay running is a recording nobody asked for.
     private var recordedUserActions: [RecordedUserAction] = []
 
-    /// Where the loop has got to. Advanced before each step is performed rather than after it, so
-    /// a step that is interrupted is not the one the loop comes back to.
+    /// Advanced before each step is performed, so an interrupted step is not the one the loop resumes.
     private var indexOfTheNextRecordedActionToReplay = 0
 
-    /// The wait between two steps of a replay.
     private var replayStepTask: Task<Void, Never>?
 
-    /// How long the loop waits between two replayed actions.
-    ///
-    /// The actions themselves are over in milliseconds, so without a wait the cursor would cross
-    /// the screen twice before the eye could follow either crossing. It has to stay well under
-    /// `pointingTourStopMaximumDwellSeconds`: each arrival schedules the tour's return home, and a
-    /// longer wait would have the cursor start flying back to the pointer between two steps.
+    /// The actions are over in milliseconds, so without a wait the cursor would cross the screen twice before the
+    /// eye could follow either. Must stay under `pointingTourStopMaximumDwellSeconds`, or the cursor flies home between two steps.
     private static let secondsBetweenReplayedActions: Double = 0.6
 
-    /// The shortcut that starts, ends and interrupts a replay, and the subscription that listens
-    /// for it.
     private var recordedActionsShortcutCancellable: AnyCancellable?
 
-    /// How much of the reply has already gone to the terminal watching it, so a chunk that changed
-    /// nothing does not pay for the parse that would work out the same answer.
+    /// So an unchanged chunk skips the parse that would work out the same answer.
     private var rawReplyUTF16CountLastSentToTerminal = -1
 
-    /// When the conversation last moved — the user speaking or Kiki working — which decides
-    /// whether the next turn continues it or starts a new one.
-    ///
-    /// Advanced by every step as well as by every turn, because the gap that starts a new
-    /// conversation is a gap in the conversation rather than a gap in what the user typed. A
-    /// search that runs for a quarter of an hour is the conversation still going: measured from
-    /// the question alone, the follow-up asked the moment it ended would read as the user having
-    /// been away, and would drop the history the search had just been building — the question it
-    /// was answering along with it.
+    /// When the conversation last moved — the user speaking or Kiki working. Advanced by every step, not only
+    /// every turn: from the question alone, the follow-up asked the moment a quarter-hour search ends would drop the history that search built.
     private var dateOfTheLastActivityInTheConversation: Date?
 
-    /// How many exchanges the history holds before its oldest are dropped. A soft bound: the turn
-    /// in progress is never trimmed, so a turn of more steps than this keeps all of them.
-    ///
-    /// For a session that never ends rather than as a working limit — what a request actually
-    /// carries is bounded separately, by the summary the context compresses its oldest steps into.
+    /// A soft bound: the turn in progress is never trimmed, so a turn of more steps keeps all of them.
+    /// What a request carries is bounded separately, by the summary the oldest steps compress into.
     private static let maximumExchangeCountCarriedInHistory = 5000
 
-    /// The context window of the model the settings panel offers, in tokens.
     private static let contextTokenCountOfTheModel = 1_000_000
 
-    /// How full the context may get before the steps behind it are compressed into a summary.
-    ///
-    /// Well under half, because the trigger is checked before the screenshot is taken and the
-    /// reply is written: what the compression leaves has to hold a screenshot of every display,
-    /// the prompt, and everything the model is about to say back.
+    /// Well under half, because the trigger is checked before the screenshot is taken: what the
+    /// compression leaves has to hold a capture of every display, the prompt, and the reply to come.
     private static let fractionOfTheContextThatStartsCompression = 0.45
 
-    /// The cost at which that happens, in tokens. The one place those two numbers are combined, so
-    /// the trigger the compression fires on and the trigger the panel counts down to are the same
-    /// figure rather than two roundings of it.
+    /// The one place those two numbers are combined, so the trigger the compression fires on and
+    /// the trigger the panel counts down to are the same figure rather than two roundings of it.
     private static let tokenCountThatStartsCompression = Int(
         Double(contextTokenCountOfTheModel) * fractionOfTheContextThatStartsCompression)
 
-    /// How many of the newest steps the context always carries whole, whatever the compression
-    /// does — the ones the question just asked actually refers to.
+    /// The ones the question just asked actually refers to.
     private static let numberOfNewestStepsAlwaysCarriedWhole = 5
 
-    /// What one screenshot is taken to cost the context.
-    ///
-    /// Vision input is counted by the image rather than by its bytes, and there is no tokenizer in
-    /// the process to ask, so the trigger is worked out against a fixed estimate per display.
+    /// Vision input is counted by the image rather than its bytes; no tokenizer in the process to ask.
     private static let estimatedTokenCountOfOneScreenshot = 5_000
 
-    /// How long the conversation can be idle before the next turn counts as a new one.
     private static let maximumGapBetweenTurnsInTheSameConversationSeconds: TimeInterval = 10 * 60
 
     init() {
-        // The panel renders the key's saved/empty state before any request is made, so seed
-        // it from the Keychain at launch.
+        // The panel renders the key's saved/empty state before any request is made, so seed it here.
         hasDeepSeekAPIKey = deepSeekAPIKeyStore.hasAPIKey
 
-        // The first reports how far into the segment the words have got, which sends the cursor
-        // off; the second that it has been spoken through, which releases the next segment.
+        // A recovered key was typed into an older build, so its step is already done: left unset, a
+        // machine with every other fact satisfied would have no segment left and no way to the video.
+        if deepSeekAPIKeyStore.didRecoverTheKeyFromTheLegacyKeychain {
+            hasCompletedOnboarding = true
+        }
+
+        // The first reports how far into the segment the words have got, sending the cursor off; the
+        // second that it has been spoken through, releasing the next segment.
         ttsClient.onSpokenCharacterRange = { [weak self] spokenCharacterRange in
             self?.handleSpokenCharacterRange(spokenCharacterRange)
         }
         ttsClient.onPlaybackFinished = { [weak self] in
             self?.handlePlaybackFinished()
         }
-        // The spinner is held until this arrives, so clearing the wait is what ends the reply's
-        // `.processing` state — see `voiceStateTheFactsSupport`. Idempotent, so a report arriving
-        // after the reply was written off settles the state onto whatever the facts now say.
+        // The spinner is held until this arrives, so clearing the wait ends the reply's `.processing`
+        // state. Idempotent: a late report settles onto whatever the facts say.
         ttsClient.onFirstSoundHeard = { [weak self] in
             self?.isWaitingForTheFirstSoundOfTheReply = false
         }
-        // The voice's own level, which drives the glow around the cursor while the reply is read
-        // aloud. The onboarding video is the other thing that ever speaks for Kiki, and it reports
-        // to the same meter — see `listenForTheOnboardingNarrationLoudness`.
+        // The voice's own level, which drives the glow; the onboarding video reports to the same meter.
         ttsClient.onVoiceLoudness = { [weak self] voiceLoudness in
             self?.voiceLoudnessMeter.report(voiceLoudness)
         }
@@ -719,32 +483,27 @@ final class CompanionManager: ObservableObject {
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
-    /// Observes displays changing so the overlay keeps one window per connected screen.
+    /// So the overlay keeps one window per connected screen.
     private var displayConfigurationChangeObserver: NSObjectProtocol?
-    /// Scheduled hide for transient cursor mode, cancelled if the user speaks again.
     private var transientHideTask: Task<Void, Never>?
 
-    /// True when every permission Kiki needs is granted. Every permission has to be in the set: the
-    /// panel renders its rows only while this is false, so one left out would become un-grantable
-    /// the moment the others were in place.
+    /// Every permission has to be in the set: the panel renders its rows only while this is false,
+    /// so one left out would become un-grantable the moment the others were in place.
     var allPermissionsGranted: Bool {
         hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission
             && hasScreenContentPermission && hasRequiredSpeechRecognitionPermission
     }
 
-    /// Speech Recognition is only required when the resolved transcription backend is Apple's
-    /// on-device one — the network providers never touch that TCC service. Read the *resolved*
-    /// provider, because the factory falls back to Apple Speech when the preferred one has no key.
-    private var hasRequiredSpeechRecognitionPermission: Bool {
+    /// Only required when the *resolved* transcription backend is Apple's — the factory falls back to
+    /// Apple Speech with no key — and not private: the guide's microphone segment waits on this fact.
+    var hasRequiredSpeechRecognitionPermission: Bool {
         !buddyDictationManager.transcriptionProviderRequiresSpeechRecognitionPermission
             || hasSpeechRecognitionPermission
     }
 
-    /// Whether the purple cursor overlay is currently visible on screen.
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The DeepSeek model used for voice responses, persisted under a key of its own so an
-    /// install carrying a model saved by an older build falls back to the default.
+    /// Persisted under a key of its own, so a model saved by an older build falls back to the default.
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedDeepSeekModel") ?? DeepSeekAPI.defaultModel
 
     func setSelectedModel(_ model: String) {
@@ -753,15 +512,13 @@ final class CompanionManager: ObservableObject {
         deepSeekAPI.model = model
     }
 
-    /// Saves the DeepSeek API key the user typed into the settings panel.
-    /// - Returns: `true` when the key reached the Keychain.
+    /// Saves the DeepSeek API key the user typed into the panel; returns whether it was stored.
     @discardableResult
     func saveDeepSeekAPIKey(_ apiKey: String) -> Bool {
         let didSaveAPIKey = deepSeekAPIKeyStore.saveAPIKey(apiKey)
         hasDeepSeekAPIKey = deepSeekAPIKeyStore.hasAPIKey
 
-        // Saving a key is the setup step, so completing it also lets the post-onboarding panel
-        // appear on the spot.
+        // Saving a key is the setup step, so completing it also lets the post-onboarding panel appear.
         if didSaveAPIKey && hasDeepSeekAPIKey {
             hasCompletedOnboarding = true
             playIntroDemoIfNeeded()
@@ -770,8 +527,7 @@ final class CompanionManager: ObservableObject {
         return didSaveAPIKey
     }
 
-    /// Whether the Kiki cursor should be shown. When off, the overlay is hidden and
-    /// push-to-talk is disabled.
+    /// When off, the overlay is hidden and push-to-talk is disabled.
     @Published var isKikiCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isKikiCursorEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isKikiCursorEnabled")
@@ -793,7 +549,7 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Whether Kiki may press an element the model asked it to operate. A label naming something
-    /// the user cannot take back is refused either way, and off means every tag only points.
+    /// irreversible is refused either way, and off means every tag only points.
     @Published var isAutomaticClickingEnabled: Bool = UserDefaults.standard.object(forKey: "isAutomaticClickingEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isAutomaticClickingEnabled")
@@ -803,10 +559,8 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "isAutomaticClickingEnabled")
     }
 
-    /// Whether Kiki may type into or press keys on the element the model asked it to operate. Off
-    /// means a keyboard tag only points, the same way the mouse's own switch leaves it. Its own
-    /// switch rather than sharing the one above: typing into a field and pressing its button are
-    /// different amounts of trust.
+    /// Whether Kiki may type into or press keys on the element the model asked it to operate; off means a keyboard
+    /// tag only points. Its own switch rather than sharing the one above: typing into a field and pressing its button are different amounts of trust.
     @Published var isAutomaticKeyboardEnabled: Bool = UserDefaults.standard.object(forKey: "isAutomaticKeyboardEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isAutomaticKeyboardEnabled")
@@ -816,29 +570,26 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "isAutomaticKeyboardEnabled")
     }
 
-    /// The sounds that go out with the gestures Kiki performs — a press, a key combination — built
-    /// once at launch because where they are needed is inside a stop's one-second dwell.
+    /// Built once at launch, because where they are needed is inside a stop's one-second dwell.
     private let elementActionSoundPlayer = ElementActionSoundPlayer()
 
-    /// Whether the user has completed onboarding at least once.
     var hasCompletedOnboarding: Bool {
         get { UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") }
         set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
     }
 
-    /// Whether the one-time intro demo has already played.
-    ///
     /// Separate from `hasCompletedOnboarding` because the two come apart: setup finishes the instant
     /// a key is saved, while the demo needs every permission it uses.
     @Published var hasPlayedIntroDemo: Bool = UserDefaults.standard.bool(forKey: "hasPlayedIntroDemo")
 
-    /// Plays the welcome animation and intro video, once. Called from the key-save path and
-    /// the permission refresh both, so the demo is not lost to ordering.
+    /// Plays the welcome animation and intro video, once. Called from the key-save path and the
+    /// permission refresh both, so the demo is not lost to ordering.
     func playIntroDemoIfNeeded() {
         guard !hasPlayedIntroDemo else { return }
 
-        // The demo is the cursor pointing at things on screen, which needs screen recording,
-        // and it ends by asking for Control+Option, which needs Speech Recognition.
+        // A skip and not a latch: the guide plays the intro itself the moment its last script ends,
+        // so latching here would lose the welcome and the video to a closing line still being spoken.
+        guard !onboardingGuide.isPlayingASegmentScript else { return }
         guard hasCompletedOnboarding && allPermissionsGranted else { return }
 
         hasPlayedIntroDemo = true
@@ -860,23 +611,22 @@ final class CompanionManager: ObservableObject {
         // Eagerly touch the API so its TLS warmup handshake completes before the demo fires.
         _ = deepSeekAPI
 
-        // If permissions were revoked (e.g. a signing change), the cursor stays hidden and the
-        // panel shows its permission rows instead.
+        // If permissions were revoked, the cursor stays hidden and the panel shows its rows instead.
         if hasCompletedOnboarding && allPermissionsGranted && isKikiCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
         }
+
+        // Last, so every fact the guide reads has been refreshed and the overlay decision made.
+        onboardingGuide.beginFollowingTheOnboardingFacts()
     }
 
     // MARK: - The Command Line Tool
 
-    /// Whether the `kiki` in PATH is this app's own tool, and whether an install is in flight.
-    ///
-    /// Read off the filesystem rather than remembered, and refreshed where the question is asked
-    /// afresh — every open of the panel, which is the only place the answer is drawn. The link can
-    /// be made or broken outside the app, by the README's own `ln -s` or by `Kiki.app` being
-    /// moved, so a remembered answer would be a stale one.
+    /// Read off the filesystem rather than remembered: the link can be made or broken outside the
+    /// app — by the README's own `ln -s`, or by `Kiki.app` being moved. Refreshed at every open of
+    /// the panel, the only place it is drawn.
     @Published private(set) var commandLineToolIsInstalled = false
 
     @Published private(set) var isInstallingTheCommandLineTool = false
@@ -886,14 +636,12 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Puts the command into PATH, behind the one system authorisation prompt that writing to
-    /// `/usr/local/bin` costs. Whether it landed is read off the disk afterwards rather than
-    /// reported by the installer: the link itself is the answer.
+    /// `/usr/local/bin` costs. The link on disk is the report, not the installer's own answer.
     func installTheCommandLineTool() async {
         guard !isInstallingTheCommandLineTool else { return }
 
-        // The row can be showing 安装 over a link that is already ours — the panel was drawn
-        // before one was made by hand — and re-making it would ask for an authorisation there is
-        // nothing to authorise.
+        // The row can be showing 安装 over a link that is already ours, and re-making it would ask
+        // for an authorisation there is nothing to authorise.
         refreshCommandLineToolInstallation()
         guard !commandLineToolIsInstalled else { return }
 
@@ -903,20 +651,12 @@ final class CompanionManager: ObservableObject {
         isInstallingTheCommandLineTool = false
     }
 
-    /// Starts the socket listening. What it does with each thing that arrives was given to it when
-    /// it was built, so this is the whole of starting it.
     private func startCommandSocketServer() {
         commandSocketServer.start()
     }
 
-    /// Whether a command sent from the terminal could be run at all, and what is missing when it
-    /// could not — answered before the command is sent, so a terminal that cannot be served is
-    /// told why instead of watching a turn fail.
-    ///
-    /// Only the two things this path actually needs. Accessibility is deliberately not one of
-    /// them: without it Kiki still sees the screen, answers and points, and only the clicks are
-    /// refused — that is a sentence in the reply, not a failure. Neither is the microphone or
-    /// Speech Recognition, which this path never touches.
+    /// Answered before the command is sent, so a terminal that cannot be served is told why instead of watching
+    /// a turn fail. Accessibility is deliberately not asked: without it Kiki still sees, answers and points.
     private func commandReadiness() -> KikiCommandReadiness {
         var problems: [String] = []
 
@@ -930,10 +670,8 @@ final class CompanionManager: ObservableObject {
             problems.append(Self.sentenceForTheMissingScreenRecordingGrant)
         }
 
-        // What a gesture a build did not have is answered by the build rather than by the moment: a
-        // terminal asks so that one sent to an app that predates it is refused with a sentence instead
-        // of arriving as some other gesture. Both `true` here and in the shutting-down fallback above,
-        // because both describe this build, and neither describes whether a command can run right now.
+        // A gesture a build did not have is answered by the build, not the moment: a request to an app that
+        // predates it is refused with a sentence instead of arriving as some other gesture.
         return KikiCommandReadiness(
             canRunCommands: problems.isEmpty,
             problems: problems,
@@ -948,17 +686,12 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Why a command cannot be run at this moment, or nil when it can.
-    ///
-    /// A terminal is turned away down two different paths — the readiness report it is answered with
-    /// when it connects, and the failure event sent to one that was already attached when Kiki went
-    /// quiet — so the answer is kept in one place rather than written out at both.
+    /// Why a command cannot be run right now, or nil. A terminal is turned away down two paths — the readiness
+    /// report at connect, the failure event sent to one already attached — so the answer lives in one place.
     private var whyCommandsCannotRunRightNow: String? {
         switch whatKikiIsDoingRightNow {
-        // A command arrives to *be* the next turn, so a reply in flight is not in its way — it is
-        // what it replaces, and a replay is one more thing a new question replaces. Only the icon
-        // stops it, and so does a recording, which is the user's own hands and not a turn to
-        // replace: the command would be running while they are still working out what to record.
+        // A command arrives to *be* the next turn: it replaces a reply in flight, and a replay is one more thing a
+        // new question replaces. The icon stops it, and so does a recording — the command would run while the user is still deciding what to record.
         case .waiting, .listeningToTheUser, .processingTheLastTurn, .replyingToTheLastTurn,
              .replayingWhatTheUserDid:
             return nil
@@ -971,47 +704,31 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Runs a command typed on the command line exactly as a spoken one runs: same teardown of the
-    /// last turn, same capture, same reply, same pointing — except for the voice, which a terminal
-    /// only gets by asking. The dictation callback's twin.
+    /// A command runs exactly as a spoken one does — same teardown, capture, reply and pointing —
+    /// except for the voice, which a terminal only gets by asking. The dictation callback's twin.
     private func runCommandFromTerminal(_ commandText: String, speakReply: Bool) {
-        // A terminal that was already attached when Kiki went quiet never saw the readiness answer
-        // that would have turned it away. Unreachable today, because a terminal is only attached for
-        // as long as a turn it started is running — but a CLI that held its connection open would
-        // land here, and running the command would be exactly what resting must not do.
+        // A terminal already attached when Kiki went quiet never saw the readiness answer that would have turned
+        // it away. A CLI that held its connection open lands here, and running the command is exactly what resting must not do.
         if let refusalReason = whyCommandsCannotRunRightNow {
             commandSocketServer.send(.failed(message: refusalReason, isRefusal: true))
             return
         }
 
-        // A command from a terminal takes Kiki over the same way talking to it does, and the click
-        // being called off is not deferred behind the turn that takes it — a new question replaces the
-        // screen the click was read off, so there is nothing left for that click to be made against.
-        // The click's terminal is still connected to be told, whichever terminal this command came
-        // from: a command takes the reply away from the terminal watching it, never a click's answer
-        // away from the terminal that asked.
-        //
-        // A replay goes the same way and for the same reason: a typed command is a new question, and
-        // the new question replaces whatever Kiki was doing. A recording never reaches here — a
-        // command is refused while one is running, above.
+        // A command takes Kiki over the way talking to it does. The click being called off is not deferred behind
+        // the turn — a new question replaces the screen it was read off — and a replay ends the same way.
         stopRecordingOrReplayingAndForgetIt()
         callOffTheActionBeingWaitedOn(because: "这次操作被打断了：另一个终端发了新命令。")
 
         lastTranscript = commandText
         print("Companion received command: \(commandText)")
 
-        // Before the capture rather than after it: what follows is several seconds of screenshot
-        // and recognition with nothing to show for it, and a terminal with no way to tell a turn
-        // that has started from one that never did is worse than a terminal that is merely quiet.
+        // Before the capture, not after: a terminal that cannot tell a started turn from one that never
+        // began is worse than a terminal that is merely quiet.
         commandSocketServer.send(.accepted(message: Self.sentenceForReadingTheScreen))
         sendTranscriptToClaudeWithScreenshot(transcript: commandText, isReadingTheReplyAloud: speakReply)
     }
 
-    /// Stops the turn a terminal is watching, without starting anything in its place.
-    ///
-    /// The same teardown a key press does, minus everything about the new question that key press
-    /// is the start of — there is no new question here, only the user saying they have heard
-    /// enough.
+    /// Stops the turn a terminal is watching — the teardown a key press does, minus the new question.
     private func cancelCommandFromTerminal() {
         currentResponseTask?.cancel()
         ttsClient.stopPlayback()
@@ -1023,14 +740,8 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Reading The Screen For A Terminal
 
-    /// Sends a terminal a picture of one screen.
-    ///
-    /// The one request here that is answered with bytes rather than with a sentence. Nothing on the
-    /// machine changes, nothing is spoken, no model is asked and no history is written: it is the
-    /// capture a turn would have been sent, handed to the terminal instead.
-    ///
-    /// Refused for the grant and for a screen that is not there, and gated on nothing else — not on a
-    /// turn being in flight, because reading a screen takes nothing away from one.
+    /// Sends a terminal a picture of one screen — the one request answered with bytes rather than a sentence.
+    /// Refused on the grant and a missing screen and nothing else, not even a turn in flight.
     private func captureScreenshotForTerminal(
         _ screenshotRequest: KikiScreenshotRequest,
         fromTheTerminalWith terminalIdentifier: CommandTerminalIdentifier
@@ -1043,12 +754,10 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // Carries no sentence, because a capture is a fraction of a second and has no wait to be told
-        // about. `locate` is the one of the two that spends seconds reading what it took.
+        // No sentence: a capture is a fraction of a second, where `locate` spends seconds reading it.
         commandSocketServer.send(.accepted(message: nil), toTheTerminalWith: terminalIdentifier)
 
-        // The screen the user is looking at when none was named: a picture is one screen's worth by
-        // construction, and the cursor's screen is the first in capture order.
+        // The cursor's screen when none was named: it comes first in capture order.
         let screenNumber = screenshotRequest.screenNumber ?? 1
 
         Task {
@@ -1075,13 +784,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Answers a terminal with where a piece of text is on screen — every appearance of it, one point
-    /// each, in reading order.
-    ///
-    /// Reading rather than acting, and so allowed in the middle of a turn: nothing on the machine
-    /// changes, and there is nothing for anything else to conflict with. The points come back in the
-    /// global screen space a posted event lands in, which is what lets a script hand one straight back
-    /// as `kiki click -x -y`.
+    /// Every place a piece of text is on screen, one point each, in reading order, in the global screen space a
+    /// posted event lands in — what lets a script hand one straight back as `kiki click -x -y`. Reading, not acting, so allowed mid-turn.
     private func locateTextForTerminal(
         _ locateRequest: KikiLocateRequest,
         fromTheTerminalWith terminalIdentifier: CommandTerminalIdentifier
@@ -1100,8 +804,7 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // The seconds of this path are the capture and the recognition, and both are still ahead, so
-        // the terminal is told before either rather than after.
+        // The seconds of this path — capture and recognition — are both still ahead.
         commandSocketServer.send(.accepted(message: Self.sentenceForReadingTheScreen), toTheTerminalWith: terminalIdentifier)
 
         Task {
@@ -1162,11 +865,7 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Takes the pictures both of the reading commands are made of, or answers the terminal with the
-    /// reason there are none.
-    ///
-    /// Shared because the failure is one failure said one way; what each command does with the
-    /// pictures afterwards is the whole of the difference between them.
+    /// The pictures both reading commands are made of, or the one sentence for why there are none.
     private func captureScreensForTerminal(_ terminalIdentifier: CommandTerminalIdentifier) async -> [CompanionScreenCapture]? {
         do {
             return try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
@@ -1183,10 +882,9 @@ final class CompanionManager: ObservableObject {
 
     /// Where the action a terminal asked for is aimed, and what to tell the terminal about it.
     private enum ActionTargetResolution {
-        /// `dragDestinationAppKitScreenLocation` is where a drag lets go, and nil for every action
-        /// that stays at one point. Carried beside the starting point rather than inside the action
-        /// because the action says *what* happens and this says where: a drag is the one gesture whose
-        /// where is two places.
+        /// `dragDestinationAppKitScreenLocation` is where a drag lets go, nil otherwise — beside the
+        /// starting point rather than inside the action, a drag being the one gesture whose *where*
+        /// is two places.
         case resolved(
             appKitScreenLocation: CGPoint,
             displayFrame: CGRect,
@@ -1197,46 +895,29 @@ final class CompanionManager: ObservableObject {
         case refused(reason: String)
     }
 
-    /// An action a terminal asked for while the cursor is flying to it: what performing it needs once
-    /// the cursor lands, since by then the resolution that produced it is long gone.
-    ///
-    /// The text the terminal named is kept because the refusal rules are asked again on arrival, where
-    /// the press is posted — the sound and the red flight both say "I am about to press this", and a
-    /// click that will not go out must not say it.
+    /// An action a terminal asked for while the cursor flies to it: what performing it needs once the cursor
+    /// lands, the resolution long gone. The named text is kept because the refusals are asked again on arrival.
     private struct ActionInFlight {
-        /// Which action this flight is for and who is waiting on it: what the arrival asks before
-        /// performing it, and where the answer belongs once it has gone out.
         let beingWaitedOn: ActionBeingWaitedOn
         let appKitScreenLocation: CGPoint
-        /// The display the point is on, which is the overlay that flies the cursor to it.
         let displayFrame: CGRect
-        /// The text the element was named by, or nil when the point is all there was — which is
-        /// every action the user typed as a coordinate and every action being replayed.
+        /// The text the element was named by, or nil when the point is all there was.
         let elementText: String?
-        /// What is done at the point — which button and how many times, or which way and how far.
-        /// Carried by the flight rather than read off the request on arrival, because the action is
-        /// not the only thing it decides: the bubble says 「双击这里！」 or 「往下滚！」 and the
-        /// terminal is told 「已双击…」 or 「已往下滚 3 屏…」, and all three are one action.
+        /// Which button and how many times, or which way and how far. Carried by the flight rather than read off
+        /// the request on arrival: the bubble and the terminal's sentence are both cut from it, and all three are one action.
         let action: ElementActionOnArrival
-        /// Where a drag lets go, and nil for every action that stays at one point. Read on arrival,
-        /// which is where a drag begins: by then the request that named the destination is gone.
+        /// Where a drag lets go, nil otherwise — read on arrival, by which time the request that
+        /// named the destination is gone.
         let dragDestinationAppKitScreenLocation: CGPoint?
-        /// What to tell the terminal when the action goes out. Written for a replay too, which has
-        /// no terminal to read it: it is what the resolution produced, and leaving it out would mean
-        /// a branch here and an optional everywhere the answer is assembled.
+        /// Written for a replay too, which has no terminal to read it.
         let successMessage: String
     }
 
-    /// Why an action asked for from the terminal cannot be made at this moment, or nil when it can.
-    ///
-    /// Only states that mean Kiki is in the middle of something: the two the menu bar icon owns, and
-    /// the three the reply pipeline owns. The cursor still flying home after a reply is deliberately
-    /// not one of them — that reply has ended, and a posted event carries its own point, so there is
-    /// nothing to wait for the pointer to arrive for.
+    /// Why an action asked for from the terminal cannot be made now, or nil when it can. Only states that mean
+    /// Kiki is in the middle of something: the cursor flying home is deliberately not one — its reply has ended, and an event carries its own point.
     private var whyAnActionFromTheTerminalCannotBeMadeRightNow: String? {
         switch whatKikiIsDoingRightNow {
-        // Unlike a command, an action takes over nothing: everywhere Kiki is already doing something,
-        // it is a conflict rather than a replacement.
+        // Unlike a command, an action takes over nothing: it is a conflict rather than a replacement.
         case .waiting:
             return nil
         case .restingInTheStatusItemIcon:
@@ -1256,19 +937,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// The action a terminal asked for, read off its request in one place, or nil for a gesture this
-    /// build does not recognise.
-    ///
-    /// One copy, because the flight, the event that goes out and the sentence the terminal is
-    /// answered with all describe the same action — a bubble saying 「双击这里！」 over a right click
-    /// would be describing a different one.
-    ///
-    /// A missing gesture is a single click and an unrecognised one is a refusal, and the difference
-    /// matters. Missing is what a tool older than this field sends, and those are all `kiki click`,
-    /// so reading it as a single click is reading it correctly. Anything else is a newer tool asking
-    /// for a gesture this build has never heard of, and the safe reading of "an action I do not
-    /// understand" is no action at all — the older fallback quietly turned a request to scroll into
-    /// a press of the left button, which on a link is a page load and on a dialog is a lost document.
+    /// The action a terminal asked for, read in one place. A missing `gesture` is one click — what a tool older
+    /// than the field sends; an unrecognised one is a refusal, never a click.
     private static func actionAskedForByTheTerminal(_ clickRequest: KikiClickRequest) -> ElementActionOnArrival? {
         switch clickRequest.gesture {
         case nil, KikiCommandProtocol.Gesture.singleClick: return .press(.singleClick)
@@ -1284,9 +954,8 @@ final class CompanionManager: ObservableObject {
         case KikiCommandProtocol.Gesture.scrollRight:
             return .scroll(.right, distance: .screenfuls(CGFloat(clickRequest.screenfuls ?? 1)))
         case KikiCommandProtocol.Gesture.drag: return .drag
-        // A gesture this build knows whose payload is missing reads as one it does not know, because
-        // there is no action to build: the tool refuses a request with no text or no combination
-        // before sending it, so what is left here is a request written by hand.
+        // A known gesture whose payload is missing reads as unknown: there is no action to build. The
+        // tool refuses such a request before sending it.
         case KikiCommandProtocol.Gesture.typeText:
             guard let typedText = clickRequest.typedText else { return nil }
             return .keyboard(.text(typedText))
@@ -1297,21 +966,10 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Performs where a terminal asked, and does nothing else: no screenshot goes to the model, no
-    /// reply is written, nothing is spoken, the cursor stays where it is and the action is not
-    /// remembered.
-    ///
-    /// Never interrupts. A command from a terminal stops the turn before it by design, because what
-    /// it brings is a new question; an action brings only a press or a scroll to place, and one
-    /// arriving while Kiki is mid-turn is refused instead of queued or squeezed in beside it.
-    ///
-    /// Every answer goes to `terminalIdentifier` rather than to whichever terminal is watching the
-    /// reply — an action asks its own question and hears its own answer, even while a reply streams
-    /// to somebody else.
+    /// Performs where a terminal asked, and nothing else: no model, no reply, no voice, nothing remembered.
+    /// Never interrupts — one arriving mid-turn is refused — and every answer goes to `terminalIdentifier`.
     private func runActionFromTerminal(_ clickRequest: KikiClickRequest, fromTheTerminalWith terminalIdentifier: CommandTerminalIdentifier) {
-        // First of the refusals, because nothing below it can be judged about a request whose
-        // gesture this build cannot read: whether the switch covers it, whether it would be refused
-        // and whether a second one is in flight are all questions about an action, and there is none.
+        // First of the refusals: the rest are all questions about an action, and here there is none.
         guard let action = Self.actionAskedForByTheTerminal(clickRequest) else {
             commandSocketServer.send(
                 .failed(message: "这个手势 Kiki 不认识，没做。", isRefusal: true),
@@ -1325,9 +983,7 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // The switch is asked by the kind of action rather than as one gate over all of them: the
-        // three mouse gestures share one row in the panel and the keyboard has its own, and a
-        // request is refused by the one that covers what it asked for.
+        // By kind, not one gate: the mouse's gestures share a panel row, the keyboard its own.
         switch action {
         case .press, .scroll, .drag:
             guard isAutomaticClickingEnabled else {
@@ -1341,13 +997,8 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        // Asked before the capture, and only for the half of it that has an opinion: a press naming
-        // something destructive, or a missing grant, is answerable now, and the text path is seconds
-        // of screenshots and recognition that would otherwise be spent arriving at a conclusion
-        // already in hand. A scroll is refused for the grant alone — it can be scrolled back, so the
-        // words that stop a press have nothing to stop here. A drag is refused for the grant and for
-        // a destination it never named, which is the one refusal in this switch that is about the
-        // request rather than about Kiki.
+        // Asked before the capture, so seconds of screenshots and recognition are not spent on a conclusion already
+        // in hand. A scroll is refused for the grant alone — it can be scrolled back — a drag for the grant and a missing destination.
         switch action {
         case .press:
             if let refusal = ElementClicker.refusalOfClick(
@@ -1363,9 +1014,8 @@ final class CompanionManager: ObservableObject {
                 return
             }
         case .drag:
-            // A drag is refused for the grant and for a missing destination, and the second of those is
-            // decided here rather than after the screens are read: a drag that named nowhere to let go
-            // is the one request this path can answer without looking at anything.
+            // Decided here rather than after the screens are read: the one request answerable without
+            // looking.
             if let refusal = ElementDragger.refusalOfDrag(
                 toAppKitScreenLocation: Self.dragDestinationAppKitScreenLocation(in: clickRequest)
             ) {
@@ -1382,44 +1032,31 @@ final class CompanionManager: ObservableObject {
                 return
             }
         case .keyboard(.combination(let keyCombination)):
-            // The dangerous table is not consulted by the tool, deliberately: a table in two places
-            // is two answers to what Kiki will not press. The terminal hears it as a refusal, which
-            // is the exit code it would have got from asking before sending anyway.
+            // No dangerous table in the tool: a table in two places is two answers. The refusal
+            // arrives as the exit code the tool would have got anyway.
             if let refusal = ElementKeyboard.refusalOfCombination(named: keyCombination) {
                 commandSocketServer.send(.failed(message: Self.sentenceForAnActionOutcome(refusal.outcome), isRefusal: true), toTheTerminalWith: terminalIdentifier)
                 return
             }
         }
 
-        // A second action is refused rather than queued, because the tool already serialises them: a
-        // `kiki click` returns once its press has been posted, so two of them in a script are one
-        // after the other. One that arrives while another is still in flight is a caller that did
-        // not wait, and it would be answered against a question the first has not finished asking —
-        // the pointer flown to the second point while the first is still on its way to the first.
-        //
-        // Last of the refusals, after the ones about the request itself, so that a terminal asking
-        // for something Kiki will never do hears that rather than a wait it could not shorten by
-        // trying again. Deliberately not part of `whyAnActionFromTheTerminalCannotBeMadeRightNow`,
-        // which `carryOutTheActionTheTerminalAskedFor` asks again after the capture: by then the
-        // action being waited on is this one, and it would refuse itself.
+        // A second action is refused, not queued, and last — never part of
+        // `whyAnActionFromTheTerminalCannotBeMadeRightNow`, asked again after the capture, where the action being waited on is this one and it would refuse itself.
         guard actionBeingWaitedOn == nil else {
             commandSocketServer.send(.failed(message: "Kiki 正在做上一个，等它做完。", isRefusal: true), toTheTerminalWith: terminalIdentifier)
             return
         }
 
-        // Named before the task exists, the way a turn stamps its own identifier before starting:
-        // every answer to this action goes through the identifier, so one whose identifier is no
-        // longer the one being waited on has already been answered and must answer nothing itself.
+        // Stamped before the task exists: an answer bearing an identifier no longer waited on has
+        // been answered already and answers nothing.
         let actionBeingWaitedOn = ActionBeingWaitedOn(
             actionIdentifier: UUID(),
             whoHearsTheAnswer: .theTerminalThatAsked(terminalIdentifier)
         )
         self.actionBeingWaitedOn = actionBeingWaitedOn
 
-        // Sent once every refusal above has been passed, which is what makes it readable as "the
-        // screens are about to be read" rather than as "your request was received": a terminal asking
-        // by text is facing seconds of capture and recognition, and one asking by coordinate is not —
-        // and it is that one that carries no sentence, because it has no wait to be told about.
+        // Sent once every refusal above is passed, which is what makes it readable as "the screens are about to
+        // be read": by text it faces seconds of capture and recognition, by coordinate it does not — and that one carries no sentence.
         commandSocketServer.send(
             .accepted(message: clickRequest.elementText != nil ? Self.sentenceForReadingTheScreen : nil),
             toTheTerminalWith: terminalIdentifier
@@ -1434,38 +1071,21 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Calls off the action being waited on, if there is one, and tells whoever asked.
-    ///
-    /// Reached by the push-to-talk key, because starting to listen is the instant the answer to "is
-    /// Kiki 等待中" stops being yes, by a command from a terminal, because what that brings is a new
-    /// question, and by the shortcut, because tapping it ends a replay. The action is not defended
-    /// against being taken over and does not delay the turn that takes it: it is simply not made,
-    /// rather than landing at a point read off a screen the new turn is about to replace. A terminal
-    /// that asked is still attached to be told, because none of those takeovers goes anywhere near it
-    /// — a command takes the reply-watching role from the terminal that was watching the reply, and
-    /// this terminal never held it.
+    /// Calls off the action being waited on, if there is one, and tells whoever asked: it is not made rather
+    /// than landing at a point read off a screen the new turn is about to replace.
     private func callOffTheActionBeingWaitedOn(because reason: String) {
         guard let actionBeingWaitedOn else { return }
         endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .failed(message: reason, isRefusal: true))
     }
 
-    /// Whether this is still the action Kiki is going to perform, and still the one whoever asked is
-    /// waiting to hear about.
-    ///
-    /// Asked after each `await` in the action path — a voice turn or a command can begin while the
-    /// screens are being read — and on arrival, where the action may have been answered while the
-    /// cursor was on its way.
+    /// Asked after each `await` in the action path — a turn or a command can begin while the screens
+    /// are read — and on arrival.
     private func isStillTheActionBeingWaitedOn(_ actionBeingWaitedOn: ActionBeingWaitedOn) -> Bool {
         self.actionBeingWaitedOn?.actionIdentifier == actionBeingWaitedOn.actionIdentifier
     }
 
-    /// The one answer this action gets, delivered by whoever reaches it first: the press or the
-    /// scroll, the flight that never landed, or whatever has taken Kiki over. It cannot be delivered
-    /// twice, and afterwards nothing is outstanding — the flight is written off with it, so an
-    /// arrival after this performs nothing.
-    ///
-    /// One delivery, but not one kind of delivery: a terminal is told what happened, while a replay
-    /// has nobody to tell and reads this only as the moment its next step may be scheduled.
+    /// Delivered by whoever reaches it first; it cannot be delivered twice, and afterwards nothing is
+    /// outstanding — the flight is written off with it, so a late arrival performs nothing.
     private func endTheActionBeingWaitedOn(_ actionBeingWaitedOn: ActionBeingWaitedOn, with event: KikiCommandEvent) {
         guard isStillTheActionBeingWaitedOn(actionBeingWaitedOn) else { return }
         self.actionBeingWaitedOn = nil
@@ -1473,11 +1093,14 @@ final class CompanionManager: ObservableObject {
 
         switch actionBeingWaitedOn.whoHearsTheAnswer {
         case .theTerminalThatAsked(let terminalIdentifier):
-            // Addressed to the terminal that asked, rather than sent to whoever is watching the reply:
-            // by now that may be another terminal, or nobody at all.
+            // Addressed to the terminal that asked: by now the reply watcher may be another terminal,
+            // or nobody.
             commandSocketServer.send(event, toTheTerminalWith: terminalIdentifier)
         case .theReplayOfTheUsersRecordedActions:
             scheduleTheNextStepOfTheReplay()
+        case .theOnboardingGuideItself:
+            // Nothing to do: the guide waits on the permission fact, not on an answer to the click.
+            break
         }
     }
 
@@ -1489,9 +1112,8 @@ final class CompanionManager: ObservableObject {
     ) async {
         let resolution = await resolveActionTarget(for: clickRequest, action: action)
 
-        // Reading the screen takes the better part of a second per screen, and a voice turn or a
-        // command can begin inside that. Being taken over is answered as being taken over, not as
-        // whatever the screen said on its way out: that screen is already the last turn's.
+        // Reading the screen takes the better part of a second per screen, and a turn or a command can begin
+        // inside that. Being taken over is answered as being taken over, not as whatever a screen from the last turn said on its way out.
         guard isStillTheActionBeingWaitedOn(actionBeingWaitedOn) else { return }
         if let takeoverReason = whyAnActionFromTheTerminalCannotBeMadeRightNow {
             endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .failed(message: takeoverReason, isRefusal: true))
@@ -1506,19 +1128,8 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Everything from a resolved point onwards — which is where the two things that ask Kiki to act
-    /// at a point meet: a terminal, and the replay of what the user recorded.
-    ///
-    /// They meet here rather than at the flight because the two answers that belong to the *request*
-    /// rather than to its source are settled above the flight: whether a drag's destination is on the
-    /// display its start resolved to, and the message the terminal is answered with. A second copy of
-    /// either would be a second way for an action to reach the machine, and the two would not agree
-    /// about what a drag between two displays is.
-    ///
-    /// What is *not* here is the question of whether this action may start — a takeover, a rule about
-    /// the words the element is named by. Each source asks that in its own terms before calling this,
-    /// because the answers differ: a terminal is refused while Kiki is replaying, and a replay is
-    /// refused while it is not the replay any more.
+    /// Everything from a resolved point onwards — where a terminal and a replay meet. The answers that
+    /// belong to the *request* are settled here; whether it may start is not, and each source asks that itself.
     private func carryOutTheResolvedAction(
         _ resolution: ActionTargetResolution,
         elementText: String?,
@@ -1531,12 +1142,8 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // The one place the two ends of a drag are held against each other, because it is the one place
-        // both are in hand: the start is whatever the terminal named, and the destination is a point it
-        // gave outright. A movement between two displays would be posted as a press on one and a
-        // release over the other, which is not a drag to any app that receives it. Held against the
-        // frame the start resolved to rather than against `NSScreen` a second time, because that frame
-        // is where the cursor is going.
+        // The one place both ends of a drag are in hand: a movement between two displays would be posted as a
+        // press on one and a release over the other — not a drag to any app that receives it. Held against the start's frame, where the cursor goes.
         if let dragDestinationAppKitScreenLocation, !displayFrame.contains(dragDestinationAppKitScreenLocation) {
             endTheActionBeingWaitedOn(
                 actionBeingWaitedOn,
@@ -1555,13 +1162,8 @@ final class CompanionManager: ObservableObject {
             successMessage: [message, hint].compactMap { $0 }.joined(separator: "\n")
         )
 
-        // Flown when there is a cursor to fly: what was asked for is the action Kiki makes on its own
-        // — the cursor going to the point and turning red on the way — and the arrival is what performs
-        // it. With the cursor switched off there is no overlay to make that flight, and the action is
-        // performed where it stands: neither a press nor a scroll needs a cursor on screen to be made.
-        //
-        // Whether that flight also carries the user's pointer is the action's own answer, and it is
-        // the overlay that asks it.
+        // With the cursor switched off there is no overlay to make the flight, and the action is performed where
+        // it stands: neither a press nor a scroll needs a cursor on screen. Whether the flight carries the user's pointer is the action's own answer.
         guard isOverlayVisible else {
             await performTheActionInFlight(actionInFlight, isClosingTheArrivalFlightAfterwards: false)
             return
@@ -1571,22 +1173,11 @@ final class CompanionManager: ObservableObject {
         flyTheCursorToTheActionBeingWaitedOn(actionInFlight)
     }
 
-    /// Sends the cursor to the point an action is aimed at, so what happens there lands at the end of
-    /// the flight the user already reads as "Kiki is about to do this".
-    ///
-    /// Flown as a pointing tour that has no stops left, which is the state a reply's tour ends in: the
-    /// overlay hands the arrival back to Kiki instead of holding three seconds and flying home, and the
-    /// cursor stays parked on the element until the tour's own return-home timeout takes it back. An
-    /// action asked for while an earlier one's cursor is still parked there therefore takes over
-    /// mid-run, with the mouse never leaving the cursor's hand in between.
+    /// Sends the cursor to the point an action is aimed at, so it lands at the end of a flight the user reads
+    /// as "Kiki is about to do this". Flown as a tour with no stops left, so the arrival is handed straight back.
     private func flyTheCursorToTheActionBeingWaitedOn(_ actionInFlight: ActionInFlight) {
-        // An action aimed at the point the cursor is standing on — a script pressing the same button
-        // twice, or a recording of two clicks in the same place — has nowhere to fly. The overlay flies
-        // when the published location *changes*, and the cursor is still on that spot, still red, still
-        // holding the mouse from the press before, so the second action is simply performed. The other
-        // half of this is what makes the test safe: a point the cursor is not standing on differs from
-        // the published one — a cursor that has gone home has cleared it — so that action is always
-        // flown to.
+        // An action aimed at the point the cursor stands on has nowhere to fly: the overlay flies when the
+        // published location *changes*, and the cursor is still on that spot, still red, still holding the mouse.
         if !isFlyingToPointingTourStop, pointingTarget?.screenLocation == actionInFlight.appKitScreenLocation {
             // There is no flight to close, so this call is not the one that closes one.
             Task { await performTheActionInFlight(actionInFlight, isClosingTheArrivalFlightAfterwards: false) }
@@ -1609,25 +1200,18 @@ final class CompanionManager: ObservableObject {
         schedulePointingTourArrivalTimeout()
     }
 
-    /// Performs the action where it was aimed and delivers the one answer — the one performance both
-    /// ways of reaching the point go through: a cursor sent to it, and one that was never sent because
-    /// there is no overlay to fly.
-    ///
-    /// `isClosingTheArrivalFlightAfterwards` is true only when a drag began at the arrival, which is
-    /// the one action that is still running when the cursor lands: the arrival deliberately leaves the
-    /// tour open for it, and this is where it is closed — after the button is up.
+    /// Performs the action where it was aimed and delivers the one answer. `isClosingTheArrivalFlightAfterwards`
+    /// is true only for a drag begun at the arrival: the tour is left open, closed here after the button is up.
     private func performTheActionInFlight(
         _ actionInFlight: ActionInFlight,
         isClosingTheArrivalFlightAfterwards: Bool
     ) async {
-        // The flight carries its own action rather than reading the one being waited on, so a flight
-        // the cursor has already been sent on does nothing once that action has been answered — by a
-        // voice turn, by a command, or by the arrival timeout.
+        // Read off the flight rather than the action being waited on now: a flight already sent out
+        // does nothing once its action has been answered — by a turn, a command or the timeout.
         let actionBeingWaitedOn = actionInFlight.beingWaitedOn
 
-        // However this returns, the flight a drag opened is closed: nothing else is going to close it,
-        // because the arrival that would have is the call this one is. The guard inside asks the tour's
-        // own state, so a flight a new turn has already torn down is not closed a second time.
+        // However this returns, the flight a drag opened is closed: the arrival that would have closed it is this
+        // call. The guard inside asks the tour's own state, so a flight a new turn already tore down is not closed twice.
         defer {
             if isClosingTheArrivalFlightAfterwards, isFlyingToPointingTourStop {
                 finishCurrentPointingTourFlight()
@@ -1640,9 +1224,8 @@ final class CompanionManager: ObservableObject {
 
         switch actionInFlight.action {
         case .press(let clickKind):
-            // Asked again here, as the pointing tour does: this is the last moment before the press,
-            // and the sound says "I am about to press this", which a click that will not go out must
-            // not say.
+            // Asked again here, as the tour does: this is the last moment before the press, and the
+            // sound says "I am about to press this" — which a click that will not go out must not say.
             if ElementClicker.refusalOfClick(
                 matchingElementLabel: actionInFlight.elementText,
                 origin: .theUsersOwnCommand
@@ -1670,8 +1253,7 @@ final class CompanionManager: ObservableObject {
             }
 
         case .scroll(let direction, let distance):
-            // No sound here, deliberately: the click's is feedback for a press, and a scroll presses
-            // nothing — the content moving is its own feedback.
+            // No sound: a scroll presses nothing — the content moving is its own feedback.
             let scrollOutcome = await ElementScroller.scrollElement(
                 atAppKitScreenLocation: actionInFlight.appKitScreenLocation,
                 primaryScreenHeightInPoints: primaryScreenHeightInPoints,
@@ -1692,8 +1274,7 @@ final class CompanionManager: ObservableObject {
             }
 
         case .drag:
-            // No sound, for the scroll's reason: the click's is feedback for a press, and a drag is not
-            // a press — what moves is its own feedback.
+            // No sound, for the scroll's reason: a drag is not a press — what moves is its own feedback.
             let dragOutcome = await dragForTheUser(
                 fromAppKitScreenLocation: actionInFlight.appKitScreenLocation,
                 toAppKitScreenLocation: actionInFlight.dragDestinationAppKitScreenLocation,
@@ -1716,9 +1297,8 @@ final class CompanionManager: ObservableObject {
             let keyboardOutcome: ElementKeyboardOutcome
             switch keyboardInput {
             case .text(let typedText):
-                // Asked again here, as the click's is: the sound says "I am about to press this", and
-                // it is the focus click's sound, because a focus click is exactly what typing begins
-                // with. A run of text that will not begin with one must not make it.
+                // Asked again as the click's is, and it is the focus click's sound, because a focus
+                // click is what typing begins with: text that will not begin with one must not make it.
                 if ElementKeyboard.refusalOfTyping(
                     typedText,
                     matchingElementLabel: actionInFlight.elementText,
@@ -1736,8 +1316,7 @@ final class CompanionManager: ObservableObject {
                 )
             case .combination(let keyCombination):
                 // The key-press sound and not the click's — a combination presses no mouse button —
-                // and asked first for the click's reason: the sound says "I am about to press this",
-                // so a combination that will be refused must not make it.
+                // asked first for the click's reason: one that will be refused must not make it.
                 if ElementKeyboard.refusalOfCombination(named: keyCombination) == nil {
                     elementActionSoundPlayer.playKeyPressSound()
                 }
@@ -1756,34 +1335,23 @@ final class CompanionManager: ObservableObject {
                  .refusedBecauseTheCombinationIsNotOneKikiKnows,
                  .refusedBecauseTheTextIsLongerThanKikiWillType,
                  .refusedBecauseAccessibilityIsNotEnabled:
-                // Only reachable if the grant went away between the question above and the keys, as
-                // with the other three.
+                // Only reachable if the grant went away between the question above and the keys.
                 endTheActionBeingWaitedOn(actionBeingWaitedOn, with: .failed(message: Self.sentenceForAnActionOutcome(keyboardOutcome), isRefusal: true))
             }
         }
     }
 
-    /// What the terminal is told while the screens are being read.
-    ///
-    /// The only slow stretch of either path, and the only thing either one announces before it is
-    /// done. Written here rather than in the tool because it is a sentence of Kiki's, and every one
-    /// of those is written in this file; the tool prints what it is sent.
+    /// What the terminal is told while the screens are being read; written here rather than in the
+    /// tool because it is a sentence of Kiki's, and the tool prints what it is sent.
     private static let sentenceForReadingTheScreen = "Kiki 正在看屏幕…"
 
-    /// What is missing when the screen cannot be read at all, said once for every path that reads it:
-    /// a command, a click asked for by word, a picture asked for and a search asked for.
-    ///
-    /// A capture without the grant is a picture of the wallpaper rather than an error, so a path that
-    /// went ahead regardless would answer with a screen nobody is looking at — the one failure here
-    /// that is silent from Kiki's side.
+    /// What is missing when the screen cannot be read at all, said once for every path that reads it: a capture
+    /// without the grant is the wallpaper rather than an error, so going ahead answers with a screen nobody sees.
     private static let sentenceForTheMissingScreenRecordingGrant =
         "没有屏幕录制权限。在「系统设置 → 隐私与安全性 → 屏幕录制」里给 Kiki 打开。"
 
-    /// Which switch is off, said in the terms of the row the user would go and turn back on.
-    ///
-    /// Two sentences rather than one covering both, because they are two rows in the panel and
-    /// 「动不了」 does not describe a keyboard. A `switch` over every case, so a fourth kind of action
-    /// has to be given its row rather than inheriting the mouse's.
+    /// Which switch is off, in the terms of the row the user would go and turn back on. A `switch`
+    /// over every case, so a fourth kind of action has to be given its row, not inherit the mouse's.
     private static func sentenceForTheSwitchThatIsOff(_ action: ElementActionOnArrival) -> String {
         switch action {
         case .press, .scroll, .drag:
@@ -1793,8 +1361,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// What to tell the terminal about a click, in the terms it thinks in: a refusal is Kiki saying
-    /// it will not do this, a failure is one that was meant to go out and did not.
+    /// What to tell the terminal about a click: a refusal is Kiki saying it will not do this, a
+    /// failure is one meant to go out and did not.
     private static func sentenceForAnActionOutcome(_ clickOutcome: ElementClickOutcome) -> String {
         switch clickOutcome {
         case .clicked:
@@ -1810,8 +1378,7 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// The same for a scroll. The two are separate because the two outcomes are: a click that was
-    /// refused named something it will not touch, and a scroll is refused for the grant alone.
+    /// The same for a scroll, whose one refusal of its own is the grant alone.
     private static func sentenceForAnActionOutcome(_ scrollOutcome: ElementScrollOutcome) -> String {
         switch scrollOutcome {
         case .scrolled:
@@ -1837,16 +1404,13 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// The same for the keyboard, whose refusals are its own.
-    ///
-    /// The first one is the click's, carried through rather than restated: typing puts the input focus
-    /// in by clicking the landing point, so being unable to click is being unable to type, and the
-    /// sentence for it is already written above.
+    /// The same for the keyboard, whose refusals are its own — except the first, which is the click's
+    /// carried through, because typing puts the input focus in by clicking the landing point.
     private static func sentenceForAnActionOutcome(_ keyboardOutcome: ElementKeyboardOutcome) -> String {
         switch keyboardOutcome {
         case .postedTheKeystrokes:
-            // Not reached: a successful keystroke is answered with the action's own completion phrase,
-            // which is where 「已输入」 and 「已按 ⌘S」 can differ. Here for the switch to be whole.
+            // Not reached: a success is answered with the action's own completion phrase, where
+            // 「已输入」 and 「已按 ⌘S」 can differ. Here for the switch to be whole.
             return "键已发出。"
         case .failedToPostTheKeystrokes:
             return "按键没能发出去。"
@@ -1863,38 +1427,28 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// A drag that named no destination, said once: the terminal path reaches this by asking
-    /// `ElementDragger` about the request and the resolution path reaches it on its way to converting
-    /// the point, and the two must not explain the same refusal in two different ways.
+    /// A drag that named no destination, said once because two paths reach it — the terminal's and
+    /// the resolution path's — and the two must not explain the same refusal in two ways.
     private static let sentenceForADragThatNamedNoDestination = "这次拖拽没说要拖到哪儿（要给 --to-x 和 --to-y）。"
 
-    /// A drag asked for between two displays.
-    ///
-    /// Refused rather than carried out across the gap: the movement is posted as events that each carry
-    /// their own point, so one starting on a display and releasing over another is a press and a release
-    /// in two places no app receives as a drag — and the thing being moved is left pressed.
+    /// A drag asked for between two displays: refused, never carried across the gap. The movement is events that
+    /// each carry their own point, so a press on one display released over another is two unrelated events — and the thing being moved is left pressed.
     private static let sentenceForADragBetweenTwoScreens = "拖拽的起点和终点不在同一块屏幕上，这次没做。"
 
-    /// A screen that was named and is not there, said once for everything that can name one — the
-    /// click by word, `kiki screenshot` and `kiki locate`.
+    /// A screen that was named and is not there, said once for the three things that can name one.
     private static func sentenceForTheMissingScreen(screenNumber: Int, among screenCaptures: [CompanionScreenCapture]) -> String {
         "只有 \(screenCaptures.count) 块屏幕，没有第 \(screenNumber) 块。"
     }
 
     /// A piece of text that was named and is not on the screen, said once for the two things that can
-    /// name one — the click by word and `kiki locate`. Both asked the same question, so both hear the
-    /// same answer, and the tool has one sentence to match on.
+    /// name one — the click by word and `kiki locate` — so the tool has one sentence to match on.
     private static func sentenceForTheMissingText(_ textToFind: String, onScreenNumber screenNumber: Int?) -> String {
         let onThatScreen = screenNumber.map { "第 \($0) 块屏幕上" } ?? "屏幕上"
         return "\(onThatScreen)没有「\(textToFind)」。"
     }
 
-    /// Where a drag lets go, as the terminal gave it: a point in the global screen space, or nil for
-    /// the two cases that have no destination — a request that named none, and one for an action that
-    /// is not a drag.
-    ///
-    /// Both fields or neither. A request carrying one of the two is a destination that cannot be
-    /// made into a point, and half a drag is a press held down on what it was moving.
+    /// Where a drag lets go, as the terminal gave it: a point in the global screen space, or nil for the two cases
+    /// that have none — a request that named none, and one that is not a drag. Both fields or neither: half a drag is a press held down.
     private static func dragDestinationGlobalScreenPoint(in clickRequest: KikiClickRequest) -> CGPoint? {
         guard let dragToGlobalScreenX = clickRequest.dragToGlobalScreenX,
               let dragToGlobalScreenY = clickRequest.dragToGlobalScreenY else {
@@ -1903,11 +1457,8 @@ final class CompanionManager: ObservableObject {
         return CGPoint(x: dragToGlobalScreenX, y: dragToGlobalScreenY)
     }
 
-    /// The same destination in the AppKit location a posted event is aimed with, or nil when the
-    /// request named none.
-    ///
-    /// Asked before anything is read off a screen, which is why it reads the request rather than the
-    /// resolution: a drag that named nowhere to let go is refused without one.
+    /// The same destination in AppKit coordinates, or nil when the request named none — read from the request,
+    /// not the resolution, because it is asked before any screen is read and the refusal costs no capture.
     private static func dragDestinationAppKitScreenLocation(in clickRequest: KikiClickRequest) -> CGPoint? {
         guard let dragDestinationGlobalScreenPoint = dragDestinationGlobalScreenPoint(in: clickRequest) else {
             return nil
@@ -1923,9 +1474,9 @@ final class CompanionManager: ObservableObject {
         for clickRequest: KikiClickRequest,
         action: ElementActionOnArrival
     ) async -> ActionTargetResolution {
-        // Read here rather than inside the two ways of naming a start, because a drag is the one
-        // action that cannot be made without it, and a request naming its start by text would
-        // otherwise spend seconds of screenshots arriving at a conclusion already in hand.
+        // Read here rather than inside the two ways of naming a start: a drag cannot be made without
+        // it, and a request naming its start by text would otherwise spend seconds of screenshots on
+        // a conclusion already in hand.
         let dragDestinationGlobalScreenPoint = Self.dragDestinationGlobalScreenPoint(in: clickRequest)
         if action == .drag, dragDestinationGlobalScreenPoint == nil {
             return .refused(reason: Self.sentenceForADragThatNamedNoDestination)
@@ -1953,17 +1504,10 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// The opening of the sentence the terminal is answered with — 「已点击」, 「已双击」, 「已三击」,
-    /// 「已右键点击」, 「已往下滚 3 屏：」, 「已拖动」, 「已输入「季度报告」到」 or 「已按 ⌘S：」 — the one
-    /// part of it that depends on the action.
-    ///
-    /// Named rather than left for the terminal to infer from which subcommand it sent, because the
-    /// tool and the app can disagree about a gesture and the sentence has to describe the action that
-    /// was actually made.
-    ///
-    /// The scroll and combination forms end in a colon and the others do not, so that the object of
-    /// the sentence reads the same either way: 「已往下滚 3 屏：屏幕坐标 (720, 450)。」 parses and
-    /// 「已往下滚 3 屏 屏幕坐标 (720, 450)。」 does not.
+    /// The opening of the sentence the terminal is answered with — 「已点击」「已双击」「已三击」「已右键点击」
+    /// 「已往下滚 3 屏：」「已拖动」「已输入「季度报告」到」「已按 ⌘S：」 — the part that depends on the action;
+    /// named rather than inferred from the subcommand, because tool and app can disagree about a gesture. The
+    /// scroll and combination forms end in a colon so the object reads the same either way.
     private static func completionPhraseForTheAction(_ action: ElementActionOnArrival) -> String {
         switch action {
         case .press(.singleClick): return "已点击"
@@ -1977,13 +1521,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// How a scroll is described in words — 「往下滚 3 屏」, 「往下滚 240 点」 — said the same way in
-    /// the sentence the terminal is answered with and in the bubble over the cursor.
-    ///
-    /// A distance says itself in its own unit rather than being converted into the other, because the
-    /// two are not interchangeable to the person reading: a screenful is what a terminal asked for and
-    /// a count of points is what they scrolled by hand, and rounding the second into the first would
-    /// describe a scroll nobody made.
+    /// How a scroll is described in words — 「往下滚 3 屏」「往下滚 240 点」 — the same in the terminal's sentence
+    /// and the bubble. A distance says itself in its own unit: a screenful is what a terminal asked for.
     private static func phraseForScrolling(_ direction: ElementScrollDirection, distance: ElementScrollDistance) -> String {
         let directionWord: String
         switch direction {
@@ -1999,11 +1538,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// A point the terminal gave in the global screen space, turned into the AppKit location every
-    /// other part of the app works in.
-    ///
-    /// A point on no display is refused rather than acted on: the event would land where the user
-    /// cannot see it, and reporting that as done is a claim the terminal has no way to check.
+    /// A point the terminal gave in the global screen space, turned into the AppKit location the rest of the app
+    /// works in. A point on no display is refused: the event would land unseen, and reporting it done is a claim the terminal cannot check.
     private func resolveActionTarget(
         atGlobalScreenPoint globalScreenPoint: CGPoint,
         action: ElementActionOnArrival,
@@ -2021,9 +1557,8 @@ final class CompanionManager: ObservableObject {
         let completionPhrase = Self.completionPhraseForTheAction(action)
         let startPoint = "屏幕坐标 (\(Int(globalScreenPoint.x)), \(Int(globalScreenPoint.y)))"
 
-        // A drag is the one action whose sentence describes a movement rather than a place, so it says
-        // where it started from as well as where it ended — with the colon that separates the verb from
-        // the two points, which the forms that name a single place read better without.
+        // A drag's sentence describes a movement rather than a place, so it says both points, and the
+        // colon separates the verb from them.
         let message: String
         if let dragDestinationGlobalScreenPoint {
             message = "\(completionPhrase)：从\(startPoint) 到屏幕坐标 (\(Int(dragDestinationGlobalScreenPoint.x)), \(Int(dragDestinationGlobalScreenPoint.y)))。"
@@ -2045,13 +1580,8 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Where a piece of text is on the screens: every appearance of it, screen by screen and in
-    /// reading order within each.
-    ///
-    /// One implementation for the two things that look for text — a click asked for by word, which
-    /// wants one of these, and `kiki locate`, which wants all of them. A second copy would be a second
-    /// answer to "where is this text", and the two would disagree about which occurrence an ordinal
-    /// lands on.
+    /// Where a piece of text is on the screens: every appearance, screen by screen in reading order. One
+    /// implementation for both lookers — a click by word wants one, `kiki locate` all — so the ordinal cannot disagree between them.
     private static func boxesOfTextOnScreens(
         matchingText textToFind: String,
         among screenCaptures: [CompanionScreenCapture],
@@ -2076,12 +1606,8 @@ final class CompanionManager: ObservableObject {
         return matches
     }
 
-    /// The point where the text the terminal named was found on screen.
-    ///
-    /// Screens are counted the way the model's own screenshots are numbered — the pointer's screen
-    /// first, the rest behind it — so `-n` and `-s` and the `:screenN` a tag can carry all mean the
-    /// same thing. Reading order within a screen is top to bottom, left to right, and the ordinal
-    /// runs across the screens in that order.
+    /// The point where the text the terminal named was found. Screens are counted the way the model's are —
+    /// pointer's screen first — so `-n`, `-s` and `:screenN` mean the same thing; reading order across screens.
     private func resolveActionTarget(
         namingText elementText: String,
         occurrenceNumber: Int,
@@ -2127,8 +1653,8 @@ final class CompanionManager: ObservableObject {
 
         let completionPhrase = Self.completionPhraseForTheAction(action)
 
-        // Said after the element and in the order the drag moves: the thing named first, then the point
-        // it is taken to. Nothing at all for an action that stays where it is.
+        // In the order the drag moves: the thing named first, then the point it is taken to. Nothing
+        // at all for an action that stays where it is.
         let dragDestinationClause = dragDestinationGlobalScreenPoint.map {
             "到屏幕坐标 (\(Int($0.x)), \(Int($0.y)))"
         } ?? ""
@@ -2137,8 +1663,8 @@ final class CompanionManager: ObservableObject {
             ? "\(completionPhrase)「\(elementText)」（第 \(occurrenceNumber) 个，第 \(match.screenIndex + 1)/\(screenCaptures.count) 块屏幕）\(dragDestinationClause)。"
             : "\(completionPhrase)「\(elementText)」（第 \(occurrenceNumber) 个）\(dragDestinationClause)。"
 
-        // Said only when the whole screen set was searched: with `-s` the terminal has already named
-        // the screen it meant, and a count of the others is not a correction to anything.
+        // Only when the whole screen set was searched: with `-s` the terminal has already named the
+        // screen it meant, and a count of the others corrects nothing.
         var hint: String?
         if screenNumber == nil, screenCaptures.count > 1 {
             let otherScreensWithAMatch = Set(matches.map(\.screenIndex)).subtracting([match.screenIndex])
@@ -2163,11 +1689,8 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Resting In The Menu Bar Icon
 
-    /// Starts the cursor's one-way flight into the menu bar icon it was left resting on.
-    ///
-    /// Called the instant the wait runs out, which is also the instant Kiki goes quiet — the flight
-    /// cannot be called off, so a cursor already on its way to the icon must not be handed a job it
-    /// would have to abandon halfway.
+    /// Starts the cursor's one-way flight into the menu bar icon, the instant the wait runs out. The flight
+    /// cannot be called off, so a cursor on its way must not be handed a job it would have to abandon.
     func beginStatusItemIconMerge(iconScreenFrame: CGRect) {
         guard statusItemIconPhase == .notInTheIcon else { return }
         statusItemIconPhase = .cursorFlyingToIcon(iconScreenFrame: iconScreenFrame)
@@ -2180,9 +1703,8 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Starts the cursor's flight back out of the icon, to the standing position beside the pointer.
-    ///
-    /// Kiki is still not taking input while this runs — the cursor is in the air, and there is
-    /// nothing at the pointer to hand a job to until it lands.
+    /// Kiki is still not taking input while this runs — there is nothing at the pointer to hand a
+    /// job to until it lands.
     func beginWakingFromTheStatusItemIcon() {
         guard statusItemIconPhase == .cursorRestingInIcon else { return }
         statusItemIconPhase = .cursorWakingFromIcon
@@ -2194,34 +1716,41 @@ final class CompanionManager: ObservableObject {
         statusItemIconPhase = .notInTheIcon
     }
 
-    /// Ends the visit, for the two cases where it must not outlive the cursor it swallowed: the
-    /// overlay going away, and a display change rebuilding every view that hosted it.
-    ///
-    /// Both leave a view that is following the pointer again, and an icon still wearing the cursor's
-    /// colour beside it would be a lie about where the cursor is. Nothing else may call this: a
-    /// visit that could be ended from outside would be a cursor that vanished mid-flight.
+    /// Ends the visit, for the two cases where it must not outlive the cursor it swallowed: the overlay going
+    /// away, and a display change. Nothing else may call this — or a cursor would vanish mid-flight.
     func endTheStatusItemIconVisit() {
         guard isNotTakingInputBecauseOfTheStatusItemIcon else { return }
         statusItemIconPhase = .notInTheIcon
     }
 
-    /// Restarts the overlay so the welcome animation and intro video play. Only reached
-    /// through `playIntroDemoIfNeeded()`.
+    /// Set when the intro wants to start while a guide line is still being spoken: the last grant
+    /// lands on the permission poll, which can fall mid-sentence, and the video would sound over the
+    /// closing words.
+    private var shouldTriggerOnboardingOnceTheGuideStopsSpeaking = false
+
     func triggerOnboarding() {
+        // The guide keeps the voice until its line has been heard through; the video is let go from
+        // the one place a line ends, `finishTheOnboardingGuideLineIfItIsStillBeingWaitedOn`.
+        guard onboardingGuideLineFinishedSpeakingContinuation == nil else {
+            shouldTriggerOnboardingOnceTheGuideStopsSpeaking = true
+            return
+        }
 
         NotificationCenter.default.post(name: .kikiDismissPanel, object: nil)
 
         startOnboardingMusic()
 
-        // The first appearance is what triggers the welcome animation and onboarding video.
+        // The first appearance is what triggers the welcome animation and intro video; the guide's
+        // own bring-up consumed it so the welcome would not play at segment 1 — handed back here.
+        overlayWindowManager.hasShownOverlayBefore = false
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
     }
 
     /// Replays the onboarding from the footer link, with the overlay already visible.
     func replayOnboarding() {
-        // The intro is a demonstration of the cursor, and a Kiki whose cursor is in the menu bar icon
-        // has none to demonstrate with — it would play as a video whose subject never appears.
+        // The intro demonstrates the cursor, and a Kiki whose cursor is in the menu bar icon has none
+        // — it would play as a video whose subject never appears.
         guard !isNotTakingInputBecauseOfTheStatusItemIcon else { return }
 
         NotificationCenter.default.post(name: .kikiDismissPanel, object: nil)
@@ -2252,7 +1781,7 @@ final class CompanionManager: ObservableObject {
             player.play()
             self.onboardingMusicPlayer = player
 
-            // After 1m 30s, fade the music out over 3s
+            // After 1m 30s, fade the music out over 3s.
             onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
                 self?.fadeOutOnboardingMusic()
             }
@@ -2283,12 +1812,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Rebuilds the cursor overlay whenever the set of connected displays changes.
-    ///
-    /// The overlay is built from `NSScreen.screens` at the moment it is shown, so a monitor plugged
-    /// in afterwards has no window of its own — and the damaging part is the missing view for a
-    /// pointing target: `pointingTarget` would stay set forever, and while it is set
-    /// the buddy hides itself on every screen.
+    /// Rebuilds the overlay whenever the connected displays change. Built from `NSScreen.screens` when shown, a
+    /// monitor plugged in later has no window — and a target with no view stays set forever, hiding the cursor on every screen.
     private func startObservingDisplayConfigurationChanges() {
         displayConfigurationChangeObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -2299,14 +1824,11 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Rebuilds the overlay for the new display configuration. macOS posts this after
-    /// `NSScreen.screens` has been updated and posts it more than once for a single plug-in; the
-    /// rebuild is idempotent, so every pass is safe.
+    /// Rebuilds the overlay for the new display configuration. macOS posts this more than once for a
+    /// single plug-in; the rebuild is idempotent, so every pass is safe.
     private func handleDisplayConfigurationChange() {
-        // Before the guard: the rebuild constructs every cursor view afresh, and a fresh view
-        // follows the pointer and has no way to learn about a visit that is already under way. Left
-        // alone, the icon would keep the cursor's colour while the cursor itself was back out
-        // following the mouse.
+        // Before the guard: the rebuild constructs every cursor view afresh, and a fresh view follows the pointer
+        // with no way to learn about a visit already under way — the icon would keep the cursor's colour while the cursor was back out following the mouse.
         endTheStatusItemIconVisit()
 
         guard isOverlayVisible else { return }
@@ -2316,8 +1838,8 @@ final class CompanionManager: ObservableObject {
             companionManager: self
         )
 
-        // A display unplugged mid-flight takes the pending target with it, and no view will
-        // ever consume that location — so clear it rather than leave the buddy hidden forever.
+        // A display unplugged mid-flight takes the pending target with it, and no view will ever
+        // consume that location — cleared rather than left to hide the cursor forever.
         if let pendingTargetDisplayFrame = pointingTarget?.displayFrame,
            !NSScreen.screens.contains(where: { $0.frame == pendingTargetDisplayFrame }) {
             clearDetectedElementLocation()
@@ -2325,9 +1847,8 @@ final class CompanionManager: ObservableObject {
     }
 
     func clearDetectedElementLocation() {
-        // Cleared before the tour, so the overlay sees a target withdrawn rather than one that
-        // changed its mind about being pressed while the cursor is standing on it. Nothing here
-        // goes through `endPointingTour`'s withdrawal — the whole target is gone.
+        // Cleared before the tour, so the overlay sees a target withdrawn rather than one that changed its mind
+        // about being pressed under the cursor — the whole target is gone, so nothing goes through `endPointingTour`'s withdrawal.
         pointingTarget = nil
         endPointingTour()
     }
@@ -2371,10 +1892,8 @@ final class CompanionManager: ObservableObject {
         } else {
             globalPushToTalkShortcutMonitor.stop()
             userActionRecorder.stop()
-            // Neither half of recording survives the permission going away: the shortcut needs the
-            // tap that hears it and a replay needs the permission to press anything. Ended here
-            // rather than left standing, because the state would otherwise be one only a restart
-            // could clear — the tap that ends it is the tap that has just been torn down.
+            // Neither half of recording survives the permission going away: the shortcut needs the tap, a replay
+            // the grant to press. Ended here, because the tap that would end it was just torn down.
             stopRecordingOrReplayingAndForgetIt()
         }
 
@@ -2393,8 +1912,7 @@ final class CompanionManager: ObservableObject {
             print("Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), speech: \(hasSpeechRecognitionPermission)")
         }
 
-        // Screen content permission is persisted — once the SCShareableContent picker has been
-        // approved there is nothing to re-check.
+        // Persisted: once the picker has been approved there is nothing to re-check.
         if !hasScreenContentPermission {
             hasScreenContentPermission = UserDefaults.standard.bool(forKey: "hasScreenContentPermission")
         }
@@ -2405,8 +1923,7 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Triggers the macOS screen content picker by performing a dummy screenshot
-    /// capture, and persists the grant so the user is never asked again.
+    /// Triggers the macOS screen content picker with a dummy capture, and persists the grant.
     @Published private(set) var isRequestingScreenContent = false
 
     func requestScreenContentPermission() {
@@ -2446,9 +1963,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Asks for Speech Recognition from the settings panel, so the dialog does not interrupt the
-    /// user's first push-to-talk press. macOS shows it exactly once, so a second press opens System
-    /// Settings — the only way back once it has been answered either way.
+    /// Asked from the panel so the dialog does not interrupt the first push-to-talk press. macOS
+    /// shows it once, so a second ask opens System Settings instead.
     func requestSpeechRecognitionPermission() {
         guard SFSpeechRecognizer.authorizationStatus() == .notDetermined else {
             if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition") {
@@ -2458,8 +1974,7 @@ final class CompanionManager: ObservableObject {
         }
 
         SFSpeechRecognizer.requestAuthorization { [weak self] authorizationStatus in
-            // The callback arrives on an arbitrary queue, so hop back before touching
-            // published state.
+            // The callback arrives on an arbitrary queue, so hop back before touching published state.
             Task { @MainActor [weak self] in
                 self?.hasSpeechRecognitionPermission = authorizationStatus == .authorized
             }
@@ -2469,7 +1984,10 @@ final class CompanionManager: ObservableObject {
     // MARK: - Private
 
     /// Triggers the system microphone prompt if the user has never been asked.
-    private func promptForMicrophoneIfNotDetermined() {
+    ///
+    /// Not private because the onboarding guide asks it as segment 5's first beat — the guide has no
+    /// panel row to press.
+    func promptForMicrophoneIfNotDetermined() {
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else { return }
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             Task { @MainActor [weak self] in
@@ -2478,8 +1996,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Polls all permissions so the UI updates live after the user grants them. Screen
-    /// Recording is the exception — macOS requires an app restart for that one.
+    /// Polls all permissions so the UI updates live. Screen Recording is the exception — macOS
+    /// requires an app restart for that one.
     private func startPermissionPolling() {
         accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -2508,37 +2026,26 @@ final class CompanionManager: ObservableObject {
 
                 self.settleVoiceState()
 
-                // Nothing to do while the microphone side is still in one of its phases; the state
-                // this observer exists for is the one it settles on the way out of them. Pressing
-                // and releasing the hotkey without saying anything runs no response task, so the
-                // transient hide is scheduled here or the overlay never goes away.
+                // Nothing to do while the microphone side is in a phase; what this observer exists for is the
+                // state it settles on. Nothing said means no response task, so the transient hide is set here.
                 guard self.dictationPhase == .nothing else { return }
                 self.scheduleTransientHideIfNeeded()
             }
     }
 
-    /// Settles `voiceState` onto the facts it depicts. The only place it is written, apart from the
-    /// credits fallback, which has no facts to derive from.
-    ///
-    /// It has two sources — the microphone, and the reply being produced and spoken — and while each
-    /// group wrote it directly, what kept the two from overwriting one another was a guard at every
-    /// call site that had to know what the other side was doing. Derived, there is nothing left to
-    /// arbitrate, and a state no fact supports is not reachable, so Kiki cannot be left showing one.
+    /// Settles `voiceState` onto the facts it depicts. The only place it is written, apart from the credits
+    /// fallback, which has no facts. Derived rather than assigned, so there is nothing to arbitrate and a
+    /// state no fact supports is not reachable.
     private func settleVoiceState() {
-        // The three facts settle several times per segment and most of those writes change nothing,
-        // and an unchanged `@Published` write still invalidates every view reading it.
+        // The three facts settle several times per segment and most writes change nothing — and an
+        // unchanged `@Published` write still invalidates every view reading it.
         let stateTheFactsSupport = voiceStateTheFactsSupport
         guard stateTheFactsSupport != voiceState else { return }
         voiceState = stateTheFactsSupport
     }
 
-    /// What the facts say Kiki is doing, in the panel's own vocabulary.
-    ///
-    /// The microphone owns the state while it is doing anything at all: the user pressing the key is
-    /// the newest thing that has happened, whatever else was running. The reply owns it from the
-    /// transcript being taken to its voice being done, and `isProducingAReply` is what covers the
-    /// gap in the middle — the transcript lands seconds before the model writes a word, and
-    /// `isSpeakingReply` only becomes true when a segment is handed over.
+    /// What the facts say Kiki is doing. The microphone owns the state while it does anything at all; the reply
+    /// owns it from the transcript to the voice done, `isProducingAReply` covering the gap before the model writes.
     private var voiceStateTheFactsSupport: CompanionVoiceState {
         switch dictationPhase {
         case .finalizing, .preparing: return .processing
@@ -2547,28 +2054,21 @@ final class CompanionManager: ObservableObject {
         }
 
         guard isProducingAReply else { return .idle }
-        // Held until the reply is actually heard, because a segment may have been handed over and
-        // still be waiting on its own synthesis. A turn that is not read aloud never hears anything,
-        // so it leaves this state when a segment is reached instead.
+        // Held until the reply is actually heard, because a segment may have been handed over and still be
+        // waiting on its own synthesis. A silent turn never hears anything, so it leaves this state when a segment is reached instead.
         if isWaitingForTheFirstSoundOfTheReply { return .processing }
-        // The same wait one step further on: at a step boundary the model has been asked for the next
-        // step and has not written a word of it yet. Left to fall through to the line below, that wait
-        // is 回复中 over a still cursor with no sound around it.
+        // The same wait one step further on: at a step boundary the model has been asked for the next step and
+        // has not written a word of it. Left to fall through, that wait is 回复中 over a still cursor with no sound around it.
         if isWaitingForTheFirstSegmentOfTheStepNowStreaming { return .processing }
         return isSpeakingReply ? .responding : .processing
     }
 
-    /// Whether the voice has said everything it has been given and the step now streaming has not
-    /// reached it yet.
-    ///
-    /// `isSpeakingReply` covers a whole turn, so it goes on being true over the wait between two
-    /// steps — where the cursor has nothing left to do either, and the model is the only one still
-    /// working. A turn of one step is never in this state, so the ordinary reply is unaffected.
+    /// Whether the voice has said everything it has been given and the step now streaming has not reached it yet:
+    /// `isSpeakingReply` covers a whole turn, so it stays true over the wait between steps, where only the model still works.
     private var isWaitingForTheFirstSegmentOfTheStepNowStreaming: Bool {
         // The index only ever moves forward and this step's segments begin at the count the step
         // started with, so the last test is true only while the voice stands before this step's own
-        // narration — which is to say only between two steps. Inside a step the narration is owed the
-        // segment after the one being spoken, and that test is already false.
+        // narration — only between two steps.
         isSpeakingReply
             && !isReplyStreamComplete
             && hasCurrentSpeechSegmentFinishedSpeaking
@@ -2584,8 +2084,8 @@ final class CompanionManager: ObservableObject {
         case finalizing
     }
 
-    /// The ordering is the priority, not the sequence: finalising outranks a recording that has not
-    /// been cleaned up yet, so a transcript being wrapped up still reads as 处理中.
+    /// The ordering is a priority, not a sequence: finalising outranks a recording not yet cleaned
+    /// up, so a transcript being wrapped up still reads as 处理中.
     private var dictationPhase: DictationPhase {
         if buddyDictationManager.isFinalizingTranscript { return .finalizing }
         if buddyDictationManager.isRecordingFromKeyboardShortcut { return .recording }
@@ -2602,29 +2102,21 @@ final class CompanionManager: ObservableObject {
             }
     }
 
-    /// Everything the last thing started, stopped: the reply being produced, the voice speaking it,
-    /// the recording or replay the user's own hands were in the middle of, and the action some
-    /// terminal is waiting on.
-    ///
-    /// One function because there are two things that begin by replacing what is running — a question,
-    /// spoken or typed, and a recording — and a second copy would be a second answer to what "starting
-    /// over" means. The pointing tour needs nothing of its own here: `clearDetectedElementLocation()`
-    /// reaches `endPointingTour` on its own, and a replay is not a tour.
-    ///
-    /// `interruptedBy` is the sentence a terminal that asked for the action being called off is told,
-    /// which is the only part of this the two callers say differently.
+    /// Everything the last thing started, stopped: the reply, the voice, the recording or replay, the action a
+    /// terminal waits on. One function because two things begin by replacing what is running, and a second copy
+    /// would be a second answer to "starting over"; `interruptedBy` is what the called-off action's terminal is told.
     private func stopEverythingTheLastThingStarted(interruptedBy reason: String) {
         currentResponseTask?.cancel()
         ttsClient.stopPlayback()
         ttsClient.discardPreparedSegments()
+        // Stopped playback reports nothing, so the guide line's wait is released here by hand.
+        finishTheOnboardingGuideLineIfItIsStillBeingWaitedOn()
         writeTheCurrentTurnIntoHistory(interruption: .theUserStartedANewQuestion)
         abandonSpeakingReply()
         clearDetectedElementLocation()
-        // Before the action below, so that a step of a replay dies with the replay rather than being
-        // carried out to a screen that is no longer what the user is working on.
+        // Before the action below, so a step of a replay dies with the replay.
         stopRecordingOrReplayingAndForgetIt()
-        // The same answer a new command from a terminal gets: Kiki has stopped being 等待中, and a
-        // press placed now would land on a screen this turn is about to replace.
+        // A press placed now would land on a screen this turn is about to replace.
         callOffTheActionBeingWaitedOn(because: reason)
     }
 
@@ -2632,33 +2124,27 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
-            // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
-            // A Kiki whose cursor is in the menu bar icon hears nothing at all — resting, or on its
-            // way back out. Only `.pressed` is refused: `.released` is the cleanup path for a start
-            // that never happened, and swallowing it would be the one way to leave the waveform
-            // stuck on screen.
+            // Only `.pressed` is refused: `.released` is the cleanup path for a start that never
+            // happened, and swallowing it would leave the waveform stuck on screen.
             guard !isNotTakingInputBecauseOfTheStatusItemIcon else { return }
 
-            // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
             transientHideTask = nil
 
-            // If the cursor is hidden, bring it back transiently for this interaction
             if !isKikiCursorEnabled && !isOverlayVisible {
                 overlayWindowManager.hasShownOverlayBefore = true
                 overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                 isOverlayVisible = true
             }
 
-            // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .kikiDismissPanel, object: nil)
 
             // Pressing the key *is* starting the next question, so this is the earliest instant the
             // previous reply can be called over.
             stopEverythingTheLastThingStarted(interruptedBy: "这次操作被打断了：Kiki 开始听你说话了。")
 
-            // Dismiss the onboarding prompt if it's showing
+
             if showOnboardingPrompt {
                 withAnimation(.easeOut(duration: 0.3)) {
                     onboardingPromptOpacity = 0.0
@@ -2685,8 +2171,7 @@ final class CompanionManager: ObservableObject {
                 )
             }
         case .released:
-            // A release arriving before the async start began recording would otherwise be
-            // dropped, leaving the waveform overlay stuck on screen.
+            // A release arriving before the async start began recording would leave the waveform stuck.
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
@@ -2697,11 +2182,8 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Recording And Replaying The User's Own Actions
 
-    /// Binds the shortcut that starts, ends and interrupts a recording.
-    ///
-    /// The recorder owns the chord rather than the push-to-talk monitor, because ending a recording is
-    /// something only the recorder can do: it is the half that knows what the recording holds. The tap
-    /// therefore listens for it at all times, which is what makes the same press able to end one.
+    /// Binds the shortcut that starts, ends and interrupts a recording. The recorder owns the chord rather than
+    /// the push-to-talk monitor, because ending a recording is something only the recorder can do, and the tap therefore listens for it at all times.
     private func bindTheRecordingShortcut() {
         recordedActionsShortcutCancellable = userActionRecorder
             .shortcutWasTappedPublisher
@@ -2711,12 +2193,8 @@ final class CompanionManager: ObservableObject {
             }
     }
 
-    /// One tap of shift+option, which is one of three things and never the same thing twice in a row:
-    /// it starts a recording, it ends one and replays it, or it stops the replay and forgets it.
-    ///
-    /// A tap rather than a hold, which is what makes a recording worth anything: a held modifier is
-    /// down during everything being recorded, so every click the user made would be made with
-    /// shift+option still pressed and every shortcut they used would be eaten.
+    /// One tap of shift+option: it starts a recording, ends one and replays it, or stops the replay and forgets
+    /// it. A tap rather than a hold: a held modifier would sit on every recorded click and eat every shortcut.
     private func handleTheRecordingShortcutBeingTapped() {
         switch recordedActionsPhase {
         case .neitherRecordingNorReplaying:
@@ -2725,18 +2203,14 @@ final class CompanionManager: ObservableObject {
             endTheRecordingAndReplayIt()
         case .replayingWhatTheUserDid:
             stopRecordingOrReplayingAndForgetIt()
-            // The step the loop had already started goes with it. A step spends its first half
-            // reading the screen and its second half flying, so the tap lands inside one often
-            // enough to be seen, and a replay that presses one more thing after being told to stop
-            // says the opposite of what the tap said.
+            // A replay that presses one more thing after being told to stop says the opposite of what
+            // the tap said: a step spends its first half reading the screen, so the tap lands inside one.
             callOffTheActionBeingWaitedOn(because: "这次重放停下来了。")
         }
     }
 
-    /// Starts watching the user's hands, or says why Kiki will not.
-    ///
-    /// Nothing is recorded when it will not: a recording of work Kiki cannot do again is discovered to
-    /// be worthless only at the end of it, and the moment to say so is before the user starts.
+    /// Starts watching the user's hands, or says why Kiki will not — a recording of work Kiki cannot
+    /// do again is worthless, so the refusal is said before the user starts rather than after.
     private func startRecordingWhatTheUserIsDoing() {
         guard !showOnboardingVideo, !isNotTakingInputBecauseOfTheStatusItemIcon else { return }
 
@@ -2753,9 +2227,8 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // A recording replaces whatever is running, the way a question does: the reply stops, and so
-        // does anything a terminal is waiting on, because the screen all of it was aimed at is the one
-        // the user is about to work on.
+        // A recording replaces whatever is running, the way a question does: the screen all of it was
+        // aimed at is the one the user is about to work on.
         stopEverythingTheLastThingStarted(interruptedBy: "这次操作被打断了：Kiki 开始记录你的操作了。")
 
         indexOfTheNextRecordedActionToReplay = 0
@@ -2765,8 +2238,7 @@ final class CompanionManager: ObservableObject {
         print("Companion is recording what the user does")
     }
 
-    /// Ends the recording and starts replaying it — or gives up quietly when it holds nothing, because
-    /// there is no gesture to make and no sentence that would help.
+    /// Ends the recording and starts replaying it, or gives up quietly when it holds nothing.
     private func endTheRecordingAndReplayIt() {
         let recordedUserActions = userActionRecorder.stopRecording()
         guard !recordedUserActions.isEmpty else {
@@ -2775,9 +2247,8 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // Asked again here rather than only where the recording started. Both halves of it can be
-        // turned off while the user is working, and a recording is minutes of their own work — so the
-        // sentence names what is missing rather than the recording disappearing without a word.
+        // Asked again here: both halves can be turned off while the user works, and a recording is
+        // minutes of their own work, so the sentence names what is missing rather than vanishing.
         guard isAutomaticClickingEnabled else {
             recordedActionsPhase = .neitherRecordingNorReplaying
             speakTheSentenceThatSaysWhyNothingWillBeRecorded(
@@ -2797,29 +2268,21 @@ final class CompanionManager: ObservableObject {
         indexOfTheNextRecordedActionToReplay = 0
         recordedActionsPhase = .replayingWhatTheUserDid
         print("Companion is replaying \(recordedUserActions.count) recorded action(s)")
-        // The same hop the arrival takes to reach the performance: a step reads the screen, and this
-        // is a shortcut press that has to return before it can.
+        // The same hop the arrival takes: this is a shortcut press that has to return before a screen
+        // can be read.
         Task { await takeTheNextStepOfTheReplay() }
     }
 
-    /// Says, aloud, why a recording is not starting or not replaying.
-    ///
-    /// Through a synthesizer of its own, the way the low-credits sentence is: there is no reply being
-    /// spoken and no turn for `voiceState` to depict. Nothing is written to `voiceState` here either,
-    /// because this sentence is over in a second and a state entered for it would have nothing to end
-    /// it.
+    /// Says, aloud, why a recording is not starting or not replaying — through a synthesizer of its
+    /// own, the way the low-credits sentence is: a state entered for a sentence over in a second would
+    /// have nothing to end it.
     private func speakTheSentenceThatSaysWhyNothingWillBeRecorded(_ sentence: String) {
         NSSpeechSynthesizer().startSpeaking(sentence)
     }
 
-    /// Ends the recording or the replay the user's hands were in the middle of, throws away what was
-    /// recorded, and gives the user their pointer back.
-    ///
-    /// One function because the two endings are the same ending — the recording stops, the loop stops,
-    /// the list goes, the phase goes back to neither — and because everything that takes Kiki over
-    /// needs all of it: a question, spoken or typed, a new recording, and the permission going away
-    /// underneath either. The recording is never kept for later, because in every one of those the user
-    /// has moved on to something else.
+    /// Ends the recording or replay the user's hands were in the middle of, throws away what was recorded, and
+    /// gives the user their pointer back. One function because the two endings are the same ending, and every
+    /// thing that takes Kiki over needs all of it; the recording is never kept for later.
     private func stopRecordingOrReplayingAndForgetIt() {
         guard recordedActionsPhase != .neitherRecordingNorReplaying else { return }
 
@@ -2828,27 +2291,18 @@ final class CompanionManager: ObservableObject {
         replayStepTask = nil
         recordedUserActions = []
         indexOfTheNextRecordedActionToReplay = 0
-        // Told even when only the replay was running: it is holding the press and the scroll of a
-        // recording that has ended, and a stale one would settle into the next recording's first action.
+        // Told even when only the replay was running: it holds a recording that has ended, and a stale
+        // one would settle into the next recording's first action.
         userActionRecorder.stopRecording()
 
-        // The cursor is part of what a replay started, so it is part of what ending one restores, the
-        // way `abandonSpeakingReply` restores it for a reply. Every replay step is a pointer-carrying
-        // flight, so the user's pointer is normally in Kiki's hand at this moment — held for a whole
-        // run and let go of only when the flight in the air lands. Left to that, the tap that stops a
-        // replay would drag the pointer to an element nothing is going to press and then hold it
-        // through the tour's three seconds before it came home, which is a mouse that stays locked
-        // after the user has taken over.
+        // Every replay step is a pointer-carrying flight, so the user's pointer is normally in Kiki's hand here.
+        // Left to the landing, the tap that stops a replay would drag the pointer to an element nothing will press and hold it through the tour's three seconds.
         clearDetectedElementLocation()
         requestBuddyReturnHome()
     }
 
-    /// One step of the replay.
-    ///
-    /// The action is made at its point exactly the way a terminal's is made at the point it asked for —
-    /// same flight, same red cursor, same click sound, same event — which is the whole reason a
-    /// recorded action is stored as the value the arrival performs rather than as a description of a
-    /// mouse event.
+    /// One step of the replay: the action is made exactly the way a terminal's is — same flight, same red cursor,
+    /// same click sound, same event — which is why a recorded action is stored as the value the arrival performs.
     private func takeTheNextStepOfTheReplay() async {
         guard recordedActionsPhase == .replayingWhatTheUserDid else { return }
         guard isAutomaticClickingEnabled else {
@@ -2858,32 +2312,30 @@ final class CompanionManager: ObservableObject {
         guard recordedUserActions.indices.contains(indexOfTheNextRecordedActionToReplay) else { return }
 
         let recordedUserAction = recordedUserActions[indexOfTheNextRecordedActionToReplay]
-        // Advanced before the action is made rather than after it, so that a step interrupted half way
-        // is not the one a restarted loop would come back to.
+        // Advanced before the action is made, so a step interrupted half way is not the one a restarted
+        // loop returns to.
         indexOfTheNextRecordedActionToReplay =
             (indexOfTheNextRecordedActionToReplay + 1) % recordedUserActions.count
 
-        // Named the way a terminal's action is named, because everything downstream asks this and
-        // nothing else which action it is performing: that the one answer goes back into the loop
-        // rather than to a terminal is the only difference between the two.
+        // Named the way a terminal's action is named — everything downstream asks this and nothing else
+        // which action it is performing; only who hears the answer differs.
         let actionBeingWaitedOn = ActionBeingWaitedOn(
             actionIdentifier: UUID(),
             whoHearsTheAnswer: .theReplayOfTheUsersRecordedActions
         )
         self.actionBeingWaitedOn = actionBeingWaitedOn
 
-        // The point is resolved the way a terminal's is, which brings the flip into the AppKit space,
-        // the search for the display it is on, and the refusal for a point on none of them. A refused
-        // point answers the action like any other, which is how a step whose window has gone away is
-        // skipped rather than ending the replay.
+        // Resolved the way a terminal's point is, refusals included: a refused point answers the action
+        // like any other, which is how a step whose window has gone away is skipped rather than ending
+        // the replay.
         let resolution = await resolveActionTarget(
             atGlobalScreenPoint: recordedUserAction.globalScreenPoint,
             action: recordedUserAction.action,
             dragDestinationGlobalScreenPoint: recordedUserAction.dragDestinationGlobalScreenPoint
         )
 
-        // Asked again after the await, for the reason the terminal's own path asks it: resolving reads
-        // the screens, which is long enough for the user to have tapped the shortcut and ended this.
+        // Asked again after the await: resolving reads the screens, long enough for the user to have
+        // tapped the shortcut and ended this.
         guard recordedActionsPhase == .replayingWhatTheUserDid,
               isStillTheActionBeingWaitedOn(actionBeingWaitedOn) else { return }
 
@@ -2895,10 +2347,9 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Waits out the gap between two replayed actions and takes the next one.
-    ///
-    /// The wait is what makes a replay watchable: the actions themselves are over in milliseconds, so
-    /// back to back the cursor would cross the screen twice before the eye could follow either.
+    /// Waits out the gap between two replayed actions and takes the next one — the actions are over in
+    /// milliseconds, so back to back the cursor would cross the screen twice before the eye could
+    /// follow either.
     private func scheduleTheNextStepOfTheReplay() {
         replayStepTask?.cancel()
         guard recordedActionsPhase == .replayingWhatTheUserDid else { return }
@@ -2994,22 +2445,18 @@ final class CompanionManager: ObservableObject {
     - user asks how to save their work, and would rather have it done than told: "在 [KEY:640,420:季度报告.txt:cmd+s] 这个文档上按一下 command s，就存上了。"
     """
 
-    /// Forgets the conversation when the user has been away long enough that this turn starts a new
-    /// one, and records this turn as the one the next gap is measured from.
-    ///
-    /// Checked at the top of the turn rather than where the exchange is appended, because the request
-    /// is built from the history and a later check would let the stale rounds go out once more.
-    /// `Date()` rather than a monotonic clock on purpose: a laptop closed overnight should read as a
-    /// long gap, while a monotonic clock stops counting while the machine sleeps.
+    /// Forgets the conversation when the user has been away long enough that this turn starts a new one, and
+    /// records this turn as the one the next gap is measured from — checked at the top of the turn, because a
+    /// later check would let the stale rounds go out once more. `Date()`, not a monotonic clock: a laptop closed
+    /// overnight should read as a long gap.
     private func startNewConversationIfTheUserHasBeenAway() {
         if let dateOfTheLastActivityInTheConversation {
             let gapSinceTheLastActivitySeconds = Date().timeIntervalSince(dateOfTheLastActivityInTheConversation)
             if gapSinceTheLastActivitySeconds > Self.maximumGapBetweenTurnsInTheSameConversationSeconds {
                 print("New conversation — \(Int(gapSinceTheLastActivitySeconds))s since the last "
                       + "activity, dropping \(conversationHistory.count) exchange(s)")
-                // The two histories are two faces of one task and are emptied together. A summary
-                // left behind would be read as the record of a task the user has since walked away
-                // from, and the questions it answers are no longer being asked.
+                // Emptied together with the history: a summary left behind would be read as the record
+                // of a task the user has walked away from.
                 conversationHistory.removeAll()
                 summaryOfTheStepsCompressedOutOfTheContext = nil
                 numberOfHistoryEntriesTheSummaryStandsInFor = 0
@@ -3029,13 +2476,9 @@ final class CompanionManager: ObservableObject {
             .map { (userPlaceholder: $0.userTranscript, assistantResponse: $0.assistantResponse) }
     }
 
-    /// The system prompt, with the summary of the steps the context no longer carries whole
-    /// appended when there is one.
-    ///
-    /// Appended to the system prompt rather than sent as a message of its own, because the
-    /// conversation has to stay an unbroken run of user and assistant turns: a summary standing
-    /// among them would either put two messages of the same role side by side or start the
-    /// conversation on an assistant turn, and the API is entitled to refuse either.
+    /// The system prompt, with the summary of the steps the context no longer carries whole appended when there
+    /// is one. Appended rather than sent as a message of its own — standing among the turns it would put two
+    /// messages of the same role side by side or start on an assistant turn, and the API may refuse either.
     private func systemPromptForThisStep() -> String {
         guard let summaryOfTheStepsCompressedOutOfTheContext,
               !summaryOfTheStepsCompressedOutOfTheContext.isEmpty else {
@@ -3054,12 +2497,9 @@ final class CompanionManager: ObservableObject {
         """
     }
 
-    /// What a stretch of the conversation is taken to cost the context, in tokens.
-    ///
-    /// There is no tokenizer in the process, so this is an estimate, and it is deliberately a
-    /// little high: an over-estimate compresses a step early, an under-estimate sends a request
-    /// the model rejects. A Chinese character is about a token and a Latin one about a quarter of
-    /// one, so the Latin rate is rounded up.
+    /// What a stretch of the conversation is taken to cost, in tokens — an estimate that errs high on purpose,
+    /// since an over-estimate compresses a step early and an under-estimate sends a request the model rejects.
+    /// There is no tokenizer in the process; a Chinese character is about a token, a Latin one about a quarter.
     private static func estimatedTokenCount(of text: String) -> Int {
         var estimatedTokenCount = 0.0
         for scalar in text.unicodeScalars {
@@ -3068,11 +2508,8 @@ final class CompanionManager: ObservableObject {
         return Int(estimatedTokenCount)
     }
 
-    /// What the next request would cost, as it stands.
-    ///
-    /// The screenshots are counted at the estimate per display rather than left out: they are the
-    /// reason the compression triggers below half, and a trigger that could not see them would
-    /// spend exactly the room they need.
+    /// What the next request would cost, as it stands. Screenshots are counted at the estimate per display rather
+    /// than left out: they are why compression triggers below half, and a trigger blind to them would spend exactly the room they need.
     private func estimatedTokenCountOfTheContextAsItStands(includingThePrompt prompt: String) -> Int {
         var tokenCount = Self.estimatedTokenCount(of: Self.companionVoiceResponseSystemPrompt)
             + Self.estimatedTokenCount(of: summaryOfTheStepsCompressedOutOfTheContext ?? "")
@@ -3087,17 +2524,14 @@ final class CompanionManager: ObservableObject {
             + NSScreen.screens.count * Self.estimatedTokenCountOfOneScreenshot
     }
 
-    /// What the settings panel shows about the task, read off the history as it stands.
-    ///
-    /// The step being asked about is counted apart from the ones on the record, because its prompt
-    /// is not in the history yet — that is the same reason `estimatedTokenCountOfTheContextAsItStands`
-    /// is given the prompt rather than reading it off the last entry.
+    /// What the settings panel shows about the task, read off the history as it stands — the step being
+    /// asked about counted apart from the ones on the record, because its prompt is not in the history
+    /// yet.
     private func taskProgressAsItStands(includingThePrompt prompt: String) -> TaskProgress {
         let isRunningARound = numberOfStepsStartedInTheTurnBeingAnswered > 0 && !hasClosedOutTheTurnBeingAnswered
 
-        // A round enters the history once per step, so its steps are consecutive entries sharing one
-        // identifier and the rounds are the run changes. The running round's steps are counted in
-        // the same pass, because both questions are asked of the same array.
+        // A round enters the history once per step, so its steps are consecutive entries sharing one identifier
+        // and the rounds are the run changes. The running round's steps are counted in the same pass, both questions being asked of one array.
         var roundCount = 0
         var numberOfStepsOfTheRunningRoundAlreadyOnTheRecord = 0
         var previousRoundIdentifier: UUID?
@@ -3112,7 +2546,7 @@ final class CompanionManager: ObservableObject {
         }
 
         // The running round joins the count only while its own first step has not been written yet:
-        // from that write on, the walk above has already counted it.
+        // from that write on the walk above has counted it.
         if isRunningARound, numberOfStepsOfTheRunningRoundAlreadyOnTheRecord == 0 {
             roundCount += 1
         }
@@ -3130,36 +2564,25 @@ final class CompanionManager: ObservableObject {
             stepInTheRoundInProgress: isRunningARound ? numberOfStepsStartedInTheTurnBeingAnswered : 0,
             estimatedTokenCountOfTheContext: estimatedTokenCountOfTheContextAsItStands(includingThePrompt: prompt),
             tokenCountThatStartsCompression: Self.tokenCountThatStartsCompression,
-            // The one place the idle gap becomes a moment. The rule itself stays in the constant the
-            // reset fires on, so the panel counts down to the same moment that reset happens at.
+            // Cut from the same constant the reset fires on, so the two cannot disagree.
             dateTheNextQuestionStartsANewConversation: dateOfTheLastActivityInTheConversation.map {
                 $0.addingTimeInterval(Self.maximumGapBetweenTurnsInTheSameConversationSeconds)
             }
         )
     }
 
-    /// Takes the panel's reading of the task again, for the callers that have just changed one of
-    /// the answers in it: a step starting, a compression landing, a round closing out, and the
-    /// idle gap emptying both histories.
-    ///
-    /// Guarded like `settleVoiceState`, and for the same reason: this is written whenever a step
-    /// starts and the panel re-draws on an unchanged `@Published` write as readily as on a changed
-    /// one, so an unguarded write would invalidate every view reading it for nothing.
+    /// Takes the panel's reading of the task again, for the four callers that have just changed one of its
+    /// answers: a step starting, a compression landing, a round closing, the idle gap emptying both histories. Guarded like `settleVoiceState`.
     private func refreshTaskProgress(includingThePrompt prompt: String) {
         let progress = taskProgressAsItStands(includingThePrompt: prompt)
         guard progress != taskProgress else { return }
         taskProgress = progress
     }
 
-    /// Where the context would stop carrying the history whole: everything before this index goes
-    /// into the summary, everything from it on goes out as it was written. Nil when there is
-    /// nothing left to compress.
-    ///
-    /// Walked back to the first step of a turn. A step that is not the first of its turn opens
-    /// with a report of what the previous step's actions did, so a context beginning at one would
-    /// open with a report of an action the model never saw itself ask for — a result whose call
-    /// has been cut away, which is what the pairing rule guards against in a tree that speaks in
-    /// tool calls rather than in tags.
+    /// Where the context stops carrying the history whole: before this index goes into the summary, from it on
+    /// goes out as written; nil when nothing is left to compress. Walked back to a turn's first step — a step
+    /// that is not the first opens with a report of the previous step's actions, so a context beginning at one
+    /// would open with a result whose call was cut away (the tool_call/tool_result pairing rule).
     private func indexWhereTheContextWouldStartCarryingTheHistoryWhole() -> Int? {
         guard conversationHistory.count > Self.numberOfNewestStepsAlwaysCarriedWhole else { return nil }
 
@@ -3172,18 +2595,15 @@ final class CompanionManager: ObservableObject {
             indexTheContextWouldStartAt -= 1
         }
 
-        // Backing up this far means every step the context could drop is already inside the
-        // summary, so the compression would spend a call to write down what it already says.
+        // Backing up this far means every step the context could drop is already in the summary, so the
+        // compression would spend a call writing down what it already says.
         guard indexTheContextWouldStartAt > numberOfHistoryEntriesTheSummaryStandsInFor else { return nil }
         return indexTheContextWouldStartAt
     }
 
-    /// Compresses the steps the context has outgrown into the summary, if it has outgrown them.
-    ///
-    /// Run before the request is built rather than after one is rejected: the rejection says only
-    /// that something was too long, and by then the step has already paid for a capture and a
-    /// round trip. A compression that fails is not fatal to the turn — the context is then simply
-    /// over its own budget, and the request goes out as it would have.
+    /// Compresses the steps the context has outgrown into the summary. Run before the request is built rather
+    /// than after one is rejected, which would have already paid for a capture and a round trip; one that fails
+    /// is not fatal — the request goes out as it would have anyway, and the next step tries again.
     private func compressTheContextIfItHasOutgrownItsRoom(includingThePrompt prompt: String) async {
         let tokenCountOfTheContextAsItStands = estimatedTokenCountOfTheContextAsItStands(includingThePrompt: prompt)
         guard tokenCountOfTheContextAsItStands > Self.tokenCountThatStartsCompression else { return }
@@ -3208,9 +2628,9 @@ final class CompanionManager: ObservableObject {
                 foldingIn: summaryOfTheStepsCompressedOutOfTheContext
             )
 
-            // The summary belongs to the conversation that asked for it, and one that came back
-            // after the question was replaced would be filed against the next conversation's
-            // history — which may be shorter, and may be about something else entirely.
+            // The summary belongs to the conversation that asked for it: one that came back after the
+            // question was replaced would be filed against a history that may be shorter, or about
+            // something else entirely.
             guard !Task.isCancelled else { return }
 
             summaryOfTheStepsCompressedOutOfTheContext = summary
@@ -3218,28 +2638,22 @@ final class CompanionManager: ObservableObject {
             print("Compressed into \(summary.count) 字, steps 0..<\(indexWhereTheContextWouldStartAt) now "
                   + "stand on the summary")
 
-            // The panel has been counting down to this moment, and the count has just gone back up:
-            // the steps that were weighing on the context are now one paragraph of it.
+            // The panel has been counting down to this moment, and the count has just gone back up.
             refreshTaskProgress(includingThePrompt: prompt)
         } catch {
-            // Not fatal: the request goes out over its own budget, which is what it would have done
-            // anyway. The next step tries again with more of the conversation behind it.
+            // Not fatal: the request goes out over its own budget, and the next step tries again with
+            // more of the conversation behind it.
             print("Context compression failed: \(error)")
         }
     }
 
-    /// Captures a screenshot, sends it with the transcript to DeepSeek, and plays the response
-    /// aloud. The cursor stays in the spinner state until audio is actually heard.
-    ///
-    /// `isReadingTheReplyAloud` is the whole of the difference between a turn someone spoke and one
-    /// a terminal typed: nothing is synthesised, and the pointing is paced by the cursor instead of
-    /// by the narration.
+    /// Captures a screenshot, sends it with the transcript to DeepSeek, and plays the response aloud.
+    /// `isReadingTheReplyAloud` is the whole difference between a spoken turn and a typed one: nothing is synthesised, and the cursor paces the tour instead.
     private func sendTranscriptToClaudeWithScreenshot(
         transcript: String,
         isReadingTheReplyAloud: Bool = true
     ) {
-        // Before anything else about this turn, decide whether it continues the last
-        // conversation.
+        // Before anything else about this turn, decide whether it continues the last conversation.
         startNewConversationIfTheUserHasBeenAway()
 
         self.isReadingTheReplyAloud = isReadingTheReplyAloud
@@ -3248,70 +2662,58 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask?.cancel()
         ttsClient.stopPlayback()
-        // A segment of the old reply still being synthesised is a core producing audio nobody
-        // will hear, and the interrupted reply's stops must not stay armed for its replacement.
+        // A segment of the old reply still being synthesised is audio nobody will hear, and its stops
+        // must not stay armed for its replacement.
         ttsClient.discardPreparedSegments()
         endPointingTour()
 
-        // Everything above this line is synchronous, which is what makes this the one race-free
-        // moment to capture the reply being replaced: `currentResponseTask` is cancelled but its
-        // `catch` has not run yet, and by then the segmenter may belong to this turn.
+        // Everything above is synchronous, so this is the one race-free moment to capture the reply
+        // being replaced: `currentResponseTask` is cancelled but its `catch` has not run yet.
         writeTheCurrentTurnIntoHistory(interruption: .theUserStartedANewQuestion)
         abandonSpeakingReply()
 
-        // A fresh turn: no step behind it, nothing to report to the model, and nothing left over
-        // from the last turn's loop for the terminal to be handed twice. After the history write
-        // above rather than before it, because what that write reads is the previous turn's prompt.
+        // A fresh turn: no step behind it, and nothing left over from the last turn's loop for the
+        // terminal to be handed twice. After the history write above, which reads the previous prompt.
         numberOfStepsStartedInTheTurnBeingAnswered = 0
         spokenTextOfTheStepsBeforeTheOneInProgress = ""
         hasClosedOutTheTurnBeingAnswered = false
-        // After the history write above, which files the previous turn's reply under the identifier
-        // of the turn it actually belonged to.
+        // After the history write above, which files the previous reply under the identifier of the
+        // turn it belonged to.
         turnIdentifierOfTheTurnBeingAnswered = UUID()
 
         askTheModelForTheNextStepOfTheTurn(prompt: transcript)
     }
 
-    /// Asks the model for one step of the turn: a look at the screen as it is now, and the reply
-    /// that follows it.
+    /// Asks the model for one step of the turn: a look at the screen as it is now, and the reply that follows. A turn
+    /// is one call of this or several, and the several are what makes it a loop — a reply that acts on the screen and
+    /// ends with `[LOOK]` changes the screen out from under itself, so the next step is the same question asked of a
+    /// picture nothing else has seen yet.
     ///
-    /// A turn is one call of this or several, and the several are what makes it a loop: a reply that
-    /// acts on the screen and ends with [LOOK] changes the screen out from under itself, so the next
-    /// step is the same question asked of a picture nothing else in the app has seen yet. Between
-    /// steps the machine is in exactly the state a new turn leaves it in, which is why everything
-    /// below is the same code for the first step and for the fifth.
-    ///
-    /// - Parameter prompt: What the model is told. The user's own transcript for the first step, and
-    ///   the sentence describing what its last actions did for every step after it.
+    /// - Parameter prompt: The user's transcript for the first step, and the sentence describing what its last actions did for every step after it.
     private func askTheModelForTheNextStepOfTheTurn(prompt: String) {
         transcriptOfTheTurnBeingAnswered = prompt
-        // A step is the conversation still going, so it counts as activity against the idle gap
-        // that would otherwise start a new one behind the user's back.
+        // A step is the conversation still going, so it counts as activity against the idle gap.
         dateOfTheLastActivityInTheConversation = Date()
-        // Read before the count moves: the turn's first step is the one asked for out of the user's
-        // own speech, and the last thing to touch the screen before it was the user.
+        // Read before the count moves: the first step is the one asked for out of the user's own
+        // speech, so the last thing to touch the screen was the user.
         let isTheFirstStepOfTheTurn = numberOfStepsStartedInTheTurnBeingAnswered == 0
         numberOfStepsStartedInTheTurnBeingAnswered += 1
         stepInProgress = StepOfTheTurnBeingAnswered()
         hasTheModelAskedToLookAgain = false
 
-        // The step's prompt is not in the history yet, so it is the prompt that is counted beside it
-        // — the same way the compression's own trigger counts the request it is about to send.
+        // The step's prompt is not in the history yet, so the prompt is what is counted beside it.
         refreshTaskProgress(includingThePrompt: prompt)
 
-        // Stamped synchronously, before the task below exists, so a chunk still on its way from
-        // the reply being replaced is already recognisable as stale when it lands.
+        // Stamped synchronously, before the task below exists, so a chunk still on its way from the
+        // reply being replaced is already recognisable as stale when it lands.
         let thisTurnIdentifier = UUID()
         turnIdentifierOfTheReplyBeingStreamed = thisTurnIdentifier
 
-        // Armed here and not where the request goes out, because the step before this one may still
-        // be being spoken and the compression and the capture below take time. Left as the last
-        // step's facts, the narration would read that gap as the turn being over and end itself
-        // under the user's ear.
+        // Cleared here and not where the request goes out — the compression and capture below take time: left at
+        // the last step's `true`, the previous step's final segment would read the turn as finished and end the narration under the user's ear.
         isReplyStreamComplete = false
-        // A silent turn will never hear anything, so the flag that says a reply is in progress and
-        // not yet audible would never be cleared by the sound it is waiting for. Nor is it armed
-        // over a step that is still being spoken: that sound is the one this flag waits for.
+        // A silent turn will never hear anything, so the flag would never be cleared by the sound it
+        // waits for. Nor is it armed over a step still being spoken: that sound is the one it waits for.
         if !isSpeakingReply {
             isWaitingForTheFirstSoundOfTheReply = isReadingTheReplyAloud
         }
@@ -3319,18 +2721,14 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask = Task {
             do {
-                // Before the capture, not after it: the compression is triggered by the room the
-                // screenshots are about to take, and a step that compressed afterwards would have
-                // already spent the round trip and the capture it was meant to save.
+                // Before the capture, not after it: a step that compressed afterwards would have already
+                // spent the round trip and the capture it was meant to save.
                 await compressTheContextIfItHasOutgrownItsRoom(includingThePrompt: prompt)
 
                 guard !Task.isCancelled else { return }
 
-                // Capture all connected screens so the AI has full context, once the screen has
-                // stopped reacting to whatever the step before this one did to it. A turn's first
-                // step waits for nothing: it is asked for out of the user's own speech, so the last
-                // thing to touch the screen was the user — already seconds ago — and the wait would
-                // buy nothing at the one moment the user is sitting waiting on kiki.
+                // All connected screens, once the screen has stopped reacting to whatever the step before did. A
+                // turn's first step waits for nothing: the last thing to touch the screen was the user, at the one moment a wait would be felt.
                 let screenCaptures: [CompanionScreenCapture]
                 if isTheFirstStepOfTheTurn {
                     screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
@@ -3341,17 +2739,16 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Read the text on every screenshot now rather than once the reply arrives:
-                // recognition takes the better part of a second per screen, and starting it after
-                // would add that whole second to every reply that points at anything.
+                // Read for text now rather than once the reply arrives: recognition takes the better part
+                // of a second per screen, and starting it after would add that to every reply that points.
                 let recognizedTextLinesTasks = screenCaptures.map { screenCapture in
                     Task {
                         await ScreenshotTextRecognizer.recognizedLines(in: screenCapture.imageData)
                     }
                 }
 
-                // Each label states the pixel dimensions of the image it sits beside, so the
-                // model's coordinate space matches the image it sees.
+                // Each label states the pixel dimensions of the image it sits beside, so the model's
+                // coordinate space matches the image it sees.
                 let labeledImages = screenCaptures.map { capture in
                     (
                         data: capture.imageData,
@@ -3377,8 +2774,7 @@ final class CompanionManager: ObservableObject {
                     userPrompt: prompt,
                     onTextChunk: { [weak self] accumulatedRawText in
                         // Awaited rather than fired and forgotten: the segmenter has to know which
-                        // sentence each new tag sits in before it can cut the reply around it, and
-                        // awaiting also pauses this read until it has answered.
+                        // sentence each new tag sits in before it can cut the reply around it.
                         await self?.absorbStreamedReplyText(
                             accumulatedRawText,
                             fromTurnIdentifiedBy: thisTurnIdentifier
@@ -3394,35 +2790,31 @@ final class CompanionManager: ObservableObject {
                 )
             } catch {
                 // A cancelled read raises either `CancellationError` or `URLError(.cancelled)`, and
-                // `URLSession.AsyncBytes` promises neither, so the task is asked rather than the error
-                // — falling through would read 「额度用完了」 to a user who merely asked again.
-                //
-                // Nothing is recorded here either: this `catch` can run after the next turn has begun.
+                // `URLSession.AsyncBytes` promises neither, so the task is asked rather than the error — falling
+                // through would read 「额度用完了」 to a user who merely asked again. Nothing is recorded here
+                // either: this `catch` can run after the next turn has begun.
                 guard !Task.isCancelled else { return }
 
-                // A reply cut off part-way has already been partly spoken and there is no taking that
-                // back; what can be helped is the fallback being read over the top of it.
+                // Part of the reply has already been spoken and cannot be taken back; what can be helped
+                // is the fallback being read over the top of it.
                 ttsClient.stopPlayback()
                 ttsClient.discardPreparedSegments()
                 writeTheCurrentTurnIntoHistory(interruption: .theReplyFailedPartWayThrough)
                 abandonSpeakingReply()
                 print("Companion response error: \(error)")
-                // A terminal watching this turn is owed an ending rather than a wait it cannot
-                // resolve — nothing else about this turn will reach it.
+                // A terminal watching this turn is owed an ending rather than a wait it cannot resolve
+                // — nothing else about this turn will reach it.
                 commandSocketServer.send(.failed(message: "这一轮没能跑完：\(error.localizedDescription)", isRefusal: false))
                 speakCreditsErrorFallback()
             }
 
             if !Task.isCancelled {
-                // A step that has already been followed by another one is not the owner of the
-                // state below: the next step armed it while this task was finishing, and clearing
-                // it here would put the spinner out in the pause between two steps of one turn.
+                // A step already followed by another one is not the owner of the state below: clearing it
+                // here would put the spinner out in the pause between two steps of one turn.
                 guard thisTurnIdentifier == turnIdentifierOfTheReplyBeingStreamed else { return }
 
-                // The `await` above returns in the middle of the narration, not after it: the
-                // reply has finished arriving while its segments are still being spoken. The turn
-                // is not over until the voice is, so the state is left to the last segment —
-                // `finishSpeakingReply` settles it when that segment is done.
+                // The `await` above returns in the middle of the narration: the turn is not over until
+                // the voice is, so the state is left to the last segment.
                 guard !isSpeakingReply, !isWaitingForTheFirstSoundOfTheReply else { return }
                 isProducingAReply = false
                 scheduleTransientHideIfNeeded()
@@ -3430,16 +2822,15 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// In transient cursor mode, waits for the reply and any pointing to finish, then fades
-    /// the overlay out after a second. Cancelled when the user starts another interaction.
+    /// In transient cursor mode, waits for the reply and any pointing to finish, then fades the
+    /// overlay out after a second. Cancelled when the user starts another interaction.
     private func scheduleTransientHideIfNeeded() {
         guard !isKikiCursorEnabled && isOverlayVisible else { return }
 
         transientHideTask?.cancel()
         transientHideTask = Task {
-            // Asks whether the *reply* is still being spoken rather than whether the voice is making
-            // sound: the client's `isPlaying` goes false between segments, so polling that would hide
-            // the overlay in the silence while the cursor is still waited on.
+            // Asks whether the *reply* is still being spoken, not whether the voice is making sound: the client's
+            // `isPlaying` goes false between segments, so polling that would hide the overlay in a silence the cursor is still waiting through.
             while isSpeakingReply {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
@@ -3459,55 +2850,45 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message when the API call fails, straight to
-    /// `NSSpeechSynthesizer` so it still works if the TTS client is mid-utterance or stuck.
+    /// Speaks a hardcoded error message when the API call fails, straight to `NSSpeechSynthesizer` so
+    /// it still works if the TTS client is mid-utterance or stuck.
     private func speakCreditsErrorFallback() {
         let utterance = "额度用完了，去 DeepSeek 充值之后我就能继续帮你。"
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
-        // The one direct write left. This sentence goes out through a synthesizer of its own, which
-        // reports nothing back — no first sound, no completion — so it is not one of the facts
-        // `voiceState` is derived from and there is nothing for a derivation to see. It is written
-        // here rather than added as a fourth fact because it is the only utterance in the app that
-        // neither ends nor reports, and a flag for it would be read once.
+        // The one direct write left: this sentence goes out through a synthesizer of its own, which reports
+        // nothing back — no first sound, no completion — so there is nothing for the derivation to see. A flag just for it would be read once.
         voiceState = .responding
     }
 
     // MARK: - Point Tag Parsing
 
-    /// How many elements one reply may point at. Every extra stop is another chance for the
-    /// narration to sit waiting on a flight, so this is a sanity limit on a rambling reply.
+    /// How many elements one reply may point at. Every extra stop is another chance for the narration
+    /// to sit waiting on a flight, so this is a sanity limit on a rambling reply.
     private static let maximumPointingTourStopCount = 15
 
     /// Where the cursor is in its trip into the menu bar icon it goes to rest in, and back out.
     ///
-    /// Neither flight can be called off — the cursor has gone somewhere the pointer cannot follow
-    /// it, so no amount of moving the mouse undoes either one, and the stored frame is what the
-    /// icon's own appearance is keyed on.
+    /// Neither flight can be called off, and the stored frame is what the icon's own appearance is
+    /// keyed on.
     enum StatusItemIconPhase: Equatable {
         case notInTheIcon
-        /// The wait is over. The cursor is on its way to this icon rectangle, in AppKit screen
-        /// coordinates — the same space `NSEvent.mouseLocation` is in.
+        /// The wait is over: on the way to this icon rectangle, in AppKit screen coordinates — the same
+        /// space `NSEvent.mouseLocation` is in.
         case cursorFlyingToIcon(iconScreenFrame: CGRect)
         /// Landed: the icon wears the cursor's colour from here on, and the cursor is gone.
         case cursorRestingInIcon
-        /// The pointer came back. The cursor is on its way out to the position beside it, where
-        /// following resumes.
+        /// The pointer came back: on the way out to the position beside it, where following resumes.
         case cursorWakingFromIcon
     }
 
-    /// Whether Kiki has gone quiet because the cursor is in the menu bar icon's hands.
-    ///
-    /// True from the moment a wait runs out, not from the landing: the flight cannot be called off,
-    /// so anything that would hand the cursor a job has to be refused from the instant it is
-    /// committed. It stays true through the flight back out for the same reason — until the cursor
-    /// has landed beside the pointer there is nothing there to hand a job to.
+    /// Whether Kiki has gone quiet because the cursor is in the menu bar icon's hands. True from the moment a
+    /// wait runs out, not from the landing, and through the flight back out: that flight cannot be called off,
+    /// so until the cursor lands there is nothing to hand a job to.
     var isNotTakingInputBecauseOfTheStatusItemIcon: Bool { statusItemIconPhase != .notInTheIcon }
 
-    /// Resting: on the way into the icon, or already inside it.
-    ///
-    /// Read by the two wait-counting paths, one per gesture — the rest's own wait counts only while
-    /// this is false, and the wake's only while it is true.
+    /// Resting: on the way into the icon, or already inside it. Read by the two wait-counting paths,
+    /// one per gesture — the rest's wait counts only while this is false, the wake's only while true.
     var isRestingInTheStatusItemIcon: Bool {
         switch statusItemIconPhase {
         case .cursorFlyingToIcon, .cursorRestingInIcon: return true
@@ -3518,14 +2899,8 @@ final class CompanionManager: ObservableObject {
     /// Waking: the cursor is on its way back out to the pointer.
     var isWakingFromTheStatusItemIcon: Bool { statusItemIconPhase == .cursorWakingFromIcon }
 
-    /// What Kiki is doing right now, from the three facts that decide it.
-    ///
-    /// The icon comes first because it is the one state that covers every way into the app: while
-    /// the cursor is in its hands there is no cursor to send anywhere, and whatever the voice is
-    /// doing is beside the point. The recording comes next, for a weaker version of the same reason:
-    /// a recording and a reply cannot both be running — starting one stops the other — so the order
-    /// between them is not a preference, and putting the recording first says what the user is
-    /// looking at while it lasts.
+    /// What Kiki is doing right now, from the three facts that decide it: the icon first, because while the
+    /// cursor is in its hands there is no cursor to send anywhere, then the recording, because a recording and a reply cannot both run.
     var whatKikiIsDoingRightNow: WhatKikiIsDoingRightNow {
         switch statusItemIconPhase {
         case .cursorFlyingToIcon, .cursorRestingInIcon: return .restingInTheStatusItemIcon
@@ -3547,40 +2922,30 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// What the cursor is doing at the element it just pointed at, from the tag the model wrote:
-    /// locating it, operating it with one press, two or three, opening its menu, scrolling it, or
-    /// typing into it.
-    ///
-    /// One case per gesture rather than one carrying a count and a button: a button takes one press,
-    /// asking for two on it is asking for a different action, and a right click opens something
-    /// neither of the others does.
-    ///
-    /// Two cases carry something, and both carry it because it is the tag's own: a scroll's distance,
-    /// because `:x3` belongs to the element it was written on, and a keyboard action's input, because
-    /// ⌘S and ⌘T are different actions and 「帮你按 ⌘S！」 has to be the bubble over the right one.
+    /// What the cursor does at the element it just pointed at, from the tag the model wrote: locate, press once or
+    /// twice or three times, open a menu, scroll, type. One case per gesture rather than one carrying a count and a
+    /// button — two presses is a different action from one, and a right click opens what neither does. Two cases carry
+    /// a payload because it is the tag's own: a scroll's distance, and a keyboard action's input, since ⌘S and ⌘T are different actions and the bubble must name the right one.
     enum PointingBubbleInvitation: Equatable {
-        /// The model is only locating the element for the user.
+        /// Only locating the element for the user.
         case lookAtElement
-        /// The model is telling the user to click or operate the element.
+        /// Telling the user to click or operate the element.
         case clickElement
-        /// The model is telling the user to open or select the element, which takes two clicks.
+        /// Opening or selecting the element, which takes two clicks.
         case doubleClickElement
-        /// The model is telling the user to select a whole paragraph of the element, which takes
-        /// three clicks.
+        /// Selecting a whole paragraph, which takes three clicks.
         case tripleClickElement
-        /// The model is telling the user the answer is in the element's context menu, which the
-        /// right button opens.
+        /// The answer is in the element's context menu, which the right button opens.
         case rightClickElement
-        /// The model is telling the user the element is to be moved somewhere else. Carries no
-        /// destination for the same reason `ElementActionOnArrival.drag` does not: it is the same
-        /// drag either way, and where it lets go travels on the stop.
+        /// The element is to be moved. Carries no destination: it is the same drag either way, and
+        /// where it lets go travels on the stop.
         case dragElement
-        /// There is more to see past the edge of this element, and which way it lies, and how far.
-        /// The distance is not always the model's: this is also the invitation a recorded scroll
-        /// replays under, and that one was measured off the user's own hand.
+        /// There is more to see past the edge of this element, which way and how far. The distance is
+        /// not always the model's: a recorded scroll replays under this invitation, measured off the
+        /// user's own hand.
         case scrollElement(ElementScrollDirection, distance: ElementScrollDistance)
-        /// The model is telling the user the element is where words are to be put in — a run of text
-        /// to type, or a combination to press with the element as the thing being pointed at.
+        /// Words to type into the element, or a combination to press with the element as the thing
+        /// being pointed at.
         case keyboardElement(ElementKeyboardInput)
 
         /// What the cursor should do on arrival, or nil when there is nothing to do but hover.
@@ -3597,12 +2962,8 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        /// The invitation that describes a given gesture, for a caller that holds the gesture and
-        /// needs the bubble and the phrase pool that go with it.
-        ///
-        /// The inverse of the property above, so the words over the cursor and the presses that go
-        /// out cannot disagree — the gestures look identical on screen until they happen, and
-        /// 「点这里！」 over a file about to open describes the wrong one.
+        /// The inverse of the property above, for a caller holding a gesture: the words over the cursor
+        /// and the presses that go out cannot disagree — the gestures look identical until they happen.
         static func describing(_ clickKind: ElementClickKind) -> PointingBubbleInvitation {
             switch clickKind {
             case .singleClick: return .clickElement
@@ -3612,8 +2973,8 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        /// The same inverse for the other gesture axis. Separate from the one above rather than
-        /// sharing it, because a scroll has a direction and a distance that a press has no room for.
+        /// The same inverse for the other gesture axis — a scroll has a direction and a distance that a
+        /// press has no room for.
         static func describing(
             _ direction: ElementScrollDirection,
             distance: ElementScrollDistance
@@ -3621,9 +2982,8 @@ final class CompanionManager: ObservableObject {
             return .scrollElement(direction, distance: distance)
         }
 
-        /// The same inverse again for a caller that holds the whole arrival action and nothing
-        /// narrower — which is every caller that got it from a terminal or from a recording rather
-        /// than from a tag, where the gesture arrived as one value already.
+        /// The same inverse again for a caller holding the whole arrival action — one that got it from
+        /// a terminal or a recording rather than a tag.
         static func describing(_ action: ElementActionOnArrival) -> PointingBubbleInvitation {
             switch action {
             case .press(let clickKind): return .describing(clickKind)
@@ -3633,8 +2993,8 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        /// The name of the case for the record file, written out so a log value is something to
-        /// search the source for.
+        /// The name of the case for the record file, written out so a log value is something to search
+        /// for in the source.
         var name: String {
             switch self {
             case .lookAtElement: return "lookAtElement"
@@ -3654,20 +3014,16 @@ final class CompanionManager: ObservableObject {
     struct PointingTarget: Equatable {
         /// Where the element is, in global AppKit screen coordinates.
         let screenLocation: CGPoint
-        /// The display frame (global AppKit coords) of the screen the element is on, so the overlay
-        /// knows which of its windows should animate.
+        /// The display frame of the screen the element is on, so the overlay knows which of its windows
+        /// should animate.
         let displayFrame: CGRect
         /// What the arrival bubble invites the user to do, taken from the tag the model wrote.
         let bubbleInvitation: PointingBubbleInvitation
-        /// Custom bubble text for the pointing animation, in place of a random phrase. Only the
-        /// onboarding demo sets it, which is why it is the one fact here with no default.
+        /// Custom bubble text in place of a random phrase; only the onboarding demo sets it, which is
+        /// why it is the one fact here with no default.
         let bubbleText: String?
-        /// What the element gets on arrival — a press or a scroll — or nil when Kiki will not do
-        /// anything to it at all. Filled from the same function that decides whether the action is
-        /// posted, so the overlay's drawing of the answer cannot disagree with what goes out.
-        ///
-        /// Withdrawn, not merely unset, when the tour ends under the cursor: the cursor stays where
-        /// it is and stops being an action.
+        /// What the element gets on arrival, or nil when Kiki will do nothing to it. Filled from the function that
+        /// decides whether the action posts, so drawing and event cannot disagree; withdrawn, not merely unset, when the tour ends under the cursor.
         var actionToPerformOnArrival: ElementActionOnArrival?
     }
 
@@ -3684,89 +3040,46 @@ final class CompanionManager: ObservableObject {
         /// Every element the model tagged, in the order it described them, capped at
         /// `maximumPointingTourStopCount`. Empty when the model wrote [POINT:none] or no tag.
         let tourStops: [PointingTourStop]
-        /// Whether the reply carried the [LOOK] marker, which asks to see the screen again once
-        /// everything it tagged has been acted on. Stripped from `spokenText` like every other tag,
-        /// so the voice never says it and the history never holds it.
+        /// Whether the reply carried the [LOOK] marker, which asks to see the screen again once everything it
+        /// tagged has been acted on. Stripped from `spokenText` like every other tag, so the voice never says it and history never holds it.
         let hasAskedToLookAgain: Bool
     }
 
-    /// One element on a pointing tour, with the point in the spoken text at which the cursor
-    /// should already be on its way there.
+    /// One element on a pointing tour, with the point in the spoken text at which the cursor should
+    /// already be on its way there.
     struct PointingTourStop {
-        /// The coordinate the model read off the screenshot, in that image's own pixel space.
-        /// It needs the same scaling and flipping as `PointingParseResult.coordinate`.
+        /// The coordinate the model read off the screenshot, in that image's own pixel space — needing
+        /// the same scaling and flipping as `PointingParseResult.coordinate`.
         let screenshotCoordinate: CGPoint
         /// Short label describing the element (e.g. "run button").
         let elementLabel: String?
         /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
         let screenNumber: Int?
-        /// Offset into `spokenText` of the sentence describing this element. The tour sends the
-        /// cursor on its way here, so it flies while the model is still describing the element, and
-        /// the end of the same sentence is where the segment carrying this stop ends.
+        /// Offset into `spokenText` of the sentence describing this element: the cursor flies while the
+        /// model is still describing it, and the same sentence's end is where the segment ends.
         let sentenceStartOffsetInSpokenText: Int
         /// What this stop's arrival bubble should invite the user to do.
         let pointingBubbleInvitation: PointingBubbleInvitation
-        /// Where a drag from this stop lets go, in the screenshot's own pixel space and on the same
-        /// screenshot as `screenshotCoordinate`. Nil for every stop that is not a drag, and for a
-        /// `[DRAG:...]` tag that named no destination — which is what the refusal is read from.
-        ///
-        /// The same screenshot even when the destination is near a display's edge, because
-        /// `screenLocation(forScreenshotCoordinate:on:)` clamps into the image it is given: a
-        /// destination scaled against another display's capture would be a different point entirely.
+        /// Where a drag from this stop lets go, in the screenshot's own pixel space and on `screenshotCoordinate`'s
+        /// own image — the point is clamped into the image it is scaled against. Nil for a non-drag and for a
+        /// `[DRAG:…]` that named no destination, which is what the refusal is read from.
         let dragDestinationScreenshotCoordinate: CGPoint?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag out of the model's response, and the
-    /// same shapes written as [CLICK:...], [DOUBLECLICK:...], [RIGHTCLICK:...], the four
-    /// [SCROLL…:...] names, each of which may also carry a `:xN` distance, [DRAG:...], which carries
-    /// a second pair of coordinates after a `>`, [TYPE:x,y:label:text] to type that text, and
-    /// [KEY:x,y:label:combination] to press that combination. Returns the spoken text with every tag
-    /// stripped, plus the coordinate, label and screen number of the last one.
-    ///
-    /// The tag is looked for anywhere in the response and the last one wins rather than being required
-    /// at the very end: anchoring it meant a model that tacked anything on after it — a trailing "。"
-    /// is enough — disabled pointing silently.
+    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag and the same shapes as [CLICK:…], [DOUBLECLICK:…],
+    /// [TRIPLECLICK:…], [RIGHTCLICK:…], the four [SCROLL…] with an optional `:xN`, [DRAG:…] with a destination after
+    /// `>`, [TYPE:…] and [KEY:…] — returning the spoken text with every tag stripped plus the last tag's coordinate,
+    /// label and screen. Looked for anywhere and the last wins: anchored at the end, a trailing "。" after it disabled pointing silently.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
-        // The tag name is matched case-insensitively while everything inside it stays exact, because
-        // the prompt describes these tags in lowercase prose and a tag the pattern does not recognize
-        // fails silently: the reply is spoken normally and the cursor never moves.
-        //
-        // The label stops at `]` and at nothing else, so it may contain colons — the prompt asks the
-        // model to copy the element's on-screen text verbatim, and a screen is full of text containing
-        // them ("今天 02:04"). `:screenN` is lazy for that reason.
-        // The alternatives are anchored just after `[`, so CLICK cannot swallow a RIGHTCLICK: the
-        // pattern would have nothing left to match at that position.
-        //
-        // The distance comes after the label and carries an `x` of its own. A bare `:3` would be
-        // eaten by the label group — it is lazy, and everything up to the next colon is still
-        // "the rest of the label" — so `[RIGHTCLICK:120,240:今天 02:04]` would come back with the
-        // label 「今天 02」 and a distance of 4. `:screenN` answers the same problem with a word in
-        // front of it, and the distance does the same. Written in this order, the label takes what
-        // it can and leaves `:x3` and `:screen2` standing.
-        //
-        // A drag's destination is the one thing appended after everything else, and it is appended
-        // rather than slotted in because the groups above it are read by number: `:x(\d+)` is group
-        // 4 and `:screen(\d+)` is group 5, so inserting the destination before either of them would
-        // have `screenfuls(fromTagMatch:)` reading a destination's y as a distance. It sits after
-        // them and is read as groups 6 and 7, which nothing else looks at.
-        // The distance's fraction is a non-capturing group, so `:x0.5` is still one group and group
-        // 4 still holds the whole number — written as a capturing one it would shift `:screenN` and
-        // the destination along by one and have them read each other's values.
-        // `LOOK` is the one alternative that names no element and has no colon: it is not a gesture
-        // but a request for another step, written on its own. Its capture groups are none, so it
-        // leaves every group number below it untouched — and it is stripped from the spoken text
-        // like any other tag, which the loop over the matches does before anything reads them.
-        //
-        // `TYPE` and `KEY` are alternatives of their own, after `LOOK`, and that is the one thing here
-        // that must not be tidied up: each carries what to type or which combination to press, and a
-        // payload group appended to the shared body above would be read as the *label* of every tag
-        // that body matches — the label is lazy, so it prefers to capture nothing, and `[POINT:400,213:
-        // 新华网]` would arrive as a label of nil and a payload of 新华网. Every tag's coordinate
-        // sharpening would fail silently and the cursor would fall back to the model's own estimate.
-        // Their groups therefore sit after every group the other tags use: TYPE reads 8–12 and KEY
-        // 13–17, and nothing above reads past 7. The screen number is last within each of them, as it
-        // is for every other tag, and the payload is required: a keyboard tag written without one does
-        // not match at all and is left in the text to be spoken, which is noisy rather than silent.
+        // Case-insensitive, exact inside; an unrecognized tag fails silently — the reply is spoken and the cursor
+        // never moves. The label stops at `]` only, so it may contain colons and `:screenN` must stay lazy for it;
+        // the alternatives anchor just after `[` so CLICK cannot swallow RIGHTCLICK. A distance carries its own
+        // `x`, a bare `:3` being eaten by that lazy label. A drag's destination is appended last because the
+        // groups are read by number (`:x` is 4, `:screen` 5) and one slotted before them would have
+        // `screenfuls(fromTagMatch:)` read its y as a distance; its fraction stays non-capturing and `LOOK`
+        // captures nothing. `TYPE`/`KEY` must stay alternatives of their own: a payload on the shared body would
+        // be read as every tag's *label*, which the lazy label prefers to capture empty, so sharpening would fail
+        // silently. Their groups come last, and the payload is required.
         let pattern = #"\[(?i:POINT|CLICK|DOUBLECLICK|TRIPLECLICK|RIGHTCLICK|SCROLLUP|SCROLLDOWN|SCROLLLEFT|SCROLLRIGHT|DRAG):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]\s][^\]]*?))?(?::x(\d+(?:\.\d+)?))?(?::screen(\d+))?(?:\s*>\s*(\d+)\s*,\s*(\d+))?)\]|\[(?i:LOOK)\]|\[(?i:TYPE):(\d+)\s*,\s*(\d+):([^\]\s][^\]]*?):(.+?)(?::screen(\d+))?\]|\[(?i:KEY):(\d+)\s*,\s*(\d+):([^\]\s][^\]]*?):(.+?)(?::screen(\d+))?\]"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
@@ -3776,10 +3089,8 @@ final class CompanionManager: ObservableObject {
         let hasAskedToLookAgain = allTagMatches.contains { Self.isTheLookMarker($0, in: responseText) }
 
         guard let lastTagMatch = allTagMatches.last else {
-            // No tag at all — the opening stretch of most replies — and it goes through the same tidy
-            // the tagged path does. It has to: this runs on every chunk and its answer is what the
-            // segmenter cuts segments from, so a reply raw until its first tag and tidied afterwards
-            // would have two coordinate spaces instead of one.
+            // No tag at all, and it goes through the same tidy the tagged path does: this runs on every chunk and
+            // its answer is what the segmenter cuts from, so a reply raw until its first tag would have two coordinate spaces.
             let tidiedRawSpokenText = Self.tidiedSpokenText(responseText)
             return PointingParseResult(
                 spokenText: tidiedRawSpokenText.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -3791,10 +3102,8 @@ final class CompanionManager: ObservableObject {
             )
         }
 
-        // Strip every tag, not just the one being pointed at, and rejoin the pieces between them.
-        // Matches arrive in ascending order, so the length of the text assembled so far as each tag is
-        // passed is exactly that tag's offset — which is how a tour stop later finds the sentence it
-        // describes. Those offsets are in this raw text and are mapped onto the tidied text at the end.
+        // Strip every tag and rejoin the pieces between them: matches arrive in ascending order, so the length of
+        // the text assembled so far is the tag's offset, how a stop later finds its sentence. Offsets are in the raw text, mapped onto the tidied one at the end.
         var rawSpokenText = ""
         var pendingPointingTourStops: [(
             screenshotCoordinate: CGPoint,
@@ -3829,8 +3138,7 @@ final class CompanionManager: ObservableObject {
         rawSpokenText += responseText[searchStartIndex...]
 
         let tidiedRawSpokenText = Self.tidiedSpokenText(rawSpokenText)
-        // Trimming only removes from the two ends, so every offset into the tidied text has to
-        // drop however much came off the front.
+        // Trimming only removes from the ends, so every offset drops however much came off the front.
         let leadingWhitespaceUTF16UnitCount = String(tidiedRawSpokenText.prefix { $0.isWhitespace }).utf16.count
         let spokenText = tidiedRawSpokenText.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -3864,23 +3172,17 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Whether one match of the tag pattern is the [LOOK] marker rather than a tag naming an element.
-    ///
-    /// Read off the matched text rather than off a capture group, because the marker is the one
-    /// alternative that captures nothing — which is what keeps the group numbers every other tag is
-    /// read by exactly where they were.
+    /// Whether one match is the [LOOK] marker rather than a tag naming an element — read off the
+    /// matched text because the marker captures nothing, which is what keeps the group numbers every
+    /// other tag is read by where they were.
     private static func isTheLookMarker(_ tagMatch: NSTextCheckingResult, in responseText: String) -> Bool {
         guard let tagRange = Range(tagMatch.range, in: responseText) else { return false }
         return responseText[tagRange].uppercased() == "[LOOK]"
     }
 
-    /// The coordinate inside a [POINT:...] tag, in the screenshot's own pixel space, or nil
-    /// for a [POINT:none] tag.
-    ///
-    /// A TYPE or KEY tag keeps its coordinate in groups of its own, so the shared groups are asked
-    /// first and a tag whose own groups are the ones that captured is answered by them. The order is
-    /// the only thing that makes one lookup serve every tag; the groups are never both populated,
-    /// because a match belongs to one alternative.
+    /// The coordinate inside a tag, in the screenshot's own pixel space, or nil for [POINT:none]. A TYPE or KEY
+    /// tag keeps its coordinate in groups of its own: the shared groups are asked first, and a tag whose own
+    /// groups captured is answered by them — never both, one match being one alternative.
     private static func screenshotCoordinate(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> CGPoint? {
         for (xGroupNumber, yGroupNumber) in [(1, 2), (8, 9), (13, 14)] where tagMatch.numberOfRanges > yGroupNumber {
             guard let xRange = Range(tagMatch.range(at: xGroupNumber), in: responseText),
@@ -3893,8 +3195,8 @@ final class CompanionManager: ObservableObject {
     }
 
     /// The element's own text inside a tag, e.g. "保存" — the label the app looks for on the picture,
-    /// which is why the prompt asks for it verbatim. Read from the tag's own groups, for the reason
-    /// the coordinate is.
+    /// which is why the prompt asks for it verbatim. Read from the tag's own groups, like the
+    /// coordinate.
     private static func elementLabel(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> String? {
         for labelGroupNumber in [3, 10, 15] where tagMatch.numberOfRanges > labelGroupNumber {
             guard let labelRange = Range(tagMatch.range(at: labelGroupNumber), in: responseText) else { continue }
@@ -3903,13 +3205,8 @@ final class CompanionManager: ObservableObject {
         return nil
     }
 
-    /// What a [TYPE:...] or [KEY:...] tag is to do with its element — the text to type, or the name
-    /// of the combination to press — or nil for every other tag.
-    ///
-    /// Read off the tag's own name rather than by trying both groups, because the two alternatives are
-    /// told apart by that name: the payload group of the one a tag did not match is empty, and reading
-    /// it would be reading a group that says nothing about this tag. The name is the one thing a
-    /// keyboard tag has in common with the gestures, and its payload is the one thing they do not.
+    /// What a [TYPE:...] or [KEY:...] tag is to do with its element — the text to type, or the combination to
+    /// press — or nil for every other tag. Read off the tag's own name, not by trying both groups: the other one's payload group is empty.
     private static func keyboardInput(
         fromTagMatch tagMatch: NSTextCheckingResult,
         in responseText: String
@@ -3933,16 +3230,12 @@ final class CompanionManager: ObservableObject {
 
         let payload = String(responseText[payloadRange])
         // A combination travels as the name the model wrote, not as a decoded value: a name nothing
-        // recognizes has to reach the refusal that says so, and a decoded one could not be reported.
+        // recognizes has to reach the refusal that says so, which a decoded one could not.
         return uppercasedTag.hasPrefix("[TYPE:") ? .text(payload) : .combination(name: payload)
     }
 
-    /// Where a [DRAG:...] tag lets go, in the screenshot's own pixel space, or nil when that tag
-    /// named no destination.
-    ///
-    /// Read only for a drag tag, because the two groups it reads are present in every tag's match —
-    /// there is one pattern and it has one shape — so a destination written after any other tag
-    /// would otherwise be read as a real one. What a tag means is its name.
+    /// Where a [DRAG:...] tag lets go, in the screenshot's own pixel space, or nil when it named no destination.
+    /// Read only for a drag: those groups are in every tag's match, so any other tag's trailing numbers would read as a real one.
     private static func dragDestinationScreenshotCoordinate(
         fromTagMatch tagMatch: NSTextCheckingResult,
         in responseText: String
@@ -3961,19 +3254,10 @@ final class CompanionManager: ObservableObject {
         return CGPoint(x: x, y: y)
     }
 
-    /// What the arrival bubble should invite the user to do, read off the tag the model wrote:
-    /// [CLICK:...] for a click, [DOUBLECLICK:...] for two, [TRIPLECLICK:...] for three,
-    /// [RIGHTCLICK:...] for the element's menu, [DRAG:...] for a drag, [SCROLLUP:...] and its three
-    /// siblings for a scroll, [TYPE:...] for a run of text and [KEY:...] for a combination,
-    /// [POINT:...] for locating it.
-    ///
-    /// Looking is the default: inviting someone to look is never wrong, while 「点这里」 reads as an
-    /// instruction a user who only asked where a setting lives never asked for.
-    ///
-    /// A gesture's name has to be added here as well as to the pattern and to the prompt, and this
-    /// is the silent one of the three: a tag the pattern knows but this does not still parses, still
-    /// flies the cursor and still does the thing, and the bubble over it says 「看这里！」 about an
-    /// action the user never asked for.
+    /// What the arrival bubble should invite the user to do, read off the tag the model wrote: a click, a scroll, a
+    /// drag, the keyboard's two, or looking — the default, since inviting a look is never wrong where 「点这里」 is an
+    /// instruction a user who only asked where a setting lives never asked for. A gesture's name has to be added here
+    /// as well as to the pattern and the prompt, and this is the silent one of the three: the tag still parses, still flies and still does the thing, and the bubble over it says 「看这里！」 about an action never asked for.
     private static func pointingBubbleInvitation(
         fromTagMatch tagMatch: NSTextCheckingResult,
         in responseText: String
@@ -3981,12 +3265,10 @@ final class CompanionManager: ObservableObject {
         guard let tagRange = Range(tagMatch.range, in: responseText) else {
             return .lookAtElement
         }
-        // Upper-cased before the comparison because the pattern accepts the tag name in any case. The
-        // names are told apart by their whole prefix, so the order they are tested in cannot matter.
+        // Upper-cased because the pattern accepts any case; the whole-prefix tests cannot overlap.
         let uppercasedTag = responseText[tagRange].uppercased()
 
-        // Asked first and separately, because the two keyboard tags are the ones that carry what to
-        // do with the element rather than only which gesture it is, and that payload is not a prefix.
+        // Asked first and separately: the keyboard tags carry a payload, and a payload is not a prefix.
         if let keyboardInput = Self.keyboardInput(fromTagMatch: tagMatch, in: responseText) {
             return .keyboardElement(keyboardInput)
         }
@@ -4022,9 +3304,8 @@ final class CompanionManager: ObservableObject {
         return .lookAtElement
     }
 
-    /// The 1-based screen number inside a tag, or nil when it named none — which means
-    /// "wherever the cursor already is". Read from the tag's own groups, for the reason the
-    /// coordinate is; a keyboard tag's sits last within its alternative, as it does for every other.
+    /// The 1-based screen number inside a tag, or nil when it named none — "wherever the cursor already
+    /// is". Read from the tag's own groups, for the reason the coordinate is.
     private static func screenNumber(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> Int? {
         for screenGroupNumber in [5, 12, 17] where tagMatch.numberOfRanges > screenGroupNumber {
             guard let screenRange = Range(tagMatch.range(at: screenGroupNumber), in: responseText) else { continue }
@@ -4033,13 +3314,8 @@ final class CompanionManager: ObservableObject {
         return nil
     }
 
-    /// How many screenfuls a scroll tag asked for, clamped, defaulting to one for a tag that named
-    /// no distance.
-    ///
-    /// Clamped here rather than where the events are built, because both ends of the range are
-    /// meaningless rather than merely large: `:x0` is a tag that names a gesture doing nothing, and
-    /// past the ceiling the count stops describing a distance anyone means. The prompt asks for half
-    /// a screen to three; this is what makes a model that writes `:x40` scroll rather than sit there.
+    /// How many screenfuls a scroll tag asked for, clamped, defaulting to one. Clamped because both ends of the
+    /// range are meaningless rather than merely large: `:x0` is a gesture doing nothing, and past the ceiling the count describes no real distance.
     private static func screenfuls(fromTagMatch tagMatch: NSTextCheckingResult, in responseText: String) -> CGFloat {
         guard tagMatch.numberOfRanges >= 5,
               let screenfulsRange = Range(tagMatch.range(at: 4), in: responseText),
@@ -4050,30 +3326,19 @@ final class CompanionManager: ObservableObject {
                    CGFloat(ElementScroller.mostScreenfulsInOneRequest))
     }
 
-    /// Finds where the sentence that mentions the element begins, looking back from the tag.
-    ///
-    /// The tour sends the cursor on its way at that point rather than at the tag, because a tag follows
-    /// the sentence describing its element: triggering on the tag would start the flight only once the
-    /// model had finished talking about it. The scan steps over any run of sentence marks and spaces
-    /// between the tag and the words before it, because the model usually writes the tag straight after
-    /// the closing punctuation of its sentence — and without that step the scan would report where the
-    /// *next* sentence begins.
+    /// Finds where the sentence that mentions the element begins, looking back from the tag: the tour flies from
+    /// there, because triggering on the tag would start the flight only once the model had finished talking about
+    /// the element. The scan steps over the run of sentence marks and spaces the model writes between tag and
+    /// sentence, and without that step it would report where the *next* sentence begins.
     private static let sentenceEndingUTF16CodeUnits: Set<UInt16> = Set("。！？；，、\n!?,;".utf16)
 
-    /// Everything that may sit between a sentence's end and the tag describing it: a sentence
-    /// mark, any space around it, and a newline, which is already one of the marks.
+    /// Everything that may sit between a sentence's end and the tag describing it.
     private static let sentenceTrailingUTF16CodeUnits: Set<UInt16> =
         CompanionManager.sentenceEndingUTF16CodeUnits.union(Set(" \t\r\u{3000}".utf16))
 
-    /// The marks a sentence can end on and have itself be a finished thought.
-    ///
-    /// This is what lets a sentence that names no element still close a speech segment, so a preamble
-    /// can be heard before the model has decided what to point at.
-    ///
-    /// The comma is deliberately not here even though `sentenceEndingUTF16CodeUnits` counts it: there
-    /// it decides where a *stop's* sentence begins, a question about the cursor, while here it would
-    /// decide where the voice may take a breath — and cutting a stop-less run of clauses at every comma
-    /// spends the prosody on nobody's wait.
+    /// The marks a sentence can end on and have itself be a finished thought: this is what lets a sentence naming
+    /// no element still close a segment, so a preamble can be heard before the model has decided what to point
+    /// at. The comma is not here although `sentenceEndingUTF16CodeUnits` counts it.
     private static let sentenceTerminatingUTF16CodeUnits: Set<UInt16> = Set("。！？；\n!?;".utf16)
 
     private static func sentenceStartOffset(inSpokenText spokenText: String, atOrBefore characterOffset: Int) -> Int {
@@ -4093,10 +3358,8 @@ final class CompanionManager: ObservableObject {
         return 0
     }
 
-    /// Cuts the reply into sentences, as UTF-16 ranges that tile the whole of it. They are contiguous
-    /// and lossless on purpose: a segment ends on a sentence boundary and the text either side is
-    /// spoken by two different utterances, so a gap here would drop words and an overlap say them
-    /// twice.
+    /// Cuts the reply into sentences, as UTF-16 ranges that tile the whole of it: a segment ends on a sentence
+    /// boundary and either side is spoken by a different utterance, so a gap here would drop words and an overlap say them twice.
     private static func sentenceRanges(inSpokenText spokenText: String) -> [Range<Int>] {
         let spokenTextUTF16CodeUnits = Array(spokenText.utf16)
         guard !spokenTextUTF16CodeUnits.isEmpty else { return [] }
@@ -4114,11 +3377,8 @@ final class CompanionManager: ObservableObject {
         return sentenceRanges
     }
 
-    /// Which sentence a character offset falls in.
-    ///
-    /// An offset past the end of the last sentence reports the last sentence rather than nothing: a tag
-    /// at the very end of a reply has its sentence start on the final character, and an offset resolving
-    /// to no sentence would leave that stop with no segment to belong to.
+    /// Which sentence a character offset falls in. An offset past the end reports the last one: a tag at the very
+    /// end of a reply has its sentence start on the final character, and no sentence would leave that stop unattached.
     private static func sentenceIndex(containingOffset characterOffset: Int, among sentenceRanges: [Range<Int>]) -> Int {
         for (sentenceIndex, sentenceRange) in sentenceRanges.enumerated() {
             if sentenceRange.lowerBound > characterOffset {
@@ -4138,17 +3398,10 @@ final class CompanionManager: ObservableObject {
         return String(decoding: spokenTextUTF16View[sliceStartIndex..<sliceEndIndex], as: UTF16.self)
     }
 
-    /// Cuts the reply into the pieces the voice is handed one at a time.
-    ///
-    /// A sentence closes a segment for one of two reasons: it names a tour stop, in which case the next
-    /// segment waits on the cursor getting through those stops, or it ends on a terminator and is not
-    /// the last sentence, in which case nothing is waiting and holding the words gains nothing. The
-    /// second is what lets a preamble be heard before the model has decided what to point at; a
-    /// sentence that names nothing and does not end itself — the last sentence, and any run of clauses
-    /// ending in a comma — is carried on to the next segment.
-    ///
-    /// The ranges tile the reply and index the *resolved* stops, since one whose screen is gone was
-    /// dropped during resolution.
+    /// Cuts the reply into the pieces the voice is handed one at a time. A sentence closes a segment for one of two
+    /// reasons: it names a tour stop, so the next segment waits on the cursor getting through those stops, or it ends
+    /// on a terminator and is not the last sentence, so nothing is waiting. A sentence that names nothing and does not
+    /// end itself — the last sentence, and a run of clauses ending in a comma — is carried on to the next segment. The ranges tile the reply and index the *resolved* stops, one whose screen is gone having been dropped during resolution.
     private static func speechSegments(
         forSpokenText spokenText: String,
         resolvedPointingTourStops: [ResolvedPointingTourStop]
@@ -4174,8 +3427,8 @@ final class CompanionManager: ObservableObject {
             }
 
             let doesThisSentenceNameStops = stopIndex > firstStopIndexInThisSentence
-            // The last sentence is never cut on its own account, however it ends: the model may
-            // still be writing it, so it is carried into the trailing segment.
+            // The last sentence is never cut on its own account, however it ends: the model may still be
+            // writing it, so it is carried into the trailing segment.
             let isTheLastSentence = sentenceIndex == sentenceRanges.count - 1
             let doesThisSentenceEndItself = Self.sentenceTerminatingUTF16CodeUnits.contains(
                 spokenTextUTF16CodeUnits[sentenceRange.upperBound - 1]
@@ -4194,8 +3447,8 @@ final class CompanionManager: ObservableObject {
             speechSegmentStartOffset = sentenceRange.upperBound
         }
 
-        // Whatever the model said after its last tag — a closing remark, a follow-up question —
-        // is still part of the reply, and is the only part still being written.
+        // Whatever the model said after its last tag — a closing remark, a follow-up question — is still
+        // part of the reply, and is the only part still being written.
         if speechSegmentStartOffset < spokenText.utf16.count {
             speechSegments.append(CompanionSpeechSegment(
                 spokenText: Self.spokenTextSubstring(
@@ -4210,29 +3463,20 @@ final class CompanionManager: ObservableObject {
         return speechSegments
     }
 
-    /// The tidy-up passes run over the assembled spoken text before it is spoken.
-    ///
-    /// What they take out is formatting rather than speech, and the synthesizer does not pass over it
-    /// the way an eye does: it reads markdown marks out as words, and a blank line can make it cut a
-    /// paragraph short while still reporting `didFinish`.
-    ///
-    /// Each pass has to be local — what it does at one character may only depend on the characters
-    /// beside it — because `tidiedOffset(forRawOffset:…)` answers by tidying the raw text up to that
-    /// offset and counting what is left; a pass whose match reaches past the offset reports a stop that
-    /// silently never fires. That is also why a numbered list marker is left alone: a prefix cut between
-    /// its two characters is a lone "1", equally a marker and a number.
+    /// The tidy-up passes run over the assembled spoken text before it is spoken: what they take out is formatting
+    /// rather than speech, and the synthesizer reads markdown marks as words and can cut a paragraph short on a blank
+    /// line while reporting `didFinish`. Each pass has to be local, because `tidiedOffset(forRawOffset:…)` answers by
+    /// tidying the raw text up to that offset — a match reaching past it reports a stop that silently never fires. A numbered list marker is left alone for the same reason.
     private static func tidiedSpokenText(_ text: String) -> String {
         text
-            // Invisible and formatting-only characters, out wherever they sit. The markdown marks
-            // among them are what the voice reads out as words. The price is a path losing its leading
-            // tilde, which is a smaller thing to lose than a reply is to hear read aloud.
+            // Invisible and formatting-only characters, out wherever they sit; the markdown marks among them are
+            // what the voice reads out as words. The price is a path losing its leading tilde — smaller than a reply heard read aloud.
             .replacingOccurrences(
                 of: "[\r\t\u{3000}\u{2028}\u{2029}\u{00A0}\u{200B}\u{FEFF}\u{00AD}\u{200E}\u{200F}*`#~>]",
                 with: "",
                 options: .regularExpression
             )
-            // A paragraph break is a full stop to the ear, but only where the reply has not already
-            // stopped: where it has, the mark that is there does the work.
+            // A paragraph break is a full stop to the ear, unless the reply already stopped there.
             .replacingOccurrences(
                 of: #"(?<=[。！？；，、!?,;.])\n+"#,
                 with: "",
@@ -4244,24 +3488,18 @@ final class CompanionManager: ObservableObject {
                 with: "。",
                 options: .regularExpression
             )
-            // Whatever is left of a break, which is one a reply opened with: a full stop before
-            // the first word is not a pause the model asked for.
+            // Whatever is left of a break, which is one a reply opened with: a full stop before the first
+            // word is not a pause the model asked for.
             .replacingOccurrences(of: #"\n+"#, with: "", options: .regularExpression)
             // Removing a tag leaves the spaces that used to sit either side of it facing.
             .replacingOccurrences(of: " +", with: " ", options: .regularExpression)
-            // Deleting a tag written mid-sentence with the same mark on both sides of it makes the two
-            // meet and read "。。", so an adjacent repeat of a mark never legitimately doubled is
-            // collapsed. ！ and ？ are left alone because "！！" is deliberate.
+            // A tag deleted from between two identical marks makes them meet and read "。。", so an
+            // adjacent repeat never legitimately doubled is collapsed. ！ and ？ are left alone.
             .replacingOccurrences(of: #"([。，、])\1"#, with: "$1", options: .regularExpression)
     }
 
-    /// Maps an offset recorded while assembling the raw text onto the tidied text that actually gets
-    /// spoken.
-    ///
-    /// The tidy passes delete characters, so an offset recorded before them drifts forward — and these
-    /// offsets are the points where the narration pauses for the cursor, so one that has slipped past
-    /// its sentence leaves the cursor flying only after the model has finished describing the element.
-    /// Re-running the same tidy over the raw text preceding the offset keeps one copy of the rules.
+    /// Maps an offset recorded while assembling the raw text onto the tidied text that is spoken. The tidy passes
+    /// delete characters, so a recorded offset drifts forward, and one that slipped past its sentence would delay the cursor past the model's description.
     private static func tidiedOffset(forRawOffset rawOffset: Int, inRawText rawText: String, leadingWhitespaceUTF16UnitCount: Int) -> Int {
         let rawTextUTF16View = rawText.utf16
         let clampedRawOffset = min(max(rawOffset, 0), rawTextUTF16View.count)
@@ -4271,12 +3509,8 @@ final class CompanionManager: ObservableObject {
         return max(0, tidiedPrefixUTF16UnitCount - leadingWhitespaceUTF16UnitCount)
     }
 
-    /// Picks which of this turn's captures a point tag refers to: the screen the model named by number,
-    /// or the screen the cursor is on when it named none — and also when it named one that is not
-    /// connected any more.
-    ///
-    /// Returns a position rather than the capture because what comes back from the screen is keyed by
-    /// that position.
+    /// Picks which of this turn's captures a point tag refers to: the screen the model named by number, the
+    /// cursor's screen when it named none or named one no longer connected. A position, because the answer is keyed by it.
     private static func screenIndex(forScreenNumber screenNumber: Int?, among screenCaptures: [CompanionScreenCapture]) -> Int? {
         if let screenNumber, screenNumber >= 1, screenNumber <= screenCaptures.count {
             return screenNumber - 1
@@ -4284,25 +3518,15 @@ final class CompanionManager: ObservableObject {
         return screenCaptures.firstIndex(where: { $0.isCursorScreen })
     }
 
-    /// The position of the screen somebody else named, or nil when there is no such screen.
-    ///
-    /// A refusal rather than a fallback, which is the whole difference between this and the function
-    /// above: the model's own `:screenN` falls back to the cursor's screen because a reply should not
-    /// fail over a number written wrong, while a terminal named a screen it wants and would otherwise
-    /// be answered about a different one without being told.
+    /// The position of the screen somebody else named, or nil when there is no such screen. A refusal rather than
+    /// a fallback — the difference from the function above: answering about a different screen without saying so is the alternative.
     private static func checkedScreenIndex(forScreenNumber screenNumber: Int, among screenCaptures: [CompanionScreenCapture]) -> Int? {
         guard screenNumber >= 1, screenNumber <= screenCaptures.count else { return nil }
         return screenNumber - 1
     }
 
-    /// The coordinate to fly to for a stop — the centre of the on-screen text the model named, or the
-    /// model's own coordinate when it named something with no text there — together with the rectangle
-    /// that coordinate came from.
-    ///
-    /// The model's coordinate is a starting point rather than an answer: it reads a recognizable shape
-    /// off an image essentially exactly, but a position it has to measure it estimates, and it estimates
-    /// badly. What it can say reliably is what the thing is called, and the screen can say exactly where
-    /// that is.
+    /// The coordinate to fly to for a stop — the centre of the on-screen text the model named, or the model's own
+    /// coordinate when none is there — with the rectangle it came from. That coordinate is a hint, not an answer: the model reads shapes exactly but estimates positions badly.
     private static func preciseScreenshotCoordinate(
         forModelScreenshotCoordinate modelScreenshotCoordinate: CGPoint,
         elementLabel: String?,
@@ -4323,14 +3547,13 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Converts a coordinate the model read off a screenshot into the global screen location the
-    /// cursor overlay flies to, along with the display frame it is on.
+    /// Converts a coordinate the model read off a screenshot into the global screen location the cursor
+    /// overlay flies to, along with the display frame it is on.
     private static func screenLocation(
         forScreenshotCoordinate screenshotCoordinate: CGPoint,
         on screenCapture: CompanionScreenCapture
     ) -> (screenLocation: CGPoint, displayFrame: CGRect) {
-        // The screen's pixel space (top-left origin, e.g. 1280x800), then scale to the display's point
-        // space (e.g. 1440x900), then convert to AppKit global coords.
+        // The screenshot's pixel space, scaled to the display's point space, then AppKit's global coords.
         let screenshotWidth = CGFloat(screenCapture.screenshotWidthInPixels)
         let screenshotHeight = CGFloat(screenCapture.screenshotHeightInPixels)
         let displayWidth = CGFloat(screenCapture.displayWidthInPoints)
@@ -4357,36 +3580,23 @@ final class CompanionManager: ObservableObject {
         return (screenLocation: globalLocation, displayFrame: displayFrame)
     }
 
-    /// Clears the last reply out of the way and gets ready to receive a new one.
-    ///
-    /// Called before the request goes out, not after it returns, because the reply is spoken while it is
-    /// still arriving — the first chunk carrying a finished clause is handed to the voice from inside the
-    /// streaming callback, so there is no single moment afterwards at which the whole reply could be set
-    /// up at once. The narration still paces the tour rather than the other way round.
-    ///
-    /// The panel keeps showing the spinner across this, which is what the user is owed for a wait on
-    /// the model: the new turn's facts are already armed by the caller, so the state they derive is
-    /// the one that was showing a moment ago.
+    /// Clears the last reply out of the way before the request goes out — a reply is spoken while it is still
+    /// arriving, so there is no moment afterwards at which it could be set up. The panel keeps showing the
+    /// spinner across this: the caller has already armed the new turn's facts.
     private func beginStreamingReply(
         screenCaptures: [CompanionScreenCapture],
         recognizedTextLinesTasks: [Task<[RecognizedTextLine], Never>]
     ) {
         endPointingTour()
 
-        // The step before this one may still be being spoken — a step whose screen work is done is
-        // handed to the model at once rather than waiting for the voice, and its audio queues behind
-        // whatever is still playing. So the narration is written off here only when nothing is left
-        // of it: writing it off unconditionally would drop audio still owed and cut the last
-        // sentence of the step before this one short. Nothing else discards it either, for the same
-        // reason — the prepared audio is one queue for the whole turn.
+        // The step before this one may still be being spoken: a step whose screen work is done is handed to the
+        // model at once, and its audio queues behind what is still playing. So the narration is written off only when nothing is left of it.
         if !isSpeakingReply, !isWaitingForTheFirstSoundOfTheReply {
-            // `false` because this runs inside the new turn, not at the end of the old one: the
-            // caller has already armed this turn's facts.
+            // `false` because this runs inside the new turn: the caller has already armed its facts.
             abandonSpeakingReply(settlingTheVoiceState: false)
         }
 
-        // Whatever was said up to here belongs to the steps before this one. The list is the turn's,
-        // and this is the offset that reads this step's own indices at the right place in it.
+        // Said up to here belongs to the steps before this one: where this step's indices start.
         speechSegmentCountBeforeTheStepNowStreaming = speechSegmentsOfTheTurnBeingSpoken.count
 
         streamingReplySegmenter = StreamingReplySegmenter(
@@ -4394,88 +3604,67 @@ final class CompanionManager: ObservableObject {
             recognizedTextLinesTasks: recognizedTextLinesTasks
         )
         isPointingTourActive = false
-        // The turn that just ended has been written into the history by whoever ended it; this
-        // is where the next turn's own record starts.
+        // The last turn was written into the history by whoever ended it; the next turn starts here.
         hasWrittenTheCurrentTurnIntoHistory = false
 
         // A length from the last turn is not this turn's, and two replies of the same length would
-        // otherwise leave the terminal with the first chunk of this one missing.
+        // otherwise leave the terminal with this one's first chunk missing.
         rawReplyUTF16CountLastSentToTerminal = -1
     }
 
-    /// Feeds the reply as far as it has been written to the segmenter, and acts on what that settled.
-    ///
-    /// Awaited from inside the streaming callback, which puts it on the critical path of reading the
-    /// response — so the one thing it can wait on is screen text recognition, which is started before
-    /// the request goes out for exactly that reason.
+    /// Feeds the reply as far as it has been written to the segmenter, and acts on what that settled. Awaited
+    /// from inside the streaming callback, so it is on the critical path of reading the response; the one thing
+    /// it may wait on is recognition, started before the request for exactly that reason.
     private func absorbStreamedReplyText(
         _ accumulatedRawText: String,
         fromTurnIdentifiedBy turnIdentifier: UUID
     ) async {
-        // Cancelling a task stops it delivering, but not instantly and not as a promise: the read can be
-        // suspended in its `await` and resume with one more chunk after the next turn has begun, and the
-        // turn's identity is the only thing that tells the two apart.
+        // Cancelling a task stops it delivering, but not instantly: the read can be suspended in its `await` and
+        // resume with one more chunk after the next turn has begun, and the turn's identity is the only thing that tells the two apart.
         guard turnIdentifier == turnIdentifierOfTheReplyBeingStreamed else { return }
         guard let streamingReplySegmenter else { return }
 
         let ingest = await streamingReplySegmenter.absorb(accumulatedRawText: accumulatedRawText)
 
-        // Asked of the segmenter rather than read off the ingest, because the early-out means most
-        // chunks produce none — and `absorb` records what arrived before it decides, so this is the
-        // reply as it stands either way. Gated on a terminal actually watching: the answer costs a
-        // full parse of the whole reply, which is the very thing the early-out exists to skip.
+        // Gated on a terminal actually watching: the answer costs a full parse of the whole reply, which
+        // is the very thing the early-out exists to skip.
         if commandSocketServer.hasATerminalWatchingTheReply {
             sendTheReplyAsItStandsToTheTerminal(accumulatedRawText: accumulatedRawText)
         }
 
-        // A skipped pass applies nothing: everything `applyStreamedReplyIngest` does is a
-        // function of what a full pass changes, and here nothing changed.
+        // A skipped pass applies nothing: everything `applyStreamedReplyIngest` does is a function of what
+        // a full pass changes, and none of it changed.
         guard let ingest else { return }
 
         applyStreamedReplyIngest(ingest)
     }
 
-    /// The reply has stopped arriving; everything still held is released.
-    ///
-    /// Until it runs the last segment is withheld, so a reply whose finalised segments have all been
-    /// spoken is still waiting here rather than finishing.
+    /// The reply has stopped arriving; everything still held is released. Until it runs the last segment
+    /// is withheld, so a reply whose finalised segments have all been spoken still waits here.
     private func concludeStreamedReply(fullRawText: String, fromTurnIdentifiedBy turnIdentifier: UUID) async {
-        // The same identity check as `absorbStreamedReplyText`, and it matters more: a stale turn
-        // reaching this line would declare the *new* reply complete and release its last segment early.
+        // The same identity check as `absorbStreamedReplyText`, and it matters more: a stale turn reaching
+        // this line would declare the *new* reply complete and release its last segment early.
         guard turnIdentifier == turnIdentifierOfTheReplyBeingStreamed else { return }
         guard let streamingReplySegmenter else { return }
 
         isReplyStreamComplete = true
         let ingest = await streamingReplySegmenter.conclude(accumulatedRawText: fullRawText)
 
-        // Cannot be left to the teardown that runs when the next question arrives: that teardown reads
-        // the history before the reply it replaces could have been added, so every reply would reach the
-        // model one turn late.
-        //
-        // And it goes before the ingest is applied rather than after, because applying it is one of the
-        // things that can finish the step — and a step that has moved on has already replaced the record
-        // of which question is being answered, so a write after it would file this reply under the next
-        // step's prompt, or drop it for being empty against a segmenter that has just been reset.
+        // Cannot be left to the teardown a new question performs — that reads the history before the reply it
+        // replaces could have been added, so every reply arrives a turn late — and must precede the ingest, which can end the step.
         writeTheCurrentTurnIntoHistory(interruption: nil)
 
         applyStreamedReplyIngest(ingest)
 
-        // The end of the stream is one of the four things that can finish a step, and for a reply that
-        // asked for nothing and pointed at nothing it is the only one: no action will report back and
-        // no tour will run out of stops.
+        // The end of the stream is one of the things that can finish a step, and for a reply that asked
+        // for nothing it is the only one: no action will report back and no tour runs out of stops.
         finishTheStepIfEverythingItAskedForIsDone()
     }
 
-    /// The whole of what one step asked for is done, so the turn either takes another step or ends.
-    ///
-    /// Three things finish a step and they finish at different times: the reply stops arriving, the
-    /// cursor runs out of stops to visit, and the last action reports what it did. Any of the three
-    /// can be the last, so all three call this — and the voice is deliberately not one of them: it
-    /// stops speaking long after the screen work is done, and a step that waited for it would sit
-    /// idle through its whole last sentence before asking the model anything.
-    ///
-    /// A step with no actions at all satisfies the count trivially, which is the common case: most
-    /// replies act on nothing, and those close out on the first call.
+    /// The whole of what one step asked for is done, so the turn either takes another step or ends. Its three finishers
+    /// finish at different times — the reply stops arriving, the cursor runs out of stops to visit, the last action
+    /// reports — so any of the three can be last and all three call this. The voice is not one of them: a step that
+    /// waited for it would sit idle through its last sentence before asking the model anything. A step with no actions satisfies the count trivially, the common case.
     private func finishTheStepIfEverythingItAskedForIsDone() {
         guard !stepInProgress.hasBeenClosedOut else { return }
         guard isReplyStreamComplete,
@@ -4489,20 +3678,16 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // The next step is asked for even while the step before it is still being spoken, so the
-        // narration of the two runs as one: this step's segments are appended to the turn's list,
-        // which is what lets the voice finish its last sentence and go straight on into this step's
-        // first one. Nothing is cut and nothing waits for anything but the audio itself.
+        // The next step is asked for even while the step before it is still being spoken, so the two runs
+        // of narration are one: this step's segments are appended to the turn's list, never replacing it.
         if isSpeakingReply, !isWaitingForTheFirstSoundOfTheReply {
             print("Step \(numberOfStepsStartedInTheTurnBeingAnswered) starts with \(speechSegmentsOfTheTurnBeingSpoken.count - currentSpeechSegmentIndex) segment(s) of narration still owed")
         }
 
         stepInProgress.hasBeenClosedOut = true
 
-        // A blank line between two steps of one turn, because the terminal renders what it is sent as
-        // they arrive: without one, a step's last sentence and the next step's first run together into
-        // a paragraph nobody wrote. The separator rides on the step that ended rather than on the one
-        // that follows, so the last step of a turn is not left with a trailing gap.
+        // A blank line between two steps: the terminal renders what it is sent as it arrives, so a step's last
+        // sentence and the next step's first would otherwise run together. It rides on the step that ended, so the turn's last step carries no trailing gap.
         let spokenTextOfTheStepThatJustEnded = spokenTextOfTheStepInProgress
         if !spokenTextOfTheStepThatJustEnded.isEmpty {
             spokenTextOfTheStepsBeforeTheOneInProgress += spokenTextOfTheStepThatJustEnded + "\n\n"
@@ -4515,11 +3700,8 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// What the step in progress has been heard to say, read freshly rather than off a stored copy.
-    ///
-    /// `spokenText` is only as fresh as the last full pass, and the passes that were skipped are
-    /// exactly the chunks the early-out bought — so anything assembling the turn's text asks the
-    /// segmenter, the same way the history write does.
+    /// Read freshly rather than off a stored copy: the passes the early-out skipped are exactly the chunks
+    /// `spokenText` is behind by.
     private var spokenTextOfTheStepInProgress: String {
         streamingReplySegmenter?.spokenTextAsItStands() ?? ""
     }
@@ -4528,9 +3710,8 @@ final class CompanionManager: ObservableObject {
     private var shouldTheTurnTakeAnotherStep: Bool {
         guard hasTheModelAskedToLookAgain else { return false }
 
-        // A step whose every action was refused or failed has left the screen exactly as the
-        // screenshot that reply was written against, so another look would come back with the same
-        // picture and earn the same reply — a loop with nothing moving in it.
+        // A step whose every action was refused or failed left the screen as the screenshot its reply was
+        // written against, so another look earns the same reply — a loop with nothing moving in it.
         guard stepInProgress.didAnyActionReachTheScreen else {
             print("Step asked to look again but nothing on the screen changed — the turn ends here.")
             return false
@@ -4544,18 +3725,14 @@ final class CompanionManager: ObservableObject {
         return true
     }
 
-    /// Ends the turn as far as the terminal watching it is concerned.
-    ///
-    /// Deferred to here rather than sent when the stream stops, because the turn is not over when the
-    /// model stops writing — it is over when the cursor has finished acting on what it wrote. The
-    /// snapshot is the whole turn's text, every step of it, so what the terminal has been reading
-    /// only ever grows.
+    /// Ends the turn as far as the watching terminal is concerned. Deferred rather than sent when the stream stops: the
+    /// turn is over when the cursor finishes acting, not when the model stops writing. The snapshot is the whole turn, so what it read only grows.
     private func closeOutTheTurnBeingAnswered() {
         guard !hasClosedOutTheTurnBeingAnswered else { return }
         hasClosedOutTheTurnBeingAnswered = true
 
-        // The round stops running here, and its last step is already on the record — so the prompt
-        // is nothing, because there is no longer a request this reading is being taken ahead of.
+        // The round stops running here, and its last step is already on the record — so the prompt is
+        // nothing, there being no longer a request this reading is taken ahead of.
         refreshTaskProgress(includingThePrompt: "")
 
         let spokenTextOfTheWholeTurn = spokenTextOfTheStepsBeforeTheOneInProgress + spokenTextOfTheStepInProgress
@@ -4566,23 +3743,17 @@ final class CompanionManager: ObservableObject {
         commandSocketServer.send(.done(spokenText: spokenTextOfTheWholeTurn))
     }
 
-    /// Hands a terminal watching the reply the text as it stands, so far.
-    ///
-    /// Skipped while the raw text has not moved, which is most chunks: the answer costs a whole
-    /// re-parse of the reply, and the total arrives only ever growing, so an unchanged length
-    /// means an unchanged answer.
-    ///
-    /// Each snapshot is the whole turn's text and not the current step's, because that is what the
-    /// terminal is promised: an absolute snapshot rather than a delta. A step of a turn is not a turn,
-    /// so a snapshot of the step alone would *shrink* at every step boundary — the text the terminal
-    /// already had would be taken back off the screen.
+    /// Hands a terminal watching the reply the text as it stands, so far. Skipped while the raw text has not moved,
+    /// which is most chunks: the answer costs a whole re-parse, and an unchanged length means an unchanged answer.
+    /// Each snapshot is the whole turn, not the current step — the terminal is promised an absolute snapshot rather
+    /// than a delta, and a step's alone would *shrink* at every step boundary.
     private func sendTheReplyAsItStandsToTheTerminal(accumulatedRawText: String) {
         let accumulatedRawTextUTF16Count = accumulatedRawText.utf16.count
         guard accumulatedRawTextUTF16Count != rawReplyUTF16CountLastSentToTerminal else { return }
         rawReplyUTF16CountLastSentToTerminal = accumulatedRawTextUTF16Count
 
-        // No segmenter is no reply in progress, and an empty snapshot is worse than none at all: it
-        // would take the steps the terminal has already read back off its screen.
+        // No segmenter is no reply in progress, and an empty snapshot is worse than none: it would take
+        // the steps the terminal has already read back off its screen.
         guard streamingReplySegmenter != nil else { return }
 
         commandSocketServer.send(.text(spokenTextSoFar:
@@ -4592,19 +3763,13 @@ final class CompanionManager: ObservableObject {
 
     /// Takes what the segmenter made of the reply so far.
     private func applyStreamedReplyIngest(_ ingest: StreamedReplyIngest) {
-        // The ingest speaks about one step, and this step's segments start at zero — so they are
-        // hung on the end of the turn's list at the offset the step began at rather than replacing
-        // what the steps before it put there. Those are already behind the voice or being spoken;
-        // only this step's own tail is recomputed.
+        // The ingest speaks about one step, numbering its segments from zero, so they are hung on the end
+        // of the turn's list at the offset the step began at: only this step's tail is recomputed.
         var segmentsOfTheWholeTurn = Array(
             speechSegmentsOfTheTurnBeingSpoken.prefix(speechSegmentCountBeforeTheStepNowStreaming)
         )
-        // A segment the step before this one cut carries a range into that step's
-        // `resolvedPointingTourStops` — an array the first tag of this step has just replaced — and
-        // an offset into that step's own text, which is not what the narration's word count is
-        // counting now. Left as it was, a range that happens to fit the new tour reads as "the
-        // narration has reached this stop" and sends the cursor to an element the voice has not come
-        // to yet.
+        // A segment cut by the step before carries a range into that step's `resolvedPointingTourStops`, which this
+        // step's first tag has just replaced. Left as it was, a range fitting the new tour reads as reached and sends the cursor ahead of the voice.
         for index in segmentsOfTheWholeTurn.indices {
             segmentsOfTheWholeTurn[index].stopIndexRange = 0..<0
         }
@@ -4612,21 +3777,18 @@ final class CompanionManager: ObservableObject {
         speechSegmentsOfTheTurnBeingSpoken = segmentsOfTheWholeTurn + ingest.speechSegments
         finalizedSpeechSegmentCount = speechSegmentCountBeforeTheStepNowStreaming
             + ingest.finalizedSpeechSegmentCount
-        // The answer is final when `conclude` runs, and the marker only ever appears once its `]`
-        // has arrived — so a `[LOOK]` cut short by the end of a step reads as no marker rather than
-        // as half of one.
+        // The marker only ever appears once its `]` has arrived, so a `[LOOK]` cut short by the end of a
+        // step reads as no marker rather than as half of one.
         hasTheModelAskedToLookAgain = ingest.hasAskedToLookAgain
 
-        // Handed to the synthesizer whether or not they can be spoken yet: synthesis is what the
-        // streaming design moved into the generation window, so the audio is in hand when it is asked for.
-        // Skipped for a reply nobody will hear, where the synthesis would be waited for and never played.
+        // Handed over whether or not they can be spoken yet: synthesis is what the streaming design moved
+        // into the generation window. Skipped for a reply nobody will hear.
         if isReadingTheReplyAloud {
             for settledSegment in ingest.segmentsToSynthesise {
                 ttsClient.prepareSpeechSegment(
                     spokenText: settledSegment.spokenText,
-                    // The numbering is the turn's, because the audio of the whole turn is one queue
-                    // and `speakPreparedSegment(segmentIndex:)` looks a prepared segment up by this
-                    // number alone — so two steps' first segments must not share one.
+                    // The turn's numbering, not the step's: the whole turn's audio is one queue and
+                    // `speakPreparedSegment(segmentIndex:)` looks a segment up by this number alone.
                     segmentIndex: speechSegmentCountBeforeTheStepNowStreaming + settledSegment.segmentIndex
                 )
             }
@@ -4635,12 +3797,8 @@ final class CompanionManager: ObservableObject {
         if !ingest.newlyResolvedPointingTourStops.isEmpty {
             resolvedPointingTourStops = ingest.allResolvedPointingTourStops
 
-            // The first tag is what makes this a tour.
-            //
-            // Deliberately not a state change: a tag resolving is not a sound. The segment the tag sits in
-            // has not been cut yet, let alone synthesised, so `.idle` here would put the triangle on screen
-            // over a reply with nothing to hear — and `.processing` means "no sound yet", which only the
-            // sound itself may end.
+            // The first tag is what makes this a tour, and it is not a state change — a tag resolving is no sound.
+            // Its segment is not cut yet, let alone synthesised, so `.idle` would show the triangle over a reply with nothing to hear.
             if !isPointingTourActive {
                 isPointingTourActive = true
                 schedulePointingTourStallWatchdog()
@@ -4656,8 +3814,7 @@ final class CompanionManager: ObservableObject {
         }
 
         // Asked on every ingest that ran, because the two events are not the same one: a segment that
-        // became final after the one before it was spoken through has no word and no arrival left to come
-        // back for it, so every event that changes the answer has a call site of its own.
+        // became final after the one before it was spoken through has no word left to come back for it.
         if isSpeakingReply {
             continuePointingTourIfPossible()
         } else {
@@ -4665,10 +3822,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// What one pass over the reply so far settled.
-    ///
-    /// The segments are handed back whole rather than as a delta because they are recomputed from the
-    /// text on every chunk, and a delta would be a second description that could disagree with the first.
+    /// What one pass over the reply so far settled. The segments come back whole rather than as a delta:
+    /// they are recomputed every chunk, and a delta could disagree with the first description.
     private struct StreamedReplyIngest {
         /// Every segment the reply holds so far, recomputed from the text just ingested.
         let speechSegments: [CompanionSpeechSegment]
@@ -4676,8 +3831,7 @@ final class CompanionManager: ObservableObject {
         let finalizedSpeechSegmentCount: Int
         /// The segments that have just become final, with the index each will be spoken under.
         let segmentsToSynthesise: [(segmentIndex: Int, spokenText: String)]
-        /// The stops whose tags have just closed and whose screen locations have just been
-        /// worked out, in the order they must be flown to.
+        /// The stops whose tags have just closed and been resolved, in the order they must be flown to.
         let newlyResolvedPointingTourStops: [ResolvedPointingTourStop]
         /// Every stop resolved so far, in the same order, for the caller's own copy.
         let allResolvedPointingTourStops: [ResolvedPointingTourStop]
@@ -4685,65 +3839,47 @@ final class CompanionManager: ObservableObject {
         let hasAskedToLookAgain: Bool
     }
 
-    /// Cuts the reply into speech segments while it is still being written.
-    ///
-    /// Each chunk is folded into a growing document that is re-parsed from the top — deliberately,
-    /// because the tag parsing, the tidy passes and the sentence scan are one implementation each, and
-    /// this way there is no second, incremental copy of them to drift.
-    ///
-    /// Redoing the work is only sound because every pass between the raw text and the segments is
-    /// prefix-stable: tidying a prefix gives the same characters as tidying the whole and cutting, and so
-    /// does the sentence scan, so a segment cut from an earlier, shorter document is the same segment in
-    /// the longer one. The one approximation is that the tail is provisional, so the cut decisions are
-    /// monotone and the last segment is held back until the text moves past it.
+    /// Cuts the reply into speech segments while it is still being written: each chunk re-parses the growing document
+    /// from the top, one implementation each of the tag parse, the tidy passes and the sentence scan, with no second
+    /// incremental copy to drift. That is only sound because every pass between the raw text and the segments is
+    /// prefix-stable — a segment cut from a shorter document is the same segment in the longer one. The one approximation is the provisional tail, held back until the text moves past it.
     private final class StreamingReplySegmenter {
         private let screenCaptures: [CompanionScreenCapture]
         private let recognizedTextLinesTasks: [Task<[RecognizedTextLine], Never>]
 
-        /// The raw reply as it stands, with any half-written tag dropped off the end.
+        /// The raw reply as it stands, half-written tag dropped off the end.
         private var accumulatedRawText = ""
 
-        /// The reply as the voice will read it, tidied and with every tag stripped. Read after the
-        /// stream ends so the diagnostic record can carry it beside the raw text.
+        /// The reply as the voice will read it, tidied and with every tag stripped.
         private(set) var spokenText = ""
 
-        /// Every tag the model has closed so far, in the order it wrote them. Kept because the diagnostic
-        /// record wants the coordinates before any of this app's arithmetic touched them.
+        /// Every tag the model has closed so far, in the order it wrote them.
         private(set) var parsedTourStops: [CompanionManager.PointingTourStop] = []
 
         private(set) var resolvedPointingTourStops: [CompanionManager.ResolvedPointingTourStop] = []
 
-        /// How many of `parsedTourStops` have been through resolution. Stops are only ever appended, so a
-        /// tag seen on an earlier chunk is never resolved twice.
+        /// How many of `parsedTourStops` have been through resolution; stops are only appended, so none is
+        /// resolved twice.
         private var resolvedTourStopCount = 0
 
-        /// The pieces of on-screen text earlier stops have already been given, one list per screen: a stop
-        /// resolves against the recognition of its own display, so two stops on two displays naming the
-        /// same thing do not compete for one piece of text.
+        /// One list per screen, so two stops on two displays naming the same thing do not compete for one
+        /// piece of text.
         private var claimedTextBoxesPerScreen: [[CGRect]]
 
-        /// How many segments have been handed to the synthesizer; never more than
-        /// `finalizedSpeechSegmentCount`, which only ever grows.
+        /// How many segments have been handed to the synthesizer, never more than
+        /// `finalizedSpeechSegmentCount`.
         private var handedOverSpeechSegmentCount = 0
 
-        /// The raw reply exactly as the last chunk delivered it, half-written tag and all.
-        ///
-        /// Kept beside `accumulatedRawText` because the early-out means most chunks are not folded in, so
-        /// the reply as it stands has to be askable for without a pass having run over it — and the history
-        /// is what asks, at the moment a question replaces the reply.
+        /// The raw reply exactly as the last chunk delivered it, half-written tag and all. Kept beside
+        /// `accumulatedRawText` because the early-out means most chunks are not folded in, and history has to ask for the reply as it stands.
         private var rawTextAsReceived = ""
 
-        /// The raw text as of the last pass that ran the whole pipeline. What arrived since is
-        /// the part the early-out scans.
+        /// The raw text as of the last pass that ran the whole pipeline; what arrived since is the part the
+        /// early-out scans.
         private var rawTextAsOfTheLastFullIngest = ""
 
-        /// Whether one more character arriving on its own could make a finished sentence out of what the
-        /// reply already ends on.
-        ///
-        /// The third of the three things that can change what a pass answers, and the one a scan of the
-        /// arriving characters cannot see: `finalizedSpeechSegmentCount` wants a segment's end *strictly*
-        /// inside the text, so "你好。" has nothing final in it and any next character pushes that end
-        /// inside and hands the sentence to the voice.
+        /// Whether one more character could make a finished sentence out of what the reply already ends on:
+        /// `finalizedSpeechSegmentCount` wants a segment's end *strictly* inside the text, so "你好。" holds nothing final until one arrives.
         private var couldOneMoreCharacterCloseASentence = true
 
         init(
@@ -4755,10 +3891,8 @@ final class CompanionManager: ObservableObject {
             self.claimedTextBoxesPerScreen = Array(repeating: [], count: screenCaptures.count)
         }
 
-        /// Folds in the reply as far as it has been written. The tail stays provisional.
-        ///
-        /// `nil` means what arrived cannot have changed anything the last pass settled. The early-out lives
-        /// here rather than inside `ingest` so that `conclude`, which must never take it, cannot reach it.
+        /// Folds in the reply as far as it has been written; the tail stays provisional. `nil` means what arrived
+        /// cannot have changed anything the last pass settled. The early-out lives here rather than inside `ingest`, which `conclude` must never reach.
         func absorb(accumulatedRawText: String) async -> StreamedReplyIngest? {
             rawTextAsReceived = accumulatedRawText
 
@@ -4773,19 +3907,11 @@ final class CompanionManager: ObservableObject {
             return await ingest(accumulatedRawText: accumulatedRawText, isReplyComplete: true)
         }
 
-        /// Whether the text that has arrived since the last full pass could change what another one would
-        /// answer.
-        ///
-        /// Three things can, and only three. A `]` closes a tag, and a tag is both a stop and a cut. A
-        /// sentence mark moves a sentence boundary, and a comma counts even though it closes no segment —
-        /// it does end a sentence, and one landing after the tail's last word takes the trailing segment
-        /// away. And a reply already sitting on a finished sentence has a segment half-finalised, which is
-        /// the state `couldOneMoreCharacterCloseASentence` needs and the reason this cannot be a pure scan
-        /// of the new characters.
-        ///
-        /// The set scanned for is the wider `sentenceEndingUTF16CodeUnits` rather than the
-        /// `sentenceTerminating` one the cut decisions use, because the question here is whether a boundary
-        /// moved, which a comma does, and the tidy can invent a full stop out of newlines.
+        /// Whether the text that has arrived since the last full pass could change what another one would answer.
+        /// Exactly three things can: a `]` closes a tag, which is both a stop and a cut; a sentence mark moves a boundary,
+        /// and a comma counts although it closes no segment; and a reply already sitting on a finished sentence has a
+        /// segment half-finalised, which is why this cannot be a pure scan. The set scanned for is the wider
+        /// `sentenceEndingUTF16CodeUnits` — the tidy can invent a full stop out of newlines.
         private func couldTheIngestAnswerHaveChanged(withIncomingRawText incomingRawText: String) -> Bool {
             guard !couldOneMoreCharacterCloseASentence else { return true }
 
@@ -4799,31 +3925,23 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        /// The reply as the voice would read it, worked out from the raw text as it stands rather than read
-        /// off the last full pass.
-        ///
-        /// `spokenText` is only as fresh as that pass and the early-out means most chunks do not run one, so
-        /// anything that has to hold *everything* that arrived has to ask afresh. The history is the one
-        /// thing that does.
+        /// The reply as the voice would read it, worked out from the raw text as it stands: `spokenText` is
+        /// only as fresh as the last full pass, and most chunks do not run one — the history asks afresh.
         func spokenTextAsItStands() -> String {
             CompanionManager.parsePointingCoordinates(
                 from: Self.droppingAHalfWrittenTag(from: rawTextAsReceived)
             ).spokenText
         }
 
-        /// The reply as the model wrote it, tags and all.
-        ///
-        /// Beside the spoken text because the two answer different questions: that one is what the model
-        /// said, this one is what it asked for. A tag the parser did not recognise is the one way a step can
-        /// ask to look again and read as having stopped, and it is invisible in the spoken text.
+        /// The reply as the model wrote it, tags and all. A tag the parser did not recognise is the one way
+        /// a step can ask to look again and read as having stopped, and it is invisible in the spoken text.
         func rawTextAsItStands() -> String { rawTextAsReceived }
 
         private func ingest(accumulatedRawText incomingRawText: String, isReplyComplete: Bool) async -> StreamedReplyIngest {
             accumulatedRawText = Self.droppingAHalfWrittenTag(from: incomingRawText)
 
-            // `parsePointingCoordinates` is the whole of the post-processing a reply gets, and calling it
-            // rather than reimplementing it is the point: it strips every tag, computes each stop's
-            // sentence offset, and tidies the result — all of them prefix-stable.
+            // `parsePointingCoordinates` is the whole of the post-processing a reply gets: it strips every tag,
+            // computes each stop's sentence offset, and tidies the result — all of them prefix-stable.
             let parseResult = CompanionManager.parsePointingCoordinates(from: accumulatedRawText)
             spokenText = parseResult.spokenText
             parsedTourStops = parseResult.tourStops
@@ -4849,8 +3967,8 @@ final class CompanionManager: ObservableObject {
                 }
             handedOverSpeechSegmentCount = finalizedSpeechSegmentCount
 
-            // The raw text is recorded whole, half-written tag and all, because it is the next
-            // pass's own input that the arriving part is measured against.
+            // The raw text is recorded whole, half-written tag and all, because it is the next pass's own
+            // input that the arriving part is measured against.
             rawTextAsOfTheLastFullIngest = incomingRawText
             couldOneMoreCharacterCloseASentence =
                 spokenText.utf16.last.map { CompanionManager.sentenceTerminatingUTF16CodeUnits.contains($0) } ?? true
@@ -4865,10 +3983,8 @@ final class CompanionManager: ObservableObject {
             )
         }
 
-        /// Turns the tags that have closed since the last pass into screen locations.
-        ///
-        /// The one thing on this path that can take a moment is screen text recognition, and it was started
-        /// before the request went out, so it has almost always finished by the time a tag is written.
+        /// Turns the tags that have closed since the last pass into screen locations. The one slow thing is
+        /// screen text recognition, started before the request went out, so it is almost always finished.
         private func resolveNewTourStops(startingAt firstUnresolvedStopIndex: Int) async {
             guard firstUnresolvedStopIndex < parsedTourStops.count else { return }
 
@@ -4888,8 +4004,8 @@ final class CompanionManager: ObservableObject {
                     avoidingBoxesClaimedByEarlierStopsOnTheSameScreen: claimedTextBoxesPerScreen[screenIndex]
                 )
                 let screenshotCoordinate = precisePosition.coordinate
-                // Only a stop that resolved against the screen has text to claim; one that fell
-                // back to the model's own coordinate matched nothing.
+                // Only a stop that resolved against the screen has text to claim; one that fell back to the
+                // model's own coordinate matched nothing.
                 if let matchedTextBox = precisePosition.matchedTextBox {
                     claimedTextBoxesPerScreen[screenIndex].append(matchedTextBox)
                 }
@@ -4898,9 +4014,8 @@ final class CompanionManager: ObservableObject {
                     forScreenshotCoordinate: screenshotCoordinate,
                     on: screenCapture
                 )
-                // A drag's destination is converted against the same capture the starting point was
-                // — `screenCapture`, the one the stop's own `:screenN` picked — so the two ends of
-                // one movement cannot land on two different displays.
+                // A drag's destination is converted against the same capture the starting point was, so the
+                // two ends of one movement cannot land on two different displays.
                 let dragDestinationScreenLocation = tourStop.dragDestinationScreenshotCoordinate.map {
                     CompanionManager.screenLocation(forScreenshotCoordinate: $0, on: screenCapture).screenLocation
                 }
@@ -4919,15 +4034,8 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        /// How many of the segments the model can no longer change.
-        ///
-        /// The segments tile the text in order, so that is every segment but the last one, if the last one
-        /// is where the text stops. It is a count rather than a flag because the caller needs the ones that
-        /// have just crossed the line, not those handed over earlier.
-        ///
-        /// Only the sentence the tail belongs to can be rewritten by a later chunk, which is what makes
-        /// this safe: a segment ending before the text does cannot be extended, merged with the next, or
-        /// lose its place to a tag not yet written.
+        /// How many of the segments the model can no longer change: every one but the last, if the last is where
+        /// the text stops. A count, not a flag: the caller needs the ones that have just crossed the line.
         private static func finalizedSpeechSegmentCount(
             in speechSegments: [CompanionSpeechSegment],
             spokenTextUTF16UnitCount: Int,
@@ -4939,22 +4047,13 @@ final class CompanionManager: ObservableObject {
             }.count
         }
 
-        /// Drops a tag the model is part-way through writing.
-        ///
-        /// A tag that has not closed is not a tag to the parser — it is ordinary characters, and the
-        /// punctuation inside it is read as punctuation the model wrote, so a chunk ending in
-        /// `[POINT:322,192:已发表。` would cut a segment at that full stop and have the voice read the
-        /// half-written tag out.
-        ///
-        /// The cut is at the *first* bracket that is never closed, not the last, which is what makes this
-        /// safe on every chunk of a growing document: text that only grows can only close brackets, so the
-        /// set of never-closed ones only shrinks and its smallest element only moves forward. Cutting at
-        /// the last one would let the truncation point move backwards the moment a second `[` was written.
+        /// Drops a tag the model is part-way through writing: an unclosed tag is ordinary characters to the parser, so a
+        /// chunk ending in `[POINT:322,192:已发表。` would cut a segment at that full stop and have the voice read the
+        /// half-written tag out. Cut at the *first* never-closed bracket, not the last: text that only grows can only close brackets, so the last would let the truncation point move backwards on a second `[`.
         private static func droppingAHalfWrittenTag(from accumulatedRawText: String) -> String {
             let codeUnits = Array(accumulatedRawText.utf16)
 
-            // A bracket is unclosed exactly when it sits after the last closing bracket there is,
-            // so the search needs no bracket-matching of its own.
+            // A bracket is unclosed exactly when it sits after the last closing bracket there is.
             let lastClosingBracketOffset = codeUnits.lastIndex(of: UInt16(UInt8(ascii: "]"))) ?? -1
             guard let unclosedBracketOffset = codeUnits[(lastClosingBracketOffset + 1)...]
                 .firstIndex(of: UInt16(UInt8(ascii: "["))) else {
@@ -4964,10 +4063,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Drops any tour in progress, and sends the cursor home with it.
-    ///
-    /// Speech is deliberately left alone: a tour ending says the cursor is finished pointing, not that the
-    /// reply is finished being spoken.
+    /// Drops any tour in progress, and sends the cursor home with it. Speech is left alone: a tour ending
+    /// says the cursor is finished pointing, not that the reply is finished being spoken.
     private func endPointingTour() {
         pointingTourNarrationResumeTimeoutTask?.cancel()
         pointingTourNarrationResumeTimeoutTask = nil
@@ -4987,19 +4084,15 @@ final class CompanionManager: ObservableObject {
         lastNarrationProgressDate = nil
         lastPointingTourStopArrivalDate = nil
         shouldReturnBuddyToCursorAfterPointing = false
-        // The tour going away is one of the ways the cursor stops having anything left to do about
-        // the segment being spoken, and the wait the panel shows on the step now streaming is
-        // settled by it.
+        // The tour going away is one of the ways the cursor stops having anything left to do about the
+        // segment being spoken, and the wait the panel shows on the step now streaming is settled by it.
         settleVoiceState()
-        // No stop is left to be pressed, so the press is withdrawn from the target the cursor is
-        // standing on. Only that field: clearing the target outright would read as a flight to nil.
+        // No stop is left to be pressed, so the press is withdrawn from the target the cursor is standing
+        // on. Only that field: clearing the target outright would read as a flight to nil.
         pointingTarget?.actionToPerformOnArrival = nil
 
-        // The tour was the only thing holding the cursor out there, and the return-home timeout that
-        // would have brought it back is one of the things cancelled above. A cursor left standing on
-        // the last stop is a cursor still holding the user's pointer, so the visit ends with the tour.
-        // Reached mid-run, not only at the end of one: a step's screen work being done is followed
-        // within the timeout by the next step's request, which is what cancels it.
+        // The tour was the only thing holding the cursor out there, and the return-home timeout is cancelled
+        // above: a cursor left on the last stop still holds the user's pointer, so the visit ends with the tour. Reached mid-run, not only at a tour's end.
         if pointingTarget != nil {
             requestBuddyReturnHome()
         }
@@ -5013,8 +4106,8 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Speaking The Reply One Segment At A Time
 
-    /// The stops the segment being spoken names, as a range into `resolvedPointingTourStops`.
-    /// Empty once every segment has been spoken.
+    /// The stops the segment being spoken names, as a range into `resolvedPointingTourStops`. Empty once
+    /// every segment has been spoken.
     private var currentSpeechSegmentStopIndexRange: Range<Int> {
         guard currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count else {
             return resolvedPointingTourStops.count..<resolvedPointingTourStops.count
@@ -5022,30 +4115,26 @@ final class CompanionManager: ObservableObject {
         return speechSegmentsOfTheTurnBeingSpoken[currentSpeechSegmentIndex].stopIndexRange
     }
 
-    /// Where in the reply's spoken text the segment being spoken starts, which is what converts
-    /// the voice's own offsets back into positions in the reply.
+    /// Where in the reply's spoken text the segment being spoken starts, which is what converts the voice's
+    /// own offsets back into positions in the reply.
     private var currentSpeechSegmentStartOffsetInSpokenText: Int {
         guard currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count else { return 0 }
         return speechSegmentsOfTheTurnBeingSpoken[currentSpeechSegmentIndex].startOffsetInSpokenText
     }
 
-    /// How much longer the cursor has to stay on the stop it landed on before it may leave.
-    /// Zero once the minimum dwell has been served, and zero when it has not landed on anything.
+    /// How much longer the cursor has to stay on the stop it landed on before it may leave. Zero once the
+    /// minimum dwell has been served, and zero when it has not landed on anything.
     private var remainingPointingTourStopDwellSeconds: Double {
         guard let lastPointingTourStopArrivalDate else { return 0 }
         return minimumPointingTourStopDwellSeconds - Date().timeIntervalSince(lastPointingTourStopArrivalDate)
     }
 
-    /// Moves the reply forward as far as it can go right now.
-    ///
-    /// Everything that could change the answer runs through here — a word spoken, a segment spoken through,
-    /// the cursor landing, a dwell running out — because the two halves of the coordination are one
-    /// question asked in a fixed order: the cursor has first refusal on every word, and only once it is
-    /// finished with the current segment is the next one handed over.
+    /// Moves the reply forward as far as it can go right now. Everything that could change the answer runs through
+    /// here — a word, a segment spoken through, the cursor landing, a dwell running out — one question in a fixed
+    /// order: the cursor has first refusal on every word, and only once it is done is the next segment handed over.
     private func continuePointingTourIfPossible() {
-        // Settled here because the cursor's half of the question is not only answered by writes: a
-        // stop's dwell runs out on its own, and this call is the only thing that hears about it. The
-        // wait the panel shows on the step now streaming begins and ends on what this call decides.
+        // Settled here because the cursor's half of the question is not only answered by writes: a stop's
+        // dwell runs out on its own, and this call is the only thing that hears about it.
         settleVoiceState()
         if let pointingTourStopTheNarrationHasReached = stopTheNarrationHasReachedInCurrentSpeechSegment() {
             startFlightToPointingTourStop(pointingTourStopTheNarrationHasReached)
@@ -5054,16 +4143,8 @@ final class CompanionManager: ObservableObject {
         advanceSpeechIfPossible()
     }
 
-    /// The stop the narration has got as far as naming in the segment being spoken, or nil when it names
-    /// none the cursor has not already been sent to.
-    ///
-    /// Every stop a segment names sits in its last sentence, which is what lets one test cover them all,
-    /// and the comparison is one-sided: a stop whose trigger went by while a flight was in the air is
-    /// picked up by the next word rather than skipped.
-    ///
-    /// A segment spoken through counts as having reached its stops whether or not a word callback said so,
-    /// because being spoken through means it was heard and the synthesizer genuinely skips reporting those
-    /// words. So does a narration that has gone silent, where no word is coming at all.
+    /// The stop the narration has got as far as naming in the segment being spoken, or nil when it names none the
+    /// cursor has not already been sent to. A segment spoken through has reached its stops whether or not a word callback said so.
     private func stopTheNarrationHasReachedInCurrentSpeechSegment() -> ResolvedPointingTourStop? {
         guard isPointingTourActive,
               !isFlyingToPointingTourStop,
@@ -5080,31 +4161,20 @@ final class CompanionManager: ObservableObject {
         return pointingTourStop
     }
 
-    /// Speaks the next segment if both sides are ready for it.
-    ///
-    /// The words are the first half: a segment not spoken through has nothing to release. The cursor is the
-    /// second, and it is the one that makes the reply wait — until it has stood on the element for its
-    /// minimum dwell, the next segment is simply never handed to the voice.
-    ///
-    /// A silent narration is waited out here rather than short-circuited, because the report this needs is
-    /// not the one it stopped sending: the voice that reports no words still reports the segment finished,
-    /// audio or none, and releasing on the words alone would cut a segment off mid-sentence.
+    /// Speaks the next segment if both sides are ready for it: the words, which a segment not spoken through has nothing
+    /// to release, and the cursor, which is the half that makes the reply wait — the next segment is never handed to the
+    /// voice before the dwell on the element has been served. A silent narration is waited out rather than short-circuited: a voice reporting no words still reports the segment finished, and releasing on the words alone would cut a segment off mid-sentence.
     private func advanceSpeechIfPossible() {
         guard isSpeakingReply, hasCurrentSpeechSegmentFinishedSpeaking else { return }
         guard hasPointerFinishedWithCurrentSpeechSegment() else { return }
 
-        // The spoken-through flag answers for the segment the index is standing on, and only a segment
-        // that is actually handed to the voice clears it — so the index moves onto a segment that has
-        // been cut, and never onto one the model is still writing. Stepped onto one of those,
-        // `speakCurrentSpeechSegment` returns before it clears the flag, the next chunk reads the flag
-        // as "the segment after this one has been said" and steps over that one as well, and the index
-        // goes on tracking the tip of the list: the rest of the step is never spoken, and every stop
-        // the missed segments named is never visited.
+        // The index may only move onto a segment already cut, never onto one the model is still writing:
+        // `speakCurrentSpeechSegment` returns without clearing the flag for that one, the next chunk reads the stale
+        // flag as "said" and steps over it too, and the index tracks the tip of the list — the rest of the step is never spoken.
         let indexAfterTheCurrentSegment = currentSpeechSegmentIndex + 1
         let isThereACutSegmentToMoveOnTo = indexAfterTheCurrentSegment < finalizedSpeechSegmentCount
-        // The one move that is not onto a segment is the ending, and it is the ending only once the
-        // model has stopped writing this step: the end of a step's segments is an empty waiting room
-        // while a step after it may still be writing more of the turn.
+        // The one move that is not onto a segment is the ending, and only once the model has stopped
+        // writing this step: the end of a step's segments is an empty waiting room for a step after it.
         let isTheStreamDoneAndThisWasTheLastSegment =
             isReplyStreamComplete && indexAfterTheCurrentSegment >= speechSegmentsOfTheTurnBeingSpoken.count
         guard isThereACutSegmentToMoveOnTo || isTheStreamDoneAndThisWasTheLastSegment else { return }
@@ -5124,18 +4194,12 @@ final class CompanionManager: ObservableObject {
         return remainingPointingTourStopDwellSeconds <= 0
     }
 
-    /// Hands the current segment to the voice, or ends the reply when there are none left.
-    ///
-    /// Returning immediately is deliberate: this is reached from inside the voice's own callbacks, and
-    /// waiting there for the next segment to be spoken through would block the callback that would have
-    /// said it had been.
-    ///
-    /// Two waits meet here: `finalizedSpeechSegmentCount`, so a segment the model may still be writing is
-    /// never handed over, and the one inside the TTS client for a segment whose synthesis has not finished.
+    /// Hands the current segment to the voice, or ends the reply when there are none left. Returning immediately
+    /// is deliberate: this is reached from inside the voice's own callbacks, and waiting would block the callback that says the segment is through.
     private func speakCurrentSpeechSegment() {
         guard currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count else {
-            // Reaching the end of the segments is not the end of the turn while a step after this
-            // one may still be writing them — it is an empty waiting room.
+            // The end of the segments is not the end of the turn while a step after this one may still be
+            // writing them — it is an empty waiting room.
             guard isReplyStreamComplete else { return }
             finishSpeakingReply()
             return
@@ -5146,29 +4210,20 @@ final class CompanionManager: ObservableObject {
 
         hasCurrentSpeechSegmentFinishedSpeaking = false
         lastSpokenWordEndOffsetInCurrentSpeechSegment = 0
-        // The narration's position is counted in the text of the step that text belongs to, and a
-        // step's stops carry offsets into that same text, so the two are comparable only inside one
-        // step. This step's first segment is the only place the position can still be the step
-        // before it's — and the comparison it would lose is not a near miss: the step before it's
-        // whole narration outweighs an offset near the start of this step's text, so the stop reads
-        // as reached and the cursor flies to an element the voice has not come to. Restated here,
-        // the first word reported in this step's own space takes it from zero.
+        // The narration's position counts the text of the step it belongs to, so it is comparable only inside one
+        // step: this step's first segment is the one place it can still be the step before's, and not a near miss — a stop would read as reached.
         if speechSegmentIndex == speechSegmentCountBeforeTheStepNowStreaming {
             lastNarrationWordEndOffsetInSpokenText = 0
         }
         isSpeakingReply = true
-        // `voiceState` follows from that write alone: a segment handed over is not yet a sound, so a
-        // reply still waiting for its first one stays `.processing` — see `voiceStateTheFactsSupport`.
+        // `voiceState` follows from that write alone: a segment handed over is not yet a sound, so a reply
+        // still waiting for its first one stays `.processing` — see `voiceStateTheFactsSupport`.
 
         guard isReadingTheReplyAloud else {
-            // Nothing was handed to a voice, so no callback will ever report this segment spoken
-            // through and the tour would wait on a word that is not coming. The cursor paces the
-            // reply instead: the segment counts as spoken through the moment it is reached, and the
-            // stops it names are visited one at a time, each held for its dwell.
-            //
-            // Not wrapped in a `Task` like the branch below: there is nothing to await here, and a
-            // hop would make this and the `continuePointingTourIfPossible()` at the end of
-            // `applyStreamedReplyIngest` land in an unpredictable order.
+            // Nothing was handed to a voice, so no callback will ever report this segment spoken through and the tour would
+            // wait on a word that is not coming. It counts as spoken through the moment it is reached, and the cursor becomes
+            // the only thing pacing the tour. Not wrapped in a `Task`: there is nothing to await, and a hop would put this and
+            // the `continuePointingTour…` call at the end of `applyStreamedReplyIngest` in an unpredictable order.
             markCurrentSpeechSegmentAsSpokenThrough()
             return
         }
@@ -5176,26 +4231,19 @@ final class CompanionManager: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.ttsClient.speakPreparedSegment(segmentIndex: speechSegmentIndex)
-            // The index is re-checked because a reply that arrived in the meantime has taken the
-            // voice, and this segment is no longer part of what is being said.
+            // Re-checked because a reply that arrived in the meantime has taken the voice, and this
+            // segment is no longer part of what is being said.
             guard self.isSpeakingReply, self.currentSpeechSegmentIndex == speechSegmentIndex else { return }
-            // Armed once per step, on its first segment: it asks whether this voice has said
-            // anything at all, and by the end of the first segment the answer is in. Per step and
-            // not per turn because the answer it reads, `hasNarrationReportedAnyWords`, is cleared
-            // where a step's tour is armed — so the count it asks about starts again at every step.
+            // Per step and not per turn: the count it reads, `hasNarrationReportedAnyWords`, is cleared
+            // where a step's tour is armed.
             if speechSegmentIndex == self.speechSegmentCountBeforeTheStepNowStreaming {
                 self.schedulePointingTourFallbackIfNarrationIsSilent()
             }
         }
     }
 
-    /// Marks the reply as spoken through. Nothing is left for the cursor to wait on, so it takes the same
-    /// route home a single point does.
-    ///
-    /// The turn ends here rather than where the response task's `await` returns, because the reply has
-    /// finished arriving while its segments are still being spoken. Clearing the three facts is what
-    /// returns the panel to 等待中, and it has to happen here: the reply's own arrival is long past, so
-    /// nothing else is left that would.
+    /// Marks the reply as spoken through: nothing is left for the cursor to wait on, so it takes the same route
+    /// home a single point does. The facts are cleared here, not where the response task's `await` returns — nothing else would return the panel to 等待中.
     private func finishSpeakingReply() {
         isSpeakingReply = false
         isWaitingForTheFirstSoundOfTheReply = false
@@ -5205,30 +4253,25 @@ final class CompanionManager: ObservableObject {
         }
         requestBuddyReturnHome()
 
-        // The voice is what holds a step back from being followed by the next one, so the step that
-        // has just become speakable-through is the other half of that join and has to say so.
+        // The step that has just become spoken through is one of the three things the join waits on and
+        // has to say so — though not one of them holds the next request back.
         finishTheStepIfEverythingItAskedForIsDone()
     }
 
-    /// Tells the cursor to come home and resume following, on every screen.
-    ///
-    /// Raised wherever the reply the cursor was pointing for is over, whether it finished, was cut off or
-    /// failed: in all three the cursor has nothing left to stand on, and the state it is in suspends cursor
-    /// tracking entirely.
+    /// Tells the cursor to come home and resume following, on every screen. Raised wherever the reply the cursor
+    /// was pointing for is over — finished, cut off or failed — because all three suspend cursor tracking entirely.
     private func requestBuddyReturnHome() {
         buddyReturnHomeRequestCount += 1
     }
 
-    /// What cut a reply short, and therefore what the history entry says about it.
-    ///
-    /// The two are kept apart because they tell the model different things: one says the user did not want
-    /// to hear the rest, the other says Kiki never finished writing it.
+    /// What cut a reply short, and therefore what the history entry says about it. Kept apart because they tell
+    /// the model different things: one says the user did not want the rest, the other that Kiki never finished writing it.
     private enum ReplyInterruption {
         case theUserStartedANewQuestion
         case theReplyFailedPartWayThrough
 
-        /// Appended to the assistant's half of the entry, in Chinese like the reply the model
-        /// reads back, and on its own paragraph so it cannot be read as part of the sentence before.
+        /// Appended to the assistant's half of the entry, in Chinese like the reply the model reads back,
+        /// and on its own paragraph so it cannot be read as part of the sentence before.
         var markerAppendedToTheHistoryEntry: String {
             switch self {
             case .theUserStartedANewQuestion:
@@ -5239,20 +4282,15 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Writes the turn that is ending into the history the next request is built from.
-    ///
-    /// Called from three places, because a reply can end in three ways that are not the same call stack:
-    /// the reply finishing, the teardown for one the next question cut off, and the `catch` for one that
-    /// failed. `hasWrittenTheCurrentTurnIntoHistory` keeps it to one entry per turn.
-    ///
-    /// What is written is the *spoken* text, with every tag stripped: the raw text carries coordinates read
-    /// off a screenshot that is already gone, and a history full of those teaches the model to point at
-    /// last turn's screen.
+    /// Writes the turn that is ending into the history the next request is built from. Three callers, because a
+    /// reply ends three ways that are not one call stack, with `hasWrittenTheCurrentTurnIntoHistory` keeping it to
+    /// one entry per turn. What is written is the *spoken* text, tags stripped: the raw text's coordinates came off
+    /// a screenshot already gone and would teach the model to point at last turn's screen.
     private func writeTheCurrentTurnIntoHistory(interruption: ReplyInterruption?) {
         guard !hasWrittenTheCurrentTurnIntoHistory else { return }
 
-        // An interrupted reply is recorded as far as it got, and for one cut off before its first word that
-        // is nowhere: an empty assistant message would teach the model that answering with nothing works.
+        // An interrupted reply is recorded as far as it got — nowhere, for one cut off before its first
+        // word: an empty assistant message would teach the model that answering with nothing works.
         let replyAsItStands = streamingReplySegmenter?.spokenTextAsItStands() ?? ""
         guard !replyAsItStands.isEmpty else { return }
         let replyAsTheModelWroteIt = streamingReplySegmenter?.rawTextAsItStands() ?? ""
@@ -5266,10 +4304,8 @@ final class CompanionManager: ObservableObject {
                 + (interruption?.markerAppendedToTheHistoryEntry ?? "")
         ))
 
-        // Where the history is actually bounded by `maximumExchangeCountCarriedInHistory`. Dropped
-        // one entry at a time and never past the turn in progress, so a turn's steps leave together
-        // whatever the count is: cutting at the count alone would evict the question being answered
-        // the moment a search passed fifteen steps, and the rest of the session behind it.
+        // Where `maximumExchangeCountCarriedInHistory` bites. Dropped one at a time and never past the turn in
+        // progress, so a turn's steps leave together: cutting at the count alone would evict the question answered fifteen steps into a search.
         while conversationHistory.count > Self.maximumExchangeCountCarriedInHistory,
               conversationHistory.first?.turnIdentifier != turnIdentifierOfTheTurnBeingAnswered {
             conversationHistory.removeFirst()
@@ -5279,34 +4315,25 @@ final class CompanionManager: ObservableObject {
               + "\(transcriptOfTheTurnBeingAnswered.count) 字 / 答 \(replyAsItStands.count) 字"
               + (interruption == nil ? "" : "（中断）"))
 
-        // The step's own words, tags and all: the raw text is the only account of why a turn stopped asking
-        // to look again, and a tag the parser did not recognise is invisible in the spoken text the history
-        // keeps — the step would read as having had nothing to ask for.
+        // Tags and all: a tag the parser did not recognise is invisible in the spoken text history keeps,
+        // and is the one way a step can ask to look again and read as having stopped.
         print("Step reply as the model wrote it: \(replyAsTheModelWroteIt)")
     }
 
-    /// Writes off the reply being spoken. For a reply that was replaced, or one the app is done with — the
-    /// voice itself is stopped by the caller.
+    /// Writes off the reply being spoken — one replaced, or one the app is done with; the voice itself is stopped
+    /// by the caller. The tour is left alone, since it can outlive the reply while the cursor flies home, but the
+    /// segmenter is dropped: a written-off reply has nothing further to ingest and its text grows without bound.
+    /// The cursor *is* sent home, because a reply that failed or was replaced reaches only this path. This writes
+    /// off the whole turn's narration, not one step's — a step boundary must not cut a sentence still being spoken,
+    /// which is why `beginStreamingReply` reaches it only when the voice has already fallen silent.
     ///
-    /// The tour is left alone, since it can outlive the reply while the cursor flies home, but the
-    /// segmenter is dropped: a reply written off has nothing further to ingest, and its accumulated text is
-    /// the one thing here that grows without bound. The cursor *is* sent home from here, because a reply
-    /// that failed or was replaced reaches only this path.
-    ///
-    /// This writes off the whole **turn's** narration, not one step's, which is why the only callers
-    /// are the ones that replace or end a turn. `beginStreamingReply` reaches it too, but only when
-    /// the voice has already fallen silent — a step boundary must not cut a sentence still being
-    /// spoken, and its segments are appended to the turn's list rather than replacing it.
-    ///
-    /// - Parameter settlingTheVoiceState: Whether writing the reply off also ends the turn the panel shows.
-    ///   False for `beginStreamingReply`, which runs inside the new turn, where the caller has already
-    ///   armed this turn's facts; clearing them here would put the spinner out for the whole reply.
+    /// - Parameter settlingTheVoiceState: False for `beginStreamingReply`; its caller already armed the turn's facts, and clearing them here would put the spinner out.
     private func abandonSpeakingReply(settlingTheVoiceState: Bool = true) {
         isSpeakingReply = false
         // Except when a new reply is being armed, where the writes below belong to that reply.
         if settlingTheVoiceState {
-            // The other half of "this reply is still the app's business": a reply written off will
-            // never report a first sound, and nothing else would ever clear a wait that no sound can.
+            // A reply written off will never report a first sound, and nothing else would ever clear a
+            // wait that no sound can.
             isWaitingForTheFirstSoundOfTheReply = false
             isProducingAReply = false
         }
@@ -5318,16 +4345,14 @@ final class CompanionManager: ObservableObject {
         streamingReplySegmenter = nil
         finalizedSpeechSegmentCount = 0
         isReplyStreamComplete = false
-        // The cursor is part of what this reply started, so it is part of what writing the reply off
-        // restores. `shouldReturnBuddyToCursorAfterPointing` is left alone — the next teardown clears it.
+        // The cursor is part of what this reply started, so it is part of what writing it off restores.
+        // `shouldReturnBuddyToCursorAfterPointing` is left alone — the next teardown clears it.
         requestBuddyReturnHome()
     }
 
-    /// Called by the TTS client as each word is about to be spoken. The narration's position is what drives
-    /// the tour: a word reaching the sentence that names an element sends the cursor.
-    ///
-    /// Nothing is held here — the words of a segment are free to run ahead of the cursor, and the wait, when
-    /// there is one, happens at the segment boundary.
+    /// Called by the TTS client as each word is about to be spoken. The narration's position is what drives the
+    /// tour: a word reaching the sentence that names an element sends the cursor. Nothing is held here — words
+    /// run ahead, and the wait, when there is one, happens at the segment boundary.
     private func handleSpokenCharacterRange(_ spokenCharacterRange: NSRange) {
         // Recorded before any of the guards below: a word arriving at all is proof this voice
         // reports what it is saying, whether or not it is the word that sends the cursor off.
@@ -5335,53 +4360,49 @@ final class CompanionManager: ObservableObject {
         lastNarrationProgressDate = Date()
 
         lastSpokenWordEndOffsetInCurrentSpeechSegment = spokenCharacterRange.location + spokenCharacterRange.length
-        // The voice reports offsets within the segment it was handed, so this converts them into the reply's
-        // own space. Deliberately not clamped to the segment's end: the voice can only report words it was
-        // given.
+        // The voice reports offsets within the segment it was handed; this converts them into the reply's
+        // own space. Not clamped to the segment's end: the voice can only report words it was given.
         lastNarrationWordEndOffsetInSpokenText = currentSpeechSegmentStartOffsetInSpokenText
             + lastSpokenWordEndOffsetInCurrentSpeechSegment
 
         continuePointingTourIfPossible()
     }
 
-    /// Called when the segment the voice was handed has been spoken through — what releases the next one,
-    /// and the only thing that does.
-    ///
-    /// A cancelled segment reports nothing and so releases nothing: it was cut off, and how much of it was
-    /// heard is not something the voice can say.
+    /// Called when the segment the voice was handed has been spoken through — what releases the next one, and
+    /// the only thing that does. A cancelled segment reports nothing and releases nothing: how much of it was heard is not something the voice can say.
     private func handlePlaybackFinished() {
+        // The end of a guide line, which is the one thing that releases the guide's next beat. Guarded on
+        // `isSpeakingReply` so a reply's segment boundary can never be read as a guide line's end.
+        if !isSpeakingReply {
+            finishTheOnboardingGuideLineIfItIsStillBeingWaitedOn()
+        }
+
         guard isSpeakingReply,
               currentSpeechSegmentIndex < speechSegmentsOfTheTurnBeingSpoken.count
         else { return }
         markCurrentSpeechSegmentAsSpokenThrough()
     }
 
-    /// Records the segment being narrated as spoken through, and moves the reply forward on it.
-    ///
-    /// Shared with the path that reads nothing aloud, where the segment is spoken through the moment
-    /// it is reached because no callback will ever say so.
+    /// Records the segment being narrated as spoken through, and moves the reply forward on it. Shared with the
+    /// path that reads nothing aloud, where a segment is spoken through on being reached, no callback ever saying so.
     private func markCurrentSpeechSegmentAsSpokenThrough() {
         hasCurrentSpeechSegmentFinishedSpeaking = true
-        // A segment the voice was heard to finish is proof the narration is still moving, and it counts for
-        // as much as a reported word: the synthesizer reports no word marks at all for a short segment, so a
-        // list reply runs through several without a single word reaching the watchdog.
+        // A finished segment counts for as much as a reported word: the synthesizer reports no word marks at
+        // all for a short segment, so a list reply runs through several without a word reaching the watchdog.
         lastNarrationProgressDate = Date()
         continuePointingTourIfPossible()
     }
 
-    /// Sends the cursor to a tour stop.
-    ///
-    /// The narration is deliberately not held here and the cursor not delayed: the words run on over the
-    /// flight, and the wait for the cursor happens at the sentence boundary instead, by not handing over the
-    /// next segment.
+    /// Sends the cursor to a tour stop. The narration is not held here: the words run on over the flight, and
+    /// the wait for the cursor happens at the sentence boundary instead, by not handing over the next segment.
     private func startFlightToPointingTourStop(_ pointingTourStop: ResolvedPointingTourStop) {
         beginFlightOfTheCursor(
             to: pointingTourStop.screenLocation,
             on: pointingTourStop.displayFrame,
             with: pointingTourStop.pointingBubbleInvitation,
-            // Asked here rather than when the action goes out, because the overlay has to know before the
-            // flight starts: a stop that will be pressed is flown to by carrying the user's pointer there,
-            // and one that will not is flown to the way it always was.
+            // Asked before the flight starts, because the overlay has to know by then: a stop that will be
+            // pressed is flown to by carrying the user's pointer, and one that will not is flown to the way
+            // it always was.
             performing: actionThatWillActuallyBePerformed(at: pointingTourStop)
         )
 
@@ -5390,11 +4411,8 @@ final class CompanionManager: ObservableObject {
         schedulePointingTourArrivalTimeout()
     }
 
-    /// Starts the cursor flying to one point, with whatever it says and does when it gets there.
-    ///
-    /// The single trigger for a flight, whether the destination came from a reply or from a terminal:
-    /// setting the location is what makes an overlay fly, and screens other than the target's stand
-    /// their own cursor down when it changes, so there is only ever one buddy on screen.
+    /// Starts the cursor flying to one point, with whatever it says and does when it gets there. The single trigger
+    /// for a flight, whether from a reply or a terminal: setting the location is what makes an overlay fly.
     private func beginFlightOfTheCursor(
         to screenLocation: CGPoint,
         on displayFrame: CGRect,
@@ -5409,8 +4427,8 @@ final class CompanionManager: ObservableObject {
         pointingTourNarrationFallbackTask?.cancel()
         pointingTourNarrationFallbackTask = nil
 
-        // Last, and in one write: the overlay flies on this changing, so a target assembled field by
-        // field would be readable in a state the flight it describes was never in.
+        // In one write: the overlay flies on this changing, so a target assembled field by field would be
+        // readable in a state its flight was never in.
         pointingTarget = PointingTarget(
             screenLocation: screenLocation,
             displayFrame: displayFrame,
@@ -5419,37 +4437,28 @@ final class CompanionManager: ObservableObject {
             actionToPerformOnArrival: actionToPerformOnArrival
         )
 
-        // And the flight itself, after the target it is to be made to: the overlay reads the target
-        // when the count changes, so a bump ahead of the write would fly it to the one before.
+        // And the flight itself, after the target: the overlay reads the target when the count changes, so
+        // a bump ahead of the write would fly it to the one before.
         pointingFlightRequestCount += 1
     }
 
-    /// Called by the cursor overlay once it has arrived at a tour stop, or at a point a terminal asked
-    /// for an action at.
+    /// Called by the cursor overlay once it has arrived at a tour stop, or at a point a terminal asked for an action
+    /// at. The arrival timeout may already have written this flight off, and counting the arrival twice would skip the next stop.
     func buddyDidArriveAtPointingTarget() {
-        // The arrival timeout may have already written this flight off, and counting the arrival
-        // a second time would skip the next stop.
         guard isFlyingToPointingTourStop else { return }
 
-        // Whether this arrival begins something that is still running when the cursor lands: a drag,
-        // which has the button down and half a second of movement to go, and a run of typed
-        // characters, which has a landing click, a character every eighth of a second and quite
-        // possibly a combination queued behind it. Closing the flight out here would move the tour on
-        // mid-gesture — letting go of what it was carrying, or pressing a second element before the
-        // first has been typed into.
-        //
-        // Asked of `requestedActionForArrival` rather than of the action that will actually happen,
-        // because a refused drag and a refused run of text are performed too — they perform nothing
-        // and say so — and it is the performing task, not the refusal, that closes the flight
-        // afterwards.
+        // Whether this arrival begins something still running when the cursor lands: a drag, and a run of typed characters
+        // — closing the flight out here would move the tour on mid-gesture, letting go of what a drag was carrying or
+        // pressing a second element before the first has been typed into. Asked of `requestedActionForArrival`, not of the
+        // action that will actually happen: a refused drag or run is performed too (it performs nothing and says so), and the performing task closes the flight afterwards.
         let isStartingAnActionThatOutlivesTheArrival = doesTheActionOutliveTheArrival(
             nextPointingTourStop.flatMap { requestedActionForArrival(at: $0) }
         ) || doesTheActionOutliveTheArrival(actionInFlight?.action)
 
         if isStartingAnActionThatOutlivesTheArrival {
-            // Nothing is flying any more, so the watchdog for a flight that never reports back has
-            // nothing left to watch. Left armed it would fire part way through the drag and move the
-            // tour on with the button still down — through the other door from the one above.
+            // Nothing is flying any more, so the watchdog for a flight that never reports back has nothing
+            // to watch. Left armed it would fire part way through the drag and move the tour on with the
+            // button still down.
             pointingTourNarrationResumeTimeoutTask?.cancel()
             pointingTourNarrationResumeTimeoutTask = nil
         }
@@ -5478,16 +4487,10 @@ final class CompanionManager: ObservableObject {
         finishCurrentPointingTourFlight()
     }
 
-    /// Whether an action is still going when the cursor has landed: a drag is moving to a second
-    /// point, and a run of text is a landing click and then a character at a time.
-    ///
-    /// A combination is not one of them. It is a press and a release a few microseconds apart, with
-    /// nothing to wait for and nothing the tour should hold the next stop behind — and holding it
-    /// would leave the flight open for a gesture that has already finished.
-    ///
-    /// A `switch` over every case, so a fourth kind of action fails to build here instead of being
-    /// quietly treated as over on arrival — which for a drag means letting go of what it was carrying
-    /// and for a typed run means clicking the next element mid-word.
+    /// Whether an action is still going when the cursor has landed: a drag is moving to a second point, and a run
+    /// of text is a landing click and then a character at a time. A combination is not one of them — a press and a
+    /// release microseconds apart. A `switch` over every case, so an action added later fails to build instead of
+    /// being quietly treated as over on arrival.
     private func doesTheActionOutliveTheArrival(_ action: ElementActionOnArrival?) -> Bool {
         switch action {
         case .drag, .keyboard(.text): return true
@@ -5495,19 +4498,13 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// The action the cursor just landed on, when the model asked for the element to be operated or
-    /// scrolled rather than only located — whichever gesture the tag it wrote named — or nil when it
-    /// asked for nothing, or when the user has automatic acting switched off.
-    ///
-    /// Reached from the cursor *arriving* and from nowhere else: the other way a flight ends, the arrival
-    /// timeout, means no cursor view accepted the target, so the cursor is not on the element.
+    /// The action the cursor just landed on, whichever gesture the tag named, or nil when it asked for nothing or
+    /// acting is off. Reached from the cursor *arriving* and nowhere else: the arrival timeout means no view accepted the target.
     private func requestedActionForArrival(at pointingTourStop: ResolvedPointingTourStop) -> ElementActionOnArrival? {
         guard let action = pointingTourStop.pointingBubbleInvitation.actionToPerformOnArrival else { return nil }
 
-        // The switch is asked by the kind of action rather than as one gate over all of them: the three
-        // mouse gestures share the panel's row and the keyboard has one of its own, and a stop is held
-        // back by the one covering what it asked for. A `switch` over every case, so a fourth family
-        // has to be given its row here rather than inheriting the mouse's.
+        // Asked by the kind of action rather than as one gate: the three mouse gestures share the panel's row and
+        // the keyboard has one of its own, and a `switch` over every case makes a fourth family be given its row here rather than inherit the mouse's.
         switch action {
         case .press, .scroll, .drag:
             guard isAutomaticClickingEnabled else { return nil }
@@ -5518,16 +4515,9 @@ final class CompanionManager: ObservableObject {
         return action
     }
 
-    /// The action this stop will actually get — nil when it asks for none *or* when the action would be
-    /// refused, which makes nil the honest answer to "will Kiki do this".
-    ///
-    /// The overlay draws this answer, so it is built on the question above rather than restating it: the
-    /// cursor turning red for a press that never follows is a loud, untrue claim.
-    ///
-    /// The two halves of the question are the two gesture axes, and each is asked of the thing that owns
-    /// it: a press is refused by the words on the element, a scroll by the grant alone, a drag by where
-    /// its destination is, a run of text by the click that would put the focus in it and by its length,
-    /// a combination by the table of ones Kiki will not press, and none of them answers for another.
+    /// The action this stop will actually get — nil when it asks for none *or* when it would be refused, which makes
+    /// nil the honest answer to "will Kiki do this". The overlay draws this answer, so it is built on the question above
+    /// rather than restating it: the cursor turning red for a press that never follows is a loud, untrue claim. Each refusal is asked of the thing that owns it, and none answers for another.
     private func actionThatWillActuallyBePerformed(at pointingTourStop: ResolvedPointingTourStop) -> ElementActionOnArrival? {
         guard let requestedAction = requestedActionForArrival(at: pointingTourStop) else { return nil }
         switch requestedAction {
@@ -5540,8 +4530,8 @@ final class CompanionManager: ObservableObject {
                 toAppKitScreenLocation: pointingTourStop.dragDestinationScreenLocation
             ) == nil else { return nil }
         case .keyboard(.text(let typedText)):
-            // Typing is refused for the focus click's reasons as well as its own, because the click is
-            // how the words get somewhere to land.
+            // Typing is refused for the focus click's reasons as well as its own — the click is how the
+            // words get somewhere to land.
             guard ElementKeyboard.refusalOfTyping(
                 typedText,
                 matchingElementLabel: pointingTourStop.elementLabel,
@@ -5559,11 +4549,8 @@ final class CompanionManager: ObservableObject {
         at pointingTourStop: ResolvedPointingTourStop,
         isClosingTheArrivalFlightAfterwards: Bool
     ) {
-        // One guard for every gesture, because the switch from pointing to acting is the same either way:
-        // a stop the model only asked to locate has nothing to do here, and neither has any stop while the
-        // user has automatic acting switched off.
-        //
-        // A refused action deliberately gets past this and is reported by the action itself.
+        // One guard for every gesture: a stop the model only asked to locate has nothing to do here, and neither
+        // has any stop while automatic acting is off. A refused action gets past this and is reported by the action itself.
         guard let action = requestedActionForArrival(at: pointingTourStop) else { return }
 
         let stopIndex = nextPointingTourStopIndex
@@ -5572,24 +4559,22 @@ final class CompanionManager: ObservableObject {
         let displayFrame = pointingTourStop.displayFrame
         // Read here rather than inside the clicker, which stays self-contained and touches no AppKit.
         let primaryScreenHeightInPoints = NSScreen.screens.first?.frame.maxY ?? 0
-        // Where a drag lets go, already on the display the starting point is on: it is converted from
-        // the same screenshot the starting point was, which clamps it to that screen's bounds.
+        // Where a drag lets go, already on the display the starting point is on: converted from the same
+        // screenshot, which clamps it to that screen's bounds.
         let dragDestinationScreenLocation = pointingTourStop.dragDestinationScreenLocation
 
-        // Counted here rather than where the task reports back, because the two ends of the join are
-        // counted by different code: the step is over when as many reports have come back as were
-        // asked for, and a silent turn's cursor is the only thing that would ever ask this again.
+        // Counted here rather than where the task reports back: the two ends of that count are written by
+        // different code.
         stepInProgress.numberOfActionsAskedFor += 1
         let thisStepIdentifier = turnIdentifierOfTheReplyBeingStreamed
 
         Task {
-            // Every arm below ends by reporting what it did, and the report is what the step is
-            // waiting for — so each one says so whether it reached the screen or not.
+            // Every arm below ends by reporting what it did, whether it reached the screen or not: the
+            // report is what the step is waiting for.
             switch action {
             case .press(let clickKind):
-                // Played before the click, and only for a click that will actually go out: asking the refusal
-                // first keeps the sound from announcing a click that was declined, and playing it here makes the
-                // sound land with the events.
+                // Only for a click that will actually go out: asking the refusal first keeps the sound from
+                // announcing a click that was declined, and playing it here lands it with the events.
                 if ElementClicker.refusalOfClick(matchingElementLabel: elementLabel, origin: .theModelsTag) == nil {
                     elementActionSoundPlayer.playClickSound()
                 }
@@ -5611,8 +4596,8 @@ final class CompanionManager: ObservableObject {
                 )
 
             case .scroll(let direction, let distance):
-                // Nothing is played: the click's sound is feedback for a press, and a scroll presses
-                // nothing. The content moving is the feedback.
+                // Nothing is played: the click's sound is feedback for a press, and the content moving is a
+                // scroll's own feedback.
                 let scrollOutcome = await ElementScroller.scrollElement(
                     atAppKitScreenLocation: screenLocation,
                     primaryScreenHeightInPoints: primaryScreenHeightInPoints,
@@ -5645,8 +4630,7 @@ final class CompanionManager: ObservableObject {
                     identifiedBy: thisStepIdentifier
                 )
 
-                // The one place a model-asked-for drag ends, and the only action that ends after the
-                // arrival rather than at it: the flight the arrival deliberately left open is closed
+                // The one place a model-asked-for drag ends: the flight the arrival left open is closed
                 // here, with the button up and the cursor standing where the drag put it.
                 if isClosingTheArrivalFlightAfterwards, isFlyingToPointingTourStop {
                     finishCurrentPointingTourFlight()
@@ -5656,9 +4640,8 @@ final class CompanionManager: ObservableObject {
                 let keyboardOutcome: ElementKeyboardOutcome
                 switch keyboardInput {
                 case .text(let typedText):
-                    // Played for the focus click, which is a press and goes out before the first
-                    // character does — the same question the click's own branch asks, because a run of
-                    // text that will not begin with one must not make its sound.
+                    // Played for the focus click, which goes out before the first character — the same question the
+                    // click's own branch asks, because a run of text that will not begin with one must not make its sound.
                     if ElementKeyboard.refusalOfTyping(
                         typedText,
                         matchingElementLabel: elementLabel,
@@ -5675,9 +4658,8 @@ final class CompanionManager: ObservableObject {
                         origin: .theModelsTag
                     )
                 case .combination(let keyCombination):
-                    // The key-press sound and not the click's, and asked first for the reason the
-                    // click's own branch gives: a combination that will be refused must not be
-                    // announced as one that is about to happen.
+                    // The key-press sound and not the click's, asked first for the reason above: a
+                    // combination that will be refused must not be announced as one about to happen.
                     if ElementKeyboard.refusalOfCombination(named: keyCombination) == nil {
                         elementActionSoundPlayer.playKeyPressSound()
                     }
@@ -5693,10 +4675,8 @@ final class CompanionManager: ObservableObject {
                     identifiedBy: thisStepIdentifier
                 )
 
-                // A typed run is the other action that outlives the arrival — the flight stays open
-                // across however many seconds the words take, so the next stop cannot be flown to
-                // mid-word — and closing it belongs here, once the last character is in. A combination
-                // is over at the arrival, which is what the flag is false for.
+                // A typed run is the other action that outlives the arrival — the flight stays open across however
+                // many seconds the words take — and closing it belongs here, once the last character is in. A combination is over at the arrival, which the flag is false for.
                 if isClosingTheArrivalFlightAfterwards, isFlyingToPointingTourStop {
                     finishCurrentPointingTourFlight()
                 }
@@ -5704,18 +4684,10 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Notes what one action of the step in progress did, in the order the model asked for them.
-    ///
-    /// The report is what the next step is told, so it is written as a sentence the model reads —
-    /// 「已点击「确定」。」 or 「「确定」没做成：点击没能发出去。」 — rather than as the outcome value the
-    /// terminal is answered with. The two audiences want different things from the same fact: a
-    /// terminal is told what happened so a script can branch on it, while the model is told it about
-    /// the element it named, because the element is the only thing in the sentence it can look for
-    /// on the next picture and the coordinate means nothing to it written down.
-    ///
-    /// Dropped for a step that is no longer the one in progress: a click takes as long as it takes,
-    /// and a tour called off while one was in the air would otherwise have its report attributed to
-    /// whatever step happens to be running by the time it lands.
+    /// Notes what one action of the step in progress did, in the order the model asked for them. The report is a sentence
+    /// the model reads rather than the outcome the terminal is answered with, because the model is told about the element
+    /// it named, the only thing it can look for on the next picture. Dropped for a step that is no longer the one in
+    /// progress: a click takes as long as it takes, and a tour called off in the air would otherwise file its report under whatever step is running when it lands.
     private func recordWhatAnActionOfTheStepDid(
         _ outcome: ElementClickOutcome,
         action: ElementActionOnArrival,
@@ -5782,30 +4754,21 @@ final class CompanionManager: ObservableObject {
         stepInProgress.sentencesSayingWhatTheActionDid.append(sentence)
         stepInProgress.didAnyActionReachTheScreen = stepInProgress.didAnyActionReachTheScreen || didItReachTheScreen
 
-        // The last of them, and the tour may have run out of stops long ago — an action is performed
-        // while its flight is still open, so this can be the only thing still running.
+        // The last of them, and the tour may have run out of stops long ago: an action outliving the
+        // arrival can be the only thing still running.
         finishTheStepIfEverythingItAskedForIsDone()
     }
 
-    /// Whether the step being reported on is still the step in progress.
-    ///
-    /// The turn identifier is what the streaming reply already uses to recognise a chunk that arrived
-    /// after the turn it belonged to was replaced; a step is a turn's worth of work, so one identifier
-    /// answers both. It moves when the next step is asked for and when a new question arrives.
+    /// Whether the step being reported on is still the step in progress. The turn identifier is what the streaming
+    /// reply already uses for a stale chunk, and a step is a turn's worth of work, so one identifier answers both — it moves with the next step and a new question.
     private func isStillTheStepIdentifiedBy(_ stepIdentifier: UUID) -> Bool {
         stepIdentifier == turnIdentifierOfTheReplyBeingStreamed
     }
 
-    /// What the model is told its own action did.
-    ///
-    /// Built on the same completion phrase the terminal is answered with — 「已点击」, 「已双击」,
-    /// 「已往下滚 3 屏：」 — rather than on a second pool written for the model, because the whole point
-    /// of that pool is that a gesture's name is decided in one place: two pools would let a gesture
-    /// added later be named for one audience and described only approximately for the other. Only the
-    /// object of the sentence differs, and it has to: a terminal may be a script looking for which
-    /// occurrence was pressed, while an occurrence is not a thing the model can do anything with. An
-    /// action with no label — the model's tag may name a scroll by direction alone — is called
-    /// 那个元素, because a sentence about nothing is worse than a vague one.
+    /// What the model is told its own action did. Built on the same completion phrase the terminal is answered with
+    /// rather than a second pool, because that pool is the one place a gesture's name is decided: two pools would let
+    /// a gesture added later be named for one audience and approximated for the other. Only the object differs, and it
+    /// must — a terminal may be a script looking for which occurrence was pressed, while the model is told about the element it named. An action with no label is called 那个元素.
     private func sentenceTellingTheModelWhatItsActionDid(
         _ action: ElementActionOnArrival,
         toElementLabel elementLabel: String?,
@@ -5818,12 +4781,9 @@ final class CompanionManager: ObservableObject {
         return elementName + "没做成：" + failureSentence
     }
 
-    /// The prompt for a step that follows the model's own actions.
-    ///
-    /// It is written as a report and not as a question, because that is what it is: the user asked
-    /// once, and everything after the first step is Kiki telling the model what happened. The prompt
-    /// names the picture as the one taken after the actions, without which a model that sees a screen
-    /// different from the one its reply was written against has no way to know why.
+    /// The prompt for a step that follows the model's own actions. Written as a report rather than a question,
+    /// because the user asked once and everything after the first step is Kiki telling the model what happened.
+    /// It names the picture as the one taken after the actions, without which a model seeing a changed screen has no way to know why.
     private static func promptForTheStepAfterTheModelsOwnActions(
         sentencesSayingWhatTheyDid: [String]
     ) -> String {
@@ -5835,21 +4795,17 @@ final class CompanionManager: ObservableObject {
         return prompt
     }
 
-    /// Drags from one point to another for the user, with the cursor drawn following it.
-    ///
-    /// The one place a drag runs, reached by both the model's tag and the terminal's request: the two
-    /// differ in where the points come from and in what is said about it afterwards, and not at all in
-    /// what is done to the machine or in what the user sees while it happens.
-    ///
-    /// The cursor follows because the overlay reads `screenLocationOfTheDragInFlight` — a drag posts its
-    /// events from here, and nothing about the flight the cursor arrived on is still running to draw it.
+    /// Drags from one point to another for the user, with the cursor drawn following it. The one place a drag
+    /// runs, reached by both the model's tag and the terminal's request: the two differ in where the points come
+    /// from and in what is said afterwards, never in what is done to the machine. The cursor follows because the
+    /// overlay reads `screenLocationOfTheDragInFlight`.
     private func dragForTheUser(
         fromAppKitScreenLocation startAppKitScreenLocation: CGPoint,
         toAppKitScreenLocation destinationAppKitScreenLocation: CGPoint?,
         primaryScreenHeightInPoints: CGFloat
     ) async -> ElementDragOutcome {
-        // Cleared however the drag ends, so a drag that was refused does not leave the cursor drawn
-        // somewhere no movement is happening.
+        // Cleared however the drag ends, so a refused drag does not leave the cursor drawn somewhere no
+        // movement is happening.
         defer { screenLocationOfTheDragInFlight = nil }
 
         return await ElementDragger.dragElement(
@@ -5862,16 +4818,11 @@ final class CompanionManager: ObservableObject {
         )
     }
 
-    /// Closes out the flight in progress: the next stop becomes eligible to be sent to, and the reply is
-    /// told the cursor has moved on.
-    ///
-    /// Reached by both ways a flight can end — the cursor arriving, and the arrival timeout — so it is the
-    /// single place the tour learns that it is standing still again.
+    /// Closes out the flight in progress: the next stop becomes eligible, and the reply is told the cursor has
+    /// moved on. Reached by both ends a flight has — arrival and timeout — it is where the tour learns it is standing still.
     private func finishCurrentPointingTourFlight() {
-        // An action being waited on was performed on arrival, where it is written off before this
-        // runs, so one still here is a flight that never landed: nothing was done, and whoever asked
-        // is told so — or, for a replay, the loop simply moves on — rather than left waiting on a
-        // cursor that is not coming.
+        // An action being waited on is written off on arrival, so one still here is a flight that never landed:
+        // nothing was done, and whoever asked is told so — for a replay, the loop merely moves on — rather than left waiting on a cursor that is not coming.
         if let actionThatNeverLanded = actionInFlight {
             endTheActionBeingWaitedOn(actionThatNeverLanded.beingWaitedOn, with: .failed(message: "光标没飞到那个点，这次操作没做成。", isRefusal: false))
         }
@@ -5879,8 +4830,8 @@ final class CompanionManager: ObservableObject {
         pointingTourNarrationResumeTimeoutTask?.cancel()
         pointingTourNarrationResumeTimeoutTask = nil
         isFlyingToPointingTourStop = false
-        // The clock the next stop's minimum dwell is measured against. A flight that timed out
-        // counts too: the cursor has been parked on that element either way.
+        // The clock the next stop's minimum dwell is measured against. A flight that timed out counts
+        // too: the cursor has been parked on that element either way.
         lastPointingTourStopArrivalDate = Date()
         nextPointingTourStopIndex += 1
 
@@ -5895,16 +4846,13 @@ final class CompanionManager: ObservableObject {
         schedulePointingTourDwellCompletion()
         continuePointingTourIfPossible()
 
-        // The tour running out of stops is one of the four things that can finish a step, and in a
-        // silent turn it is the last of them: with no voice to wait on, the segment walk runs
-        // itself out long before the cursor has visited everything the reply named.
+        // The tour running out of stops is one of the things that can finish a step, and in a silent turn it is
+        // the last: with no voice to wait on, the segment walk runs out long before the cursor has visited everything the reply named.
         finishTheStepIfEverythingItAskedForIsDone()
     }
 
-    /// Pokes the tour once the cursor has spent its minimum time on the stop it landed on.
-    ///
-    /// In the case this exists for nothing else does: the narration has already been spoken through, so no
-    /// further word is coming to re-run the coordination.
+    /// Pokes the tour once the cursor has spent its minimum time on the stop it landed on — the case this
+    /// exists for being the one where nothing else does, the narration having already been spoken through.
     private func schedulePointingTourDwellCompletion() {
         pointingTourDwellCompletionTask?.cancel()
         pointingTourDwellCompletionTask = nil
@@ -5919,8 +4867,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Sends the cursor home if the narration is still going three seconds after the cursor landed
-    /// on the last element it will point at.
+    /// Sends the cursor home if the narration is still going three seconds after the cursor landed on the
+    /// last element it will point at.
     private func schedulePointingTourReturnHomeTimeout() {
         pointingTourReturnHomeTimeoutTask?.cancel()
         pointingTourReturnHomeTimeoutTask = Task { [weak self] in
@@ -5934,11 +4882,8 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Writes off a flight that never reports back.
-    ///
-    /// Every path that never reaches a cursor view funnels through it — the screen holding the element was
-    /// unplugged between the screenshot and the flight, or the welcome animation is running, which makes
-    /// the view ignore targets — and it degrades them to one missed stop.
+    /// Writes off a flight that never reports back — the screen unplugged between screenshot and flight, the
+    /// welcome animation, which makes the view ignore targets. Every such path degrades to one missed stop.
     private func schedulePointingTourArrivalTimeout() {
         pointingTourNarrationResumeTimeoutTask?.cancel()
         pointingTourNarrationResumeTimeoutTask = Task { [weak self] in
@@ -5949,19 +4894,15 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Hands the tour over to the cursor if the narration never gets going.
-    ///
-    /// The tour is triggered by the words being spoken, so a voice that never reports what it is saying
-    /// would leave the cursor parked where it was for every reply. Pointing at the first tagged element and
-    /// ending the tour there was the old answer, and it dropped every element after the first.
+    /// Hands the tour over to the cursor if the narration never gets going: the tour is triggered by the
+    /// words being spoken, so a voice that never reports what it is saying would leave the cursor parked.
     private func schedulePointingTourFallbackIfNarrationIsSilent() {
         pointingTourNarrationFallbackTask?.cancel()
         pointingTourNarrationFallbackTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.pointingTourSilentNarrationFallbackSeconds * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
-            // Only a voice that has said nothing at all is silent. Asking whether a flight had started
-            // would be a different question, with a wrong answer for any reply that talks about something
-            // else before its first tagged element.
+            // Only a voice that has said nothing at all is silent; asking whether a flight had started is a
+            // different question, wrong for a reply that talks about something else before its first tag.
             guard !self.hasNarrationReportedAnyWords else { return }
             print("Pointing tour: narration reported no words, the cursor paces the tour from here")
             self.hasTheNarrationGoneSilent = true
@@ -5969,16 +4910,9 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Unsticks a reply whose narration has gone quiet partway through.
-    ///
-    /// The reply is driven by the words being spoken, so a voice that stops reporting them leaves it
-    /// stranded: nothing sends the cursor to the next stop and nothing ends the tour either. The
-    /// silent-narration fallback does not cover this, because it asks whether the voice has said anything
-    /// *at all* and answers once, which a voice that has already reported words passed.
-    ///
-    /// The tour is ended rather than advanced, the words being what pace it and there being none left; the
-    /// cursor is parked on the stop it was waiting to serve. The segment in progress is written off with
-    /// it, because a voice that has stopped producing audio will never report it.
+    /// Unsticks a reply whose narration has gone quiet partway through: the reply is driven by the words being spoken, so
+    /// a voice that stops reporting them leaves nothing to send the cursor to the next stop and nothing to end the tour.
+    /// The silent-narration fallback does not cover this — it answers once, on a voice that said nothing at all. The tour is ended rather than advanced, and the segment in progress written off with it.
     private func schedulePointingTourStallWatchdog() {
         pointingTourStallWatchdogTask?.cancel()
         pointingTourStallWatchdogTask = Task { [weak self] in
@@ -5987,8 +4921,8 @@ final class CompanionManager: ObservableObject {
                 guard !Task.isCancelled, let self else { return }
                 guard self.isPointingTourActive else { return }
 
-                // A voice that never reported a word is the silent-narration case, which has its
-                // own fallback. This watchdog is for a voice that was reporting and then stopped.
+                // A voice that never reported a word is the silent-narration case, which has its own
+                // fallback. This watchdog is for a voice that was reporting and then stopped.
                 guard self.hasNarrationReportedAnyWords else { continue }
 
                 guard let lastNarrationProgressDate = self.lastNarrationProgressDate,
@@ -6002,10 +4936,8 @@ final class CompanionManager: ObservableObject {
                 // Read before the tour is ended, which clears both of them.
                 let stopToParkOn = self.nextPointingTourStop ?? self.resolvedPointingTourStops.last
                 self.endPointingTour()
-                // Put back for the stop the cursor was waiting to serve, which `endPointingTour` has
-                // just cleared along with the rest of the tour. Doing nothing is the point: the tour
-                // that asked for the action is over, and the cursor is only being left standing where
-                // it got to.
+                // Put back for the stop the cursor was waiting to serve, which `endPointingTour` has just cleared
+                // with the rest of the tour. No action goes with it: that tour is over, the cursor merely left standing where it got to.
                 if let stopToParkOn {
                     self.pointingTarget = PointingTarget(
                         screenLocation: stopToParkOn.screenLocation,
@@ -6035,37 +4967,33 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // A replay starts the demos over: the second run's first demo would otherwise be told to
-        // avoid everything the first run pointed at, on a screen that has nothing to do with them.
+        // A replay starts the demos over: the second run's first demo would otherwise be told to avoid
+        // everything the first run pointed at, on a screen that has nothing to do with them.
         onboardingDemoTargetsAlreadyPointedAt.removeAll()
 
         let player = AVPlayer(url: videoURL)
         player.isMuted = false
-        // Full volume from the first sample, rather than ramping up from silence: the ramp cost the clip
-        // its opening words, so the first thing the user heard was the middle of a sentence.
+        // Full volume from the first sample: ramping up from silence cost the clip its opening words, so
+        // the first thing the user heard was the middle of a sentence.
         player.volume = 1.0
         self.onboardingVideoPlayer = player
         self.showOnboardingVideo = true
         self.onboardingVideoOpacity = 0.0
 
         // The picture fades in first and playback starts after it: a paused `AVPlayerLayer` draws the item's
-        // frame at time zero, so what fades in is the clip's opening image rather than an empty box. The two
-        // delays time the fade against the playback, so moving either changes when the narration is heard.
+        // frame at time zero, so what fades in is the clip's opening image. Both delays time the fade against
+        // the playback, so moving either changes what is heard when.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            // Waits for SwiftUI to mount the view; the .animation modifier handles the fade.
             self.onboardingVideoOpacity = 1.0
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
             player.play()
         }
 
-        // Two demos, ten seconds apart: Kiki flies to something interesting on screen and comments on it,
-        // then does the same somewhere else. Both are silent — the only output is one sentence in the
-        // pointing bubble — so they play alongside the narration.
-        //
-        // Both times have to land inside the clip, and the failure is silent: a boundary time past the end
-        // is never reached, while the end observer tears the whole observer down regardless. These two
-        // numbers move with the clip.
+        // Two demos, ten seconds apart: Kiki flies to something interesting on screen and comments on it, then does the
+        // same somewhere else. Both are silent — their only output is one sentence in the pointing bubble — so they play
+        // alongside the narration. Both boundary times must land inside the clip, and the failure is silent: a time past
+        // the end is never reached, while the end observer tears the whole observer down regardless. These two numbers move with the clip.
         let demoTriggerTimes = [5, 15].map {
             CMTime(seconds: Double($0), preferredTimescale: 600)
         }
@@ -6078,7 +5006,6 @@ final class CompanionManager: ObservableObject {
 
         listenForTheOnboardingNarrationLoudness(of: player, videoAt: videoURL)
 
-        // Fade out and clean up when the video finishes
         onboardingVideoEndObserver = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: player.currentItem,
@@ -6086,11 +5013,10 @@ final class CompanionManager: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             self.onboardingVideoOpacity = 0.0
-            // Wait out the fade-out before tearing down, matching the opacity animation's own
-            // duration in `OverlayWindow`, or the clip disappears in one frame instead of fading.
+            // Wait out the fade-out before tearing down, matching the opacity animation's own duration in
+            // `OverlayWindow`, or the clip disappears in one frame instead of fading.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 self.tearDownOnboardingVideo()
-                // After the video disappears, stream in the prompt to try talking
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     self.startOnboardingPromptStream()
                 }
@@ -6098,22 +5024,17 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Measures the clip's own narration once, then follows it by where the player has got to.
-    ///
-    /// `AVPlayer` publishes no level, so the track is decoded instead of listened to. The decode is
-    /// a fraction of a second of pure arithmetic and belongs off the main actor — what it would
-    /// otherwise be holding up is the fade-in of the video it is measuring.
-    ///
-    /// The music underneath the intro is not in this: it is mixed at playback rather than stored in
-    /// the clip, and the glow follows a voice, not a soundtrack.
+    /// Measures the clip's own narration once, then follows it by where the player has got to. `AVPlayer` publishes
+    /// no level, so the track is decoded off the main actor — what the decode would otherwise hold up is the
+    /// video's own fade-in. The music under the intro goes through an `AVAudioPlayer` the meter never sees.
     private func listenForTheOnboardingNarrationLoudness(of player: AVPlayer, videoAt videoURL: URL) {
         Task { [weak self] in
             let envelope = await Task.detached(priority: .userInitiated) {
                 OnboardingNarrationLoudnessEnvelope.measuring(videoAt: videoURL)
             }.value
 
-            // The video may have been torn down or replayed while that was being measured, and a
-            // report from the run before this one would drive the glow of the run now.
+            // The video may have been torn down or replayed while that was being measured, and a report
+            // from the run before this one would drive the glow of the run now.
             guard let self, let envelope, self.onboardingVideoPlayer === player else { return }
 
             self.onboardingNarrationLoudnessObserver = player.addPeriodicTimeObserver(
@@ -6136,8 +5057,8 @@ final class CompanionManager: ObservableObject {
             onboardingVideoPlayer?.removeTimeObserver(loudnessObserver)
             onboardingNarrationLoudnessObserver = nil
         }
-        // The clip is the only thing that was speaking; whatever it left the glow at is not
-        // something anything would report over.
+        // The clip is the only thing that was speaking, and nothing else would report over what it left
+        // the glow at.
         voiceLoudnessMeter.report(0)
         onboardingVideoPlayer?.pause()
         onboardingVideoPlayer = nil
@@ -6161,7 +5082,6 @@ final class CompanionManager: ObservableObject {
         Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
             guard currentIndex < message.count else {
                 timer.invalidate()
-                // Auto-dismiss after 10 seconds
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
                     guard self.showOnboardingPrompt else { return }
                     withAnimation(.easeOut(duration: 0.3)) {
@@ -6196,17 +5116,16 @@ final class CompanionManager: ObservableObject {
     the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. origin (0,0) is top-left. x increases rightward, y increases downward.
     """
 
-    /// Captures a screenshot, asks the model to find something interesting to point at, and
-    /// triggers the flight. Used during onboarding to demo pointing while the intro video plays.
+    /// Captures a screenshot, asks the model to find something interesting to point at, and triggers the
+    /// flight. Used during onboarding to demo pointing while the intro video plays.
     func performOnboardingDemoInteraction() {
-        // Don't interrupt an active voice response
         guard voiceState == .idle || voiceState == .responding else { return }
 
         Task {
             do {
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
 
-                // Only the cursor screen, so the model can't pick something on a monitor we can't
+                // Only the cursor screen, so the model cannot pick something on a monitor Kiki cannot
                 // point at.
                 guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
                     print("Onboarding demo: no cursor screen found")
@@ -6214,8 +5133,7 @@ final class CompanionManager: ObservableObject {
                 }
 
                 // The demo picks something with a name on screen, so it gets the same exact positioning the
-                // pointing tour uses. Started before the request so the recognition runs while the model
-                // writes.
+                // pointing tour uses. Started before the request so it runs while the model writes.
                 let recognizedTextLinesTask = Task {
                     await ScreenshotTextRecognizer.recognizedLines(in: cursorScreenCapture.imageData)
                 }
@@ -6227,10 +5145,8 @@ final class CompanionManager: ObservableObject {
                         + "x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
                 )]
 
-                // What an earlier demo already pointed at on this same display. Each demo is a fresh request
-                // carrying no history, so left alone the model picks the same thing again. Two levers, and
-                // both are needed: this tells the model what to avoid, and the claimed box below takes the
-                // ground away if it names the same element anyway.
+                // What an earlier demo already pointed at on this same display. Each demo is a fresh request with
+                // no history, so the model would pick the same thing again; the claimed box below takes that ground away.
                 let earlierDemoTargetsOnThisScreen = onboardingDemoTargetsAlreadyPointedAt
                     .filter { $0.displayFrame == cursorScreenCapture.displayFrame }
 
@@ -6244,8 +5160,8 @@ final class CompanionManager: ObservableObject {
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
                     userPrompt: userPrompt,
-                    // Empty on purpose, unlike the voice path: the demo says nothing out loud, its
-                    // whole output being one sentence written into the pointing bubble.
+                    // Empty on purpose: the demo says nothing out loud, its whole output being one
+                    // sentence written into the pointing bubble.
                     onTextChunk: { _ in }
                 )
 
@@ -6256,9 +5172,8 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                // The boxes an earlier demo resolved to are passed as claimed, the same mechanism the
-                // pointing tour uses. A label that would land on covered ground falls back to the model's own
-                // coordinate, so the second demo still points somewhere.
+                // Passed as claimed, as the pointing tour does: a label that would land on covered ground
+                // falls back to the model's own coordinate, so the second demo still points somewhere.
                 let precisePosition = Self.preciseScreenshotCoordinate(
                     forModelScreenshotCoordinate: modelPointCoordinate,
                     elementLabel: parseResult.elementLabel,
@@ -6272,8 +5187,8 @@ final class CompanionManager: ObservableObject {
                     on: cursorScreenCapture
                 )
 
-                // Recorded whether or not the flight goes anywhere, so the next demo is told about
-                // it either way. A target with no label carries nothing forward.
+                // Recorded whether or not the flight goes anywhere, so the next demo is told about it either
+                // way. A target with no label carries nothing forward.
                 if let elementLabel = parseResult.elementLabel, !elementLabel.isEmpty {
                     onboardingDemoTargetsAlreadyPointedAt.append(
                         OnboardingDemoTarget(
@@ -6284,10 +5199,8 @@ final class CompanionManager: ObservableObject {
                     )
                 }
 
-                // One target, and its invitation is a look: the demo points something out rather than
-                // offering to operate it. The overlay reads that to decide whether the flight carries
-                // the user's mouse, so anything else here would have the welcome animation take hold of
-                // the pointer mid-demo.
+                // Its invitation is a look, not an offer to operate: the overlay reads that to decide whether
+                // the flight carries the user's mouse, so anything else would take hold of the pointer mid-demo.
                 pointingTarget = PointingTarget(
                     screenLocation: resolvedLocation.screenLocation,
                     displayFrame: resolvedLocation.displayFrame,
@@ -6296,14 +5209,481 @@ final class CompanionManager: ObservableObject {
                     bubbleText: parseResult.spokenText,
                     actionToPerformOnArrival: nil
                 )
-                // The demo builds its target here rather than through `beginFlightOfTheCursor`,
-                // because that function takes the tour's bookkeeping with it — so this is the second
-                // of the two places a flight is asked for, and it bumps the count itself.
+                // Built here rather than through `beginFlightOfTheCursor`, which takes the tour's bookkeeping with
+                // it — so this is the second of the two places a flight is asked for, and it bumps the count itself.
                 pointingFlightRequestCount += 1
                 print("Onboarding demo: pointing at \"\(parseResult.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")
             } catch {
                 print("Onboarding demo error: \(error)")
             }
         }
+    }
+
+    // MARK: - The First-Run Onboarding Guide
+
+    /// One place on the settings panel the guide can point at. Named rather than measured: the panel is a SwiftUI
+    /// view whose rows move as the setup section fills and empties, so the only code that knows where a row stands is the row itself.
+    enum KikiSettingsPanelAnchor: Hashable {
+        case deepSeekAPIKeyField
+        case screenRecordingPermissionRow
+        case screenContentPermissionRow
+    }
+
+    /// Where each anchored element of the settings panel stands on screen, in AppKit global coordinates.
+    /// Reported by the panel, read by the guide.
+    @Published private(set) var settingsPanelAnchorScreenFrames: [KikiSettingsPanelAnchor: CGRect] = [:]
+
+    /// Records where one anchored element stands, or forgets it when it leaves the screen. Guarded like
+    /// `settleVoiceState`, for the same reason: the panel re-reports on every layout pass, and an unchanged
+    /// dictionary written anyway would invalidate every view reading it.
+    func setSettingsPanelAnchorScreenFrame(_ screenFrame: CGRect?, for anchor: KikiSettingsPanelAnchor) {
+        var updatedScreenFrames = settingsPanelAnchorScreenFrames
+        if let screenFrame {
+            updatedScreenFrames[anchor] = screenFrame
+        } else {
+            updatedScreenFrames.removeValue(forKey: anchor)
+        }
+
+        guard updatedScreenFrames != settingsPanelAnchorScreenFrames else { return }
+        settingsPanelAnchorScreenFrames = updatedScreenFrames
+    }
+
+    /// Whether the settings panel is on screen right now. Its flights point at a thing only the panel shows, and
+    /// the user leaves it constantly: a cursor flying at a row nobody can see reads as a fault, not as guidance —
+    /// so the flights are gated on this, and the guide's wait is woken by it.
+    @Published private(set) var isTheSettingsPanelVisible = false
+
+    /// The panel is on screen. Called by `MenuBarPanelManager` where the panel is ordered in and out.
+    func theSettingsPanelCameOnScreen() {
+        guard !isTheSettingsPanelVisible else { return }
+        isTheSettingsPanelVisible = true
+    }
+
+    func theSettingsPanelWentOffScreen() {
+        guard isTheSettingsPanelVisible else { return }
+        isTheSettingsPanelVisible = false
+    }
+
+    /// Whether a reply is being had right now, in any of its three phases. Asked by the guide before it speaks,
+    /// points or presses: a turn owns the voice, cursor and keyboard, and a new question's teardown stops whatever the guide was doing.
+    var isATurnUnderwayRightNow: Bool {
+        isProducingAReply || isSpeakingReply || buddyDictationManager.isDictationInProgress
+    }
+
+    /// Whether an action is still in the air — what the guide's press asks on its own, because a refusal *while
+    /// one is in flight* is not "Kiki may not press": it is the ordinary state of a press this beat just sent, not yet landed.
+    var isAnActionBeingWaitedOn: Bool { actionBeingWaitedOn != nil }
+
+    /// The first-run guide — the segments themselves live in `KikiOnboardingGuide`.
+    private(set) lazy var onboardingGuide = KikiOnboardingGuide(companionManager: self)
+
+    /// Shows the overlay for the guide on a launch where `start()` deliberately left it hidden — it raises the cursor
+    /// only when setup is complete, so on a fresh install the guide would have nowhere to fly from. Does nothing when the overlay is up or the cursor is switched off.
+    func showTheOverlayForTheFirstRunOnboardingGuide() {
+        guard !isOverlayVisible, isKikiCursorEnabled else { return }
+        overlayWindowManager.hasShownOverlayBefore = true
+        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+        isOverlayVisible = true
+    }
+
+    /// The guide line being spoken, and what releases the script that spoke it: `speakPreparedSegment` returns the
+    /// moment the audio starts, so a line's *end* arrives through `handlePlaybackFinished` — and a stopped playback
+    /// reports nothing at all, which is why a new question's teardown and a watchdog of its own also release it.
+    private var onboardingGuideLineFinishedSpeakingContinuation: CheckedContinuation<Void, Never>?
+    private var onboardingGuideLineWriteOffTask: Task<Void, Never>?
+
+    /// How long one guide line may be waited on before the wait is written off: longer than any line the guide
+    /// says, short enough that a quiet synthesizer does not stall the segment — which no later launch repairs.
+    private static let secondsBeforeAnOnboardingGuideLineIsWrittenOff: TimeInterval = 15
+
+    /// Speaks one line the onboarding guide says, and returns once it has been heard or written off. Not the
+    /// reply path: nothing is queued behind a reply's segments, the guide waits for a turn to end, and
+    /// `isSpeakingReply` stays false throughout — which is what lets `handlePlaybackFinished` tell the two apart.
+    func speakAnOnboardingGuideLine(_ lineToSpeak: String) async {
+        // The video is the guide's ending, and its narration owns the voice from the moment it starts —
+        // a line spoken now would talk over it.
+        guard !showOnboardingVideo else { return }
+
+        // Any wait left armed by an earlier line belongs to a script that has already moved on.
+        finishTheOnboardingGuideLineIfItIsStillBeingWaitedOn()
+
+        ttsClient.discardPreparedSegments()
+        ttsClient.prepareSpeechSegment(spokenText: lineToSpeak, segmentIndex: 0)
+
+        // The continuation is armed before the speaking task exists: a segment the synthesizer yields no audio for
+        // reports its end synchronously from inside `speakPreparedSegment`, and a continuation armed after that would never be resumed.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            onboardingGuideLineFinishedSpeakingContinuation = continuation
+
+            onboardingGuideLineWriteOffTask?.cancel()
+            onboardingGuideLineWriteOffTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.secondsBeforeAnOnboardingGuideLineIsWrittenOff * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.finishTheOnboardingGuideLineIfItIsStillBeingWaitedOn()
+            }
+
+            Task { [weak self] in
+                await self?.ttsClient.speakPreparedSegment(segmentIndex: 0)
+            }
+        }
+
+        ttsClient.discardPreparedSegments()
+    }
+
+    /// Releases the wait on the guide line being spoken, if one is waiting, and lets go of a video that asked to start
+    /// while the line was still sounding. The one resumer, called from the three ways a line ends — heard through
+    /// (`handlePlaybackFinished`), the watchdog running out, the teardown a new question performs — and the guard also serves the fourth caller, the cleanup a new line performs before arming its own wait.
+    func finishTheOnboardingGuideLineIfItIsStillBeingWaitedOn() {
+        onboardingGuideLineWriteOffTask?.cancel()
+        onboardingGuideLineWriteOffTask = nil
+
+        // Guarded rather than optional-chained, because the deferred video below belongs to the end of a
+        // line and must not start a beat before the next one.
+        guard let continuation = onboardingGuideLineFinishedSpeakingContinuation else { return }
+        onboardingGuideLineFinishedSpeakingContinuation = nil
+        continuation.resume()
+
+        if shouldTriggerOnboardingOnceTheGuideStopsSpeaking {
+            shouldTriggerOnboardingOnceTheGuideStopsSpeaking = false
+            triggerOnboarding()
+        }
+    }
+
+    /// The screen an AppKit global point falls on, or nil when it falls on none — a point left over from a
+    /// display that has since been unplugged.
+    func screenContaining(appKitScreenLocation: CGPoint) -> NSScreen? {
+        NSScreen.screens.first { $0.frame.contains(appKitScreenLocation) }
+    }
+
+    /// Sends the cursor to a point on screen with one thing written beside it and nothing done on arrival. Built the way
+    /// `performOnboardingDemoInteraction` builds its target rather than through `beginFlightOfTheCursor`, which takes the
+    /// pointing tour's bookkeeping with it: the guide has a single look that ends by itself.
+    ///
+    /// - Returns: whether a flight was asked for — false when the overlay is not up or the point is on no connected screen, ordinary states rather than failures.
+    @discardableResult
+    func pointTheCursorAtAppKitScreenLocation(_ screenLocation: CGPoint, saying bubbleText: String) -> Bool {
+        guard isOverlayVisible, let containingScreen = screenContaining(appKitScreenLocation: screenLocation) else {
+            return false
+        }
+
+        pointingTarget = PointingTarget(
+            screenLocation: screenLocation,
+            displayFrame: containingScreen.frame,
+            bubbleInvitation: .lookAtElement,
+            bubbleText: bubbleText,
+            actionToPerformOnArrival: nil
+        )
+        // Bumped after the target is written: the overlay reads the target when the count changes.
+        pointingFlightRequestCount += 1
+        return true
+    }
+
+    /// Points at an anchored element of the settings panel, waiting for the panel to report where it stands: it is up
+    /// but still laying out for the first moments of a segment, and its rows move as the setup section fills in, so
+    /// the frame is waited for rather than read once. It also has to be *on screen* — a hidden panel's rows keep
+    /// reporting frames, and flying to one is the cursor flashing at nothing.
+    ///
+    /// - Returns: whether the cursor was sent; false when the frame never arrived, the panel is hidden, or the cursor is hidden.
+    @discardableResult
+    func pointTheCursorAtSettingsPanelAnchor(
+        _ anchor: KikiSettingsPanelAnchor,
+        saying bubbleText: String,
+        waitingUpToSeconds: TimeInterval
+    ) async -> Bool {
+        let momentToGiveUpWaiting = Date().addingTimeInterval(waitingUpToSeconds)
+        while Date() < momentToGiveUpWaiting {
+            if isTheSettingsPanelVisible, let anchorScreenFrame = settingsPanelAnchorScreenFrames[anchor] {
+                return pointTheCursorAtAppKitScreenLocation(
+                    CGPoint(x: anchorScreenFrame.midX, y: anchorScreenFrame.midY),
+                    saying: bubbleText
+                )
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        return false
+    }
+
+    /// The smallest and largest a dialog is taken to be, in points. Distinguishes a dialog from the rest of the
+    /// window list: menu bar extras and the status item are short, a browser is larger; the settings pane measures
+    /// inside the range on some displays, so it is dropped by frame instead.
+    private static let smallestDialogWindowSizeInPoints = CGSize(width: 120, height: 80)
+    private static let largestDialogWindowSizeInPoints = CGSize(width: 1000, height: 750)
+
+    /// The two layers a dialog window stands at: `.normal`, and `.modalPanel` for `NSAlert` and the consent
+    /// prompts macOS 26 presents through UserNotificationCenter — kept apart from the menu bar, the Dock and this app's overlay above them.
+    private static let layersADialogWindowStandsAt: Set<Int> = [
+        Int(NSWindow.Level.normal.rawValue),
+        Int(NSWindow.Level.modalPanel.rawValue)
+    ]
+
+    /// The system processes that raise the prompts the first-run guide waits on, and the button each one's alert
+    /// asks the user to press. Raw values are bundle identifiers: the window server reports an owner name in the
+    /// user's own language (系统设置), so an owner name is not a name to switch on. The button is read off the
+    /// host rather than the alert, because nothing at this point in the guide can read the alert.
+    enum SystemAlertHost: String {
+        case universalAccessAuthWarn = "com.apple.accessibility.universalAccessAuthWarn"
+        case loginwindow = "com.apple.loginwindow"
+        case systemSettings = "com.apple.systempreferences"
+        case userNotificationCenter = "com.apple.UserNotificationCenter"
+
+        /// The name on the fingerprint check's sheet. The check stands as loginwindow's own window on some machines
+        /// and as a sheet of System Settings on others, so it is not one host's name — where it is System Settings', the sheet's size is what reaches this name, never the host.
+        static let fingerprintCheckButtonName = "允许此操作"
+
+        /// The name on the alert's own button, for the hosts whose alerts say one thing apiece. System Settings
+        /// owns both the quit-and-reopen prompt and the fingerprint check, and only the sheet's size tells the two apart.
+        var buttonNameItAsksFor: String {
+            switch self {
+            case .universalAccessAuthWarn: "打开系统设置"
+            case .loginwindow: Self.fingerprintCheckButtonName
+            case .systemSettings: "退出并重新打开"
+            case .userNotificationCenter: "允许"
+            }
+        }
+    }
+
+    /// One of those processes' windows, standing on screen: where it is in the space the guide points in,
+    /// and which host raised it.
+    struct SystemAlertWindow {
+        let frame: CGRect
+        let host: SystemAlertHost
+    }
+
+    /// Every system alert standing on screen, front to back. Read off the window server rather than the accessibility
+    /// tree, because the grant the guide needs these for is one the app does not hold yet. This app's own windows are
+    /// left out — the settings panel carries 「允许 Kiki 用鼠标操作」, and a search for 「允许」 narrowed only by
+    /// "inside some window" would find that row. Three filters stand between the window list and an alert: the two
+    /// layers a dialog stands at, the size range, and the host, which keeps a stranger's panel from having a button named over it; the System Settings pane is dropped by frame, because on some displays it measures inside the size range.
+    func systemAlertWindowsInFrontToBackOrder() -> [SystemAlertWindow] {
+        guard let windowInfoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return [] }
+
+        let ownProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+        let primaryScreenHeightInPoints = NSScreen.screens.first?.frame.maxY ?? 0
+        // Found once, outside the walk: finding it is a walk of the window list in its own right.
+        let systemSettingsPaneFrame = frameOfTheSystemSettingsWindow()
+
+        var systemAlertWindows: [SystemAlertWindow] = []
+        for windowInfo in windowInfoList {
+            guard let ownerProcessIdentifier = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
+                  ownerProcessIdentifier != ownProcessIdentifier,
+                  let windowLayer = windowInfo[kCGWindowLayer as String] as? Int,
+                  Self.layersADialogWindowStandsAt.contains(windowLayer),
+                  let windowAlpha = windowInfo[kCGWindowAlpha as String] as? Double,
+                  windowAlpha > 0.05,
+                  let boundsDictionary = windowInfo[kCGWindowBounds as String] as? NSDictionary,
+                  let accessibilityScreenFrame = CGRect(dictionaryRepresentation: boundsDictionary)
+            else { continue }
+
+            let screenFrame = Self.appKitScreenFrame(
+                fromAccessibilityScreenFrame: accessibilityScreenFrame,
+                primaryScreenHeightInPoints: primaryScreenHeightInPoints
+            )
+            guard screenFrame.width >= Self.smallestDialogWindowSizeInPoints.width,
+                  screenFrame.height >= Self.smallestDialogWindowSizeInPoints.height,
+                  screenFrame.width <= Self.largestDialogWindowSizeInPoints.width,
+                  screenFrame.height <= Self.largestDialogWindowSizeInPoints.height
+            else { continue }
+
+            guard screenFrame != systemSettingsPaneFrame else { continue }
+
+            let alertHost = Self.systemAlertHost(
+                ownedByProcessIdentifier: ownerProcessIdentifier,
+                named: windowInfo[kCGWindowOwnerName as String] as? String
+            )
+            guard let alertHost else { continue }
+
+            systemAlertWindows.append(SystemAlertWindow(frame: screenFrame, host: alertHost))
+        }
+        return systemAlertWindows
+    }
+
+    /// The one place a window's owner becomes one of the hosts, or nil for one that raises no system prompt. The
+    /// owner name is only a fallback, for the host NSWorkspace may not list: a daemon's process name is not localized, unlike an app's.
+    private static func systemAlertHost(
+        ownedByProcessIdentifier ownerProcessIdentifier: pid_t,
+        named ownerName: String?
+    ) -> SystemAlertHost? {
+        if let bundleIdentifier = NSRunningApplication(processIdentifier: ownerProcessIdentifier)?.bundleIdentifier,
+           let alertHost = SystemAlertHost(rawValue: bundleIdentifier) {
+            return alertHost
+        }
+        return ownerName == "universalAccessAuthWarn" ? .universalAccessAuthWarn : nil
+    }
+
+    /// The frame of the System Settings window, or nil when it is not on screen: found by owning process, not by
+    /// size, because on some displays the pane measures inside the dialog range. The guide points here for grants only the user's hand can make.
+    func frameOfTheSystemSettingsWindow() -> CGRect? {
+        let systemSettingsProcessIdentifiers = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.systempreferences")
+            .map(\.processIdentifier)
+        guard !systemSettingsProcessIdentifiers.isEmpty else { return nil }
+
+        guard let windowInfoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+
+        let primaryScreenHeightInPoints = NSScreen.screens.first?.frame.maxY ?? 0
+
+        var largestScreenFrame: CGRect?
+        for windowInfo in windowInfoList {
+            guard let ownerProcessIdentifier = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
+                  systemSettingsProcessIdentifiers.contains(ownerProcessIdentifier),
+                  let windowAlpha = windowInfo[kCGWindowAlpha as String] as? Double,
+                  windowAlpha > 0.05,
+                  let boundsDictionary = windowInfo[kCGWindowBounds as String] as? NSDictionary,
+                  let accessibilityScreenFrame = CGRect(dictionaryRepresentation: boundsDictionary)
+            else { continue }
+
+            let screenFrame = Self.appKitScreenFrame(
+                fromAccessibilityScreenFrame: accessibilityScreenFrame,
+                primaryScreenHeightInPoints: primaryScreenHeightInPoints
+            )
+            // The largest window is the pane. System Settings owns smaller ones too — its own alerts, and
+            // on some versions a toolbar shelf — and the pane is what is being pointed at.
+            if let currentLargest = largestScreenFrame,
+               currentLargest.width * currentLargest.height >= screenFrame.width * screenFrame.height {
+                continue
+            }
+            largestScreenFrame = screenFrame
+        }
+        return largestScreenFrame
+    }
+
+    /// Converts a window-server frame into AppKit global coordinates, through the one copy of the flip rather than
+    /// a second subtraction: `CGWindowListCopyWindowInfo` reports in the Accessibility space, the space `resolveActionTarget` converts from — top-left origin on the primary display.
+    private static func appKitScreenFrame(
+        fromAccessibilityScreenFrame accessibilityScreenFrame: CGRect,
+        primaryScreenHeightInPoints: CGFloat
+    ) -> CGRect {
+        let topLeftInAppKit = ElementClicker.appKitScreenLocation(
+            fromAccessibilityScreenPoint: accessibilityScreenFrame.origin,
+            primaryScreenHeightInPoints: primaryScreenHeightInPoints
+        )
+        let bottomRightInAppKit = ElementClicker.appKitScreenLocation(
+            fromAccessibilityScreenPoint: CGPoint(
+                x: accessibilityScreenFrame.maxX,
+                y: accessibilityScreenFrame.maxY
+            ),
+            primaryScreenHeightInPoints: primaryScreenHeightInPoints
+        )
+
+        return CGRect(
+            x: topLeftInAppKit.x,
+            y: bottomRightInAppKit.y,
+            width: bottomRightInAppKit.x - topLeftInAppKit.x,
+            height: topLeftInAppKit.y - bottomRightInAppKit.y
+        )
+    }
+
+    /// The middle of the one piece of on-screen text standing alone as this label, in AppKit global coordinates, searched
+    /// for only inside the given windows — frontmost first, reading order within a window. Standing alone as a whole word
+    /// is what keeps 「允许」 from being found inside 「不允许」, the two sitting one character apart on the very alerts this aims a press at.
+    ///
+    /// - Returns: the point and the capture it was converted from — nil when the screen cannot be read or the label is nowhere.
+    func locationStandingAloneAsLabel(
+        _ label: String,
+        insideOneOf containingWindowFrames: [CGRect]
+    ) async -> (screenLocation: CGPoint, displayFrame: CGRect)? {
+        let capturedScreens: [CompanionScreenCapture]
+        do {
+            capturedScreens = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+        } catch {
+            print("Onboarding guide: cannot read the screen to find 「\(label)」 — \(error)")
+            return nil
+        }
+
+        var recognizedLinesByScreen: [[RecognizedTextLine]] = []
+        for capturedScreen in capturedScreens {
+            recognizedLinesByScreen.append(
+                await ScreenshotTextRecognizer.recognizedLines(in: capturedScreen.imageData)
+            )
+        }
+
+        for containingWindowFrame in containingWindowFrames {
+            for (screenIndex, capturedScreen) in capturedScreens.enumerated() {
+                let boxesStandingAlone = ScreenshotTextElementMatcher.elementBoxesStandingAlone(
+                    matchingElementLabel: label,
+                    amongRecognizedLines: recognizedLinesByScreen[screenIndex]
+                )
+                for boxStandingAlone in boxesStandingAlone {
+                    let resolvedLocation = Self.screenLocation(
+                        forScreenshotCoordinate: CGPoint(x: boxStandingAlone.midX, y: boxStandingAlone.midY),
+                        on: capturedScreen
+                    )
+                    if containingWindowFrame.contains(resolvedLocation.screenLocation) {
+                        return resolvedLocation
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Presses the button carrying this label in the system's own permission alerts, frontmost first. It reaches the
+    /// machine the way every other action does — the same `carryOutTheResolvedAction`, red carrying flight, sound and
+    /// `CGEvent` — so a press the guide makes is not a second kind of press. The answer goes to nobody
+    /// (`.theOnboardingGuideItself`), because the script waits on the permission fact its press was made for.
+    ///
+    /// - Returns: whether the press was sent; false is ordinary — nothing stands alone as this label inside a dialog, the screen cannot be read, or Kiki may not press right now — and the guide points instead.
+    func pressTheSystemAlertButtonLabelled(_ buttonLabel: String) async -> Bool {
+        guard isAutomaticClickingEnabled,
+              hasAccessibilityPermission,
+              isOverlayVisible,
+              !isATurnUnderwayRightNow
+        else {
+            print("Onboarding guide: not pressing 「\(buttonLabel)」 — Kiki may not or cannot press right now")
+            return false
+        }
+
+        // Its own guard, because this one is ordinary rather than a refusal: the beat is woken every second and
+        // a half, and a press asked for a moment ago is still flying — `isAnActionBeingWaitedOn` tells the two apart.
+        guard actionBeingWaitedOn == nil else {
+            print("Onboarding guide: not pressing 「\(buttonLabel)」 — an action is still in the air")
+            return false
+        }
+
+        let systemAlertWindowFrames = systemAlertWindowsInFrontToBackOrder().map(\.frame)
+        guard !systemAlertWindowFrames.isEmpty,
+              let pressTarget = await locationStandingAloneAsLabel(buttonLabel, insideOneOf: systemAlertWindowFrames)
+        else {
+            print("Onboarding guide: not pressing 「\(buttonLabel)」 — nothing standing alone inside an alert, or the screen could not be read")
+            return false
+        }
+
+        // Asked again after the capture, which is a second wide: the user may have started a turn, or a
+        // replayed action may have a press in flight by now.
+        guard isAutomaticClickingEnabled,
+              !isATurnUnderwayRightNow,
+              actionBeingWaitedOn == nil
+        else {
+            print("Onboarding guide: not pressing 「\(buttonLabel)」 — a turn or another action began while the screen was being read")
+            return false
+        }
+
+        let actionBeingWaitedOn = ActionBeingWaitedOn(
+            actionIdentifier: UUID(),
+            whoHearsTheAnswer: .theOnboardingGuideItself
+        )
+        self.actionBeingWaitedOn = actionBeingWaitedOn
+
+        await carryOutTheResolvedAction(
+            .resolved(
+                appKitScreenLocation: pressTarget.screenLocation,
+                displayFrame: pressTarget.displayFrame,
+                dragDestinationAppKitScreenLocation: nil,
+                message: "已点击「\(buttonLabel)」。",
+                hint: nil
+            ),
+            // No label travels with the press. The label was this app's own way of finding the point, and
+            // the point is the whole instruction — the same shape a click the user typed as a coordinate has.
+            elementText: nil,
+            action: .press(.singleClick),
+            actionBeingWaitedOn: actionBeingWaitedOn
+        )
+        return true
     }
 }

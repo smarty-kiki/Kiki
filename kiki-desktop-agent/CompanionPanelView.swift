@@ -49,33 +49,35 @@ struct CompanionPanelView: View {
                 automaticKeyboardToggleRow
                     .padding(.horizontal, 16)
 
-                // 10 rather than the 4 the rows above use: a settings row carries 4pt of padding
-                // of its own and its switch is drawn taller than its label, and this section
-                // carries neither, so the difference is added here to leave the same gap again.
+                // 10 rather than the 4 the rows above use: those carry 4pt of padding of their own and
+                // a taller switch.
                 Spacer()
                     .frame(height: 10)
 
                 savedDeepSeekAPIKeySection
                     .padding(.horizontal, 16)
-            } else {
+            } else if !companionManager.hasCompletedOnboarding {
+                // Setup, stage one: the key alone. The permission rows are stage two, and arrive
+                // only once this step is done — the same path the guide walks.
                 settingsCopySection
                     .padding(.top, 16)
                     .padding(.horizontal, 16)
-
-                // A row goes away as its own step is finished, so the setup half shows exactly what
-                // is still missing and nothing that is already done.
-                if !companionManager.allPermissionsGranted {
-                    Spacer()
-                        .frame(height: 16)
-
-                    settingsSection
-                        .padding(.horizontal, 16)
-                }
 
                 Spacer()
                     .frame(height: 14)
 
                 deepSeekAPIKeySection
+                    .padding(.horizontal, 16)
+            } else {
+                // Setup, stage two: the grants, all at once — the guide is what takes them one by one.
+                settingsCopySection
+                    .padding(.top, 16)
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 16)
+
+                settingsSection
                     .padding(.horizontal, 16)
             }
 
@@ -103,13 +105,9 @@ struct CompanionPanelView: View {
         .background(panelBackground)
     }
 
-    /// Whether Kiki has been set up at all: a key saved and every permission in place.
-    ///
-    /// The panel is split on this one question rather than on each half's own state, so the setup
-    /// half and the everyday half can never both claim a row — which is what the key field did when
-    /// it was shown unconditionally beside the shortcut copy. It reads `hasCompletedOnboarding`
-    /// rather than the Keychain so that a key deleted outside the app does not put a fresh install's
-    /// panel back.
+    /// One question for the whole panel, not one per half, so the setup half and the everyday half can
+    /// never both claim a row. Read from `hasCompletedOnboarding` rather than the Keychain, so a key
+    /// deleted outside the app does not put a fresh install's panel back.
     private var isSetUp: Bool {
         companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted
     }
@@ -119,7 +117,6 @@ struct CompanionPanelView: View {
     private var panelHeader: some View {
         HStack {
             HStack(spacing: 8) {
-                // Animated status dot
                 Circle()
                     .fill(statusDotColor)
                     .frame(width: 8, height: 8)
@@ -157,15 +154,8 @@ struct CompanionPanelView: View {
 
     // MARK: - Task Progress
 
-    /// What the task in progress has taken, where it stands, and how close its context is to being
-    /// compressed into a summary.
-    ///
-    /// Read off `taskProgress` rather than worked out here: the estimate walks every character of
-    /// the conversation, and this body re-evaluates on every chunk of the reply.
-    ///
-    /// Absent until there is a task: a panel that says "no task yet" every time it is opened is
-    /// describing nothing, and the row would be there for the whole life of the app without ever
-    /// having anything to say.
+    /// Read off `taskProgress` rather than worked out here: the estimate walks every character of the
+    /// conversation, and this body re-evaluates on every chunk of the reply. Absent until there is a task.
     @ViewBuilder
     private var taskProgressSection: some View {
         if companionManager.taskProgress.hasATask {
@@ -178,11 +168,8 @@ struct CompanionPanelView: View {
         }
     }
 
-    /// The card itself: where the task stands on one line, and how full Kiki's head is on the next.
-    ///
-    /// Tinted and outlined in the accent rather than filled with `surface1` like the cards below it,
-    /// because those three describe ways of talking to Kiki that are always available while this one
-    /// is the task happening now — and it is the coloured thing on a panel of grey ones.
+    /// Tinted in the accent rather than `surface1` like the cards below, because this one is the task
+    /// happening now.
     private var taskStatusCard: some View {
         let progress = companionManager.taskProgress
 
@@ -192,9 +179,8 @@ struct CompanionPanelView: View {
                     .fill(progress.isRunning ? DS.Colors.accentText : DS.Colors.textTertiary)
                     .frame(width: 6, height: 6)
 
-                // The clock is read here rather than on the manager: what moves every second is the
-                // distance to a moment, not the moment itself, and that distance is drawn by this
-                // one line and nobody else.
+                // The clock is read here, not on the manager: what moves every second is the distance
+                // to a moment, not the moment itself, and only this line draws it.
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(taskStateDescription(of: progress, at: context.date))
                         .font(.system(size: 12, weight: .medium))
@@ -231,11 +217,8 @@ struct CompanionPanelView: View {
         )
     }
 
-    /// Whether Kiki is still working on the task, which step of it it is on, and — once it is over —
-    /// how long it has before it resets.
-    ///
-    /// The countdown is shown only while nothing is running, because that is the only time it says
-    /// anything: a task in progress is activity, and every step of it pushes the moment back.
+    /// The countdown shows only while nothing is running: a task in progress is activity, and every step
+    /// of it pushes the moment back.
     private func taskStateDescription(of progress: TaskProgress, at now: Date) -> String {
         guard progress.isRunning else {
             return "忙完了" + conversationRemainingDescription(of: progress, at: now)
@@ -243,11 +226,8 @@ struct CompanionPanelView: View {
         return "正在忙 · 第 \(progress.stepInTheRoundInProgress) 步"
     }
 
-    /// How long the task that is over has left before it resets, and then which question resets it.
-    ///
-    /// Nothing is dropped at the moment the countdown runs out — the history goes when the next
-    /// question arrives and finds it too old — so this says when the reset comes rather than
-    /// announcing one that has not happened. The card keeps its shape either way.
+    /// Nothing is dropped when the countdown runs out — the history goes when the next question finds
+    /// it too old — so this says when the reset comes, not that it has happened.
     private func conversationRemainingDescription(of progress: TaskProgress, at now: Date) -> String {
         guard let secondsLeft = progress.secondsBeforeTheNextQuestionStartsANewConversation(from: now) else {
             return ""
@@ -257,17 +237,14 @@ struct CompanionPanelView: View {
         }
 
         if secondsLeft >= 60 {
-            // Rounded up, so most of a minute reads as that minute rather than as the one below it.
+            // Rounded up: most of a minute reads as that minute, not as the one below it.
             return " · \(Int(ceil(secondsLeft / 60))) 分钟后重置"
         }
         return " · \(Int(secondsLeft)) 秒后重置"
     }
 
-    /// How full Kiki's head is, said the way a person would say it rather than the way the
-    /// compression is implemented.
-    ///
-    /// The threshold that makes it "getting full" is the same one the bar changes colour at, so the
-    /// sentence and the bar agree about when that is instead of being two opinions of it.
+    /// The "getting full" threshold is the one the bar changes colour at, so the sentence and the bar
+    /// cannot hold two opinions of when that is.
     private func memoryUseDescription(of progress: TaskProgress) -> String {
         let percentUsed = Int(progress.fractionOfTheRoomBeforeCompressionUsed * 100)
 
@@ -277,10 +254,8 @@ struct CompanionPanelView: View {
         return "脑子用了 \(percentUsed)% · 还有 \(100 - percentUsed)% 才满"
     }
 
-    /// How much of the room there is before the compression, drawn as a bar.
-    ///
-    /// Measured against the trigger rather than against the model's whole window, so a full bar and
-    /// the compression starting are the same moment.
+    /// Measured against the trigger, not the model's whole window, so a full bar and the compression
+    /// starting are one moment.
     private func contextUseBar(fractionUsed: Double) -> some View {
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
@@ -297,8 +272,8 @@ struct CompanionPanelView: View {
 
     // MARK: - Setup Copy
 
-    /// What the panel says while Kiki cannot be used yet. The three ways to use it are not described
-    /// here — those are `howToUseKikiSection`, which waits until there is something to use.
+    /// What the panel says while Kiki cannot be used yet; the three ways to use it are
+    /// `howToUseKikiSection`, which waits until there is something to use.
     @ViewBuilder
     private var settingsCopySection: some View {
         if companionManager.allPermissionsGranted {
@@ -308,13 +283,14 @@ struct CompanionPanelView: View {
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.hasCompletedOnboarding {
-            // Permissions were revoked after onboarding — tell user to re-grant
+            // The key is saved and grants are missing — a first run just past the key step, or an
+            // install whose grants were revoked — so nothing here may say anything was taken away.
             VStack(alignment: .leading, spacing: 6) {
-                Text("需要授权")
+                Text("还差几项授权")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                Text("部分权限已被撤销，请在下方重新授予全部四项以继续使用 Kiki。")
+                Text("在下面逐个把权限打开，Kiki 就能开始了。")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -342,13 +318,8 @@ struct CompanionPanelView: View {
 
     // MARK: - How To Use Kiki
 
-    /// The three ways into Kiki, one card each.
-    ///
-    /// They are cards rather than three lines because they do not read alike: two are keyboard
-    /// shortcuts that differ only in which modifiers and whether the key is held, and the third is
-    /// not a key at all. Written as a paragraph — which is what this was — the one shortcut that
-    /// needs a key held and the one that needs it tapped blur together, and the terminal is not
-    /// mentioned anywhere.
+    /// The three ways into Kiki, one card each — cards because they do not read alike: the two
+    /// shortcuts differ only in modifiers and whether the key is held, and the third way is not a key.
     private var howToUseKikiSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("怎么用 Kiki")
@@ -360,7 +331,6 @@ struct CompanionPanelView: View {
         .padding(.horizontal, 16)
     }
 
-    /// The everyday way in: hold both keys, speak, let go.
     private var askingKikiCard: some View {
         usageModeCard(
             iconName: "mic",
@@ -380,7 +350,6 @@ struct CompanionPanelView: View {
         }
     }
 
-    /// The other way in: Kiki watches the user do something once, then does it again on a loop.
     private var followingTheUserCard: some View {
         usageModeCard(
             iconName: "record.circle",
@@ -400,7 +369,6 @@ struct CompanionPanelView: View {
         }
     }
 
-    /// The way in that is not a key: a typed request that runs the same pipeline.
     private var commandLineCard: some View {
         usageModeCard(
             iconName: "terminal",
@@ -417,14 +385,11 @@ struct CompanionPanelView: View {
         }
     }
 
-    /// Whether the `kiki` command is in PATH, and the way to put it there.
+    /// Whether the `kiki` command is in PATH, and the way to put it there: the install costs one
+    /// system authorisation prompt — `/usr/local/bin` belongs to root — which is why it is a button
+    /// the user presses rather than something that happens at launch.
     ///
-    /// The install costs one system authorisation prompt — `/usr/local/bin` belongs to root, so
-    /// there is no way to write it without one — which is why it is a button the user presses
-    /// rather than something that happens at launch.
-    ///
-    /// Absent for a build that carries no tool inside it: there is nothing to install, and the
-    /// command above is then the build-product copy the README's `ln -s` is about.
+    /// Absent for a build carrying no tool inside it: there is nothing to install.
     @ViewBuilder
     private var commandLineToolInstallRow: some View {
         if KikiCommandLineInstaller.toolInsideTheRunningApp != nil {
@@ -458,8 +423,8 @@ struct CompanionPanelView: View {
         }
     }
 
-    /// One card. The shortcut row is a closure because the third card has a command line where the
-    /// other two have keycaps — the shape is shared, what names the trigger is not.
+    /// The trigger is a closure because the third card has a command line where the other two have
+    /// keycaps.
     private func usageModeCard(
         iconName: String,
         title: String,
@@ -478,8 +443,7 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textPrimary)
             }
 
-            // Aligned under the title rather than under the icon, so the shortcut and the sentence
-            // describing it read as one block.
+            // Aligned under the title, not the icon, so the trigger and its sentence read as one block.
             trigger()
                 .padding(.leading, 24)
 
@@ -502,7 +466,6 @@ struct CompanionPanelView: View {
         )
     }
 
-    /// A key drawn the way a keyboard draws it: the modifier's own glyph, then its name.
     private func shortcutKeyCap(symbol: String, keyName: String) -> some View {
         HStack(spacing: 3) {
             Text(symbol)
@@ -541,25 +504,31 @@ struct CompanionPanelView: View {
 
     // MARK: - Permissions
 
+    /// 22 is the 授权 button's own height (11 pt text, 4 pt padding, capsule stroke). Rows are pinned to
+    /// it, so a grant — which swaps that button for the shorter 已授权 badge — never changes a row's
+    /// height, and the panel doesn't shift while the guide walks it.
+    private static let permissionRowContentHeight: CGFloat = 22
+
+    /// The permission rows, in the order the first-run guide takes them — the guide's own dependency
+    /// order, so the list reads the way the walk goes. A row moves here only when the guide's moves too.
     private var settingsSection: some View {
         VStack(spacing: 2) {
             sectionHeader("权限")
                 .padding(.bottom, 4)
 
-            microphonePermissionRow
-
-            // Only for the on-device transcription backend: the network providers never
-            // touch the Speech Recognition TCC service, so this row would be un-grantable.
-            if companionManager.buddyDictationManager.transcriptionProviderRequiresSpeechRecognitionPermission {
-                speechRecognitionPermissionRow
-            }
-
-            accessibilityPermissionRow
-
             screenRecordingPermissionRow
 
             screenContentPermissionRow
 
+            accessibilityPermissionRow
+
+            microphonePermissionRow
+
+            // Only for the on-device backend: the network providers never touch the Speech Recognition
+            // TCC service, so this row would be un-grantable.
+            if companionManager.buddyDictationManager.transcriptionProviderRequiresSpeechRecognitionPermission {
+                speechRecognitionPermissionRow
+            }
         }
     }
 
@@ -591,7 +560,6 @@ struct CompanionPanelView: View {
             } else {
                 HStack(spacing: 6) {
                     Button(action: {
-                        // System prompt on the first attempt, System Settings after that.
                         WindowPositionManager.requestAccessibilityPermission()
                     }) {
                         Text("授权")
@@ -628,6 +596,7 @@ struct CompanionPanelView: View {
                 }
             }
         }
+        .frame(height: Self.permissionRowContentHeight)
         .padding(.vertical, 6)
     }
 
@@ -640,17 +609,9 @@ struct CompanionPanelView: View {
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("屏幕录制")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(DS.Colors.textSecondary)
-
-                    Text(isGranted
-                         ? "只在你按快捷键时截屏"
-                         : "授权后请退出并重新打开")
-                        .font(.system(size: 10))
-                        .foregroundColor(DS.Colors.textTertiary)
-                }
+                Text("屏幕录制")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
             }
 
             Spacer()
@@ -684,14 +645,19 @@ struct CompanionPanelView: View {
                 .pointerCursor()
             }
         }
+        .frame(height: Self.permissionRowContentHeight)
         .padding(.vertical, 6)
+        .background(
+            KikiSettingsPanelAnchorReporter(
+                companionManager: companionManager,
+                anchor: .screenRecordingPermissionRow
+            )
+        )
     }
 
-    /// The second stage of the screen permission chain, shown before the first stage is
-    /// granted. 「屏幕内容」 is a separate TCC grant that macOS only offers once
-    /// ScreenCaptureKit has taken a real screenshot, so it cannot be requested until
-    /// Screen Recording is in place. Greyed out rather than hidden, so the panel doesn't
-    /// grow a row out of nowhere after the first grant.
+    /// The second stage of the screen permission chain: 「屏幕内容」 is a separate TCC grant macOS only
+    /// offers once ScreenCaptureKit has taken a real screenshot. Greyed out rather than hidden, so the
+    /// panel doesn't grow a row out of nowhere after the first grant.
     private var screenContentPermissionRow: some View {
         let isGranted = companionManager.hasScreenContentPermission
         let canRequestPermission = companionManager.hasScreenRecordingPermission
@@ -737,7 +703,14 @@ struct CompanionPanelView: View {
                 .disabled(!canRequestPermission)
             }
         }
+        .frame(height: Self.permissionRowContentHeight)
         .padding(.vertical, 6)
+        .background(
+            KikiSettingsPanelAnchorReporter(
+                companionManager: companionManager,
+                anchor: .screenContentPermissionRow
+            )
+        )
     }
 
     private var microphonePermissionRow: some View {
@@ -767,7 +740,6 @@ struct CompanionPanelView: View {
                 }
             } else {
                 Button(action: {
-                    // Native dialog on the first attempt; System Settings once denied.
                     let status = AVCaptureDevice.authorizationStatus(for: .audio)
                     if status == .notDetermined {
                         AVCaptureDevice.requestAccess(for: .audio) { _ in }
@@ -791,6 +763,7 @@ struct CompanionPanelView: View {
                 .pointerCursor()
             }
         }
+        .frame(height: Self.permissionRowContentHeight)
         .padding(.vertical, 6)
     }
 
@@ -837,6 +810,7 @@ struct CompanionPanelView: View {
                 .pointerCursor()
             }
         }
+        .frame(height: Self.permissionRowContentHeight)
         .padding(.vertical, 6)
     }
 
@@ -927,13 +901,12 @@ struct CompanionPanelView: View {
 
     /// The switch for the one thing Kiki does to the machine rather than on it.
     ///
-    /// It covers both halves — pressing and scrolling — because in the user's mind it answers one
-    /// question, "may Kiki move things on my screen with the mouse", and a switch that stopped at
-    /// pressing would let the screen keep moving after it was turned off.
+    /// It covers pressing and scrolling together — one question in the user's mind, "may Kiki move
+    /// things on my screen with the mouse" — because a switch that stopped at pressing would let the
+    /// screen keep moving after it was turned off.
     ///
-    /// Off, a `[CLICK:…]` means what it meant before pressing existed: the cursor still
-    /// flies to the element and the bubble still says 「点这里」. A refused press
-    /// degrades to the same thing.
+    /// Off, a `[CLICK:…]` reads as it did before pressing existed: the cursor still flies and the
+    /// bubble still says 「点这里」. A refused press degrades to the same thing.
     private var automaticClickingToggleRow: some View {
         HStack {
             HStack(spacing: 8) {
@@ -963,13 +936,12 @@ struct CompanionPanelView: View {
 
     /// The switch for the other way Kiki reaches the machine.
     ///
-    /// A row of its own rather than folded into the mouse's, because they are two permissions in the
-    /// user's mind as much as in the code: typing into a field and pressing a combination are felt as
-    /// "Kiki has my keyboard", which is a different thing from "Kiki has my mouse", and someone who
-    /// wants to watch it point and click without ever touching the keyboard must be able to say so.
+    /// A row of its own rather than folded into the mouse's: "Kiki has my keyboard" is a different
+    /// permission from "Kiki has my mouse", and someone who wants to watch it point and click without
+    /// ever handing over the keyboard must be able to say so.
     ///
     /// Off, a `[TYPE:…]` or `[KEY:…]` means what a `[CLICK:…]` means with the mouse switch off: the
-    /// cursor still flies to the element and the bubble still says 「看这里」.
+    /// cursor still flies and the bubble says 「看这里」.
     private var automaticKeyboardToggleRow: some View {
         HStack {
             HStack(spacing: 8) {
@@ -1021,7 +993,6 @@ struct CompanionPanelView: View {
 
     // MARK: - DeepSeek API Key
 
-    /// The key while it is still missing: the field, and nothing to collapse.
     private var deepSeekAPIKeySection: some View {
         VStack(alignment: .leading, spacing: 8) {
             deepSeekAPIKeyTitleRow
@@ -1032,9 +1003,9 @@ struct CompanionPanelView: View {
 
     /// The key once it is saved: a line saying so, and a way back to the field.
     ///
-    /// The field is put away because a saved key never needs re-typing, but it has to stay
-    /// reachable — this row is the only place in the app that can put a different key in the
-    /// Keychain, so collapsing it without the 更换 button would make a key unchangeable.
+    /// The field is put away because a saved key never needs re-typing, but it has to stay reachable:
+    /// this row is the only place in the app that can put a different key in, so collapsing it without
+    /// 更换 would make a key unchangeable.
     private var savedDeepSeekAPIKeySection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
@@ -1091,11 +1062,9 @@ struct CompanionPanelView: View {
 
     private var deepSeekAPIKeyField: some View {
         HStack(spacing: 6) {
-                // A SecureField so a key pasted with someone looking over your shoulder
-                // isn't readable off the screen. The field stays empty even when a key is
-                // saved — the 「已保存」 label above is the confirmation, and an empty
-                // field can't silently re-write what was stored before. The placeholder
-                // differs for the same reason.
+                // A SecureField so a pasted key isn't readable off the screen. It stays empty even when
+                // a key is saved — 「已保存」 above is the confirmation — so it can't silently re-write
+                // what was stored, and the placeholder differs for the same reason.
                 SecureField(
                     companionManager.hasDeepSeekAPIKey ? "*******************" : "sk-...",
                     text: $deepSeekAPIKeyInput
@@ -1112,6 +1081,12 @@ struct CompanionPanelView: View {
                     .overlay(
                         RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                             .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                    )
+                    .background(
+                        KikiSettingsPanelAnchorReporter(
+                            companionManager: companionManager,
+                            anchor: .deepSeekAPIKeyField
+                        )
                     )
                     .onSubmit(saveDeepSeekAPIKeyFromInput)
 
@@ -1138,14 +1113,13 @@ struct CompanionPanelView: View {
         !deepSeekAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// Stores the pasted key in the Keychain and empties the field, so the secret
-    /// doesn't sit in a text field for the rest of the session.
+    /// Stores the pasted key and empties the field, so the secret doesn't sit in a text field for
+    /// the rest of the session.
     private func saveDeepSeekAPIKeyFromInput() {
         guard canSaveDeepSeekAPIKey else { return }
         companionManager.saveDeepSeekAPIKey(deepSeekAPIKeyInput)
         deepSeekAPIKeyInput = ""
-        // Saving a replacement puts the field back away, so the panel returns to the line that
-        // says the key is saved rather than keeping the empty field on screen.
+        // Saving a replacement puts the field back away, rather than leaving the empty field on screen.
         isReplacingDeepSeekAPIKey = false
     }
 
@@ -1198,8 +1172,8 @@ struct CompanionPanelView: View {
 
     // MARK: - Footer
 
-    /// Read from the bundle rather than written here, so the number the panel shows is always the
-    /// one this build actually is — the same number a release tag and a bug report have to match.
+    /// Read from the bundle rather than written here, so the number shown is always the one this build
+    /// actually is — the same number a release tag and a bug report have to match.
     private var appVersionText: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
     }
@@ -1247,18 +1221,17 @@ struct CompanionPanelView: View {
     // MARK: - Visual Helpers
 
     private var panelBackground: some View {
+        // No shadow: the window is cut to this shape's size exactly, so a shadow drawn here is clipped
+        // everywhere except the four corner cut-outs, where it reads as a gray smudge.
         RoundedRectangle(cornerRadius: 12, style: .continuous)
             .fill(DS.Colors.background)
-            .shadow(color: Color.black.opacity(0.28), radius: 20, x: 0, y: 10)
-            .shadow(color: Color.black.opacity(0.14), radius: 4, x: 0, y: 2)
     }
 
     private var statusDotColor: Color {
         if companionManager.isRestingInTheStatusItemIcon {
             return DS.Colors.textTertiary
         }
-        // The accent like the other working states: waking is something Kiki is doing, where
-        // resting is something it is not.
+        // The accent like the other working states: waking is something Kiki is doing, resting is not.
         if companionManager.isWakingFromTheStatusItemIcon {
             return DS.Colors.accentText
         }
@@ -1320,4 +1293,127 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+// MARK: - Settings Panel Anchors
+
+/// Reports where one piece of the panel stands on screen, so the first-run guide can fly the cursor
+/// onto it. Each row the guide points at carries one of these behind it, because the panel is the
+/// only code that knows where its rows are — they move as the setup section fills in and empties.
+private struct KikiSettingsPanelAnchorReporter: NSViewRepresentable {
+    let companionManager: CompanionManager
+    let anchor: CompanionManager.KikiSettingsPanelAnchor
+
+    func makeNSView(context: Context) -> AnchorReportingView {
+        let anchorReportingView = AnchorReportingView(frame: .zero)
+        anchorReportingView.onAnchorScreenFrameChanged = { [weak companionManager] anchorScreenFrame in
+            companionManager?.setSettingsPanelAnchorScreenFrame(anchorScreenFrame, for: anchor)
+        }
+        return anchorReportingView
+    }
+
+    func updateNSView(_ anchorReportingView: AnchorReportingView, context: Context) {}
+}
+
+/// The invisible box a reporter hangs off, laid out by SwiftUI to the same frame as the content it
+/// stands behind.
+///
+/// The screen frame comes from `window.convertToScreen` and nothing else: the panel moves and resizes
+/// with its content, so working the position out from the panel's own frame would be a second copy
+/// that goes stale the moment either changes.
+private final class AnchorReportingView: NSView {
+    /// Where this box stands in AppKit global screen coordinates, or nil when it has no place on
+    /// screen to report.
+    var onAnchorScreenFrameChanged: ((CGRect?) -> Void)?
+
+    private var frameChangedObserver: NSObjectProtocol?
+    private var windowObservers: [NSObjectProtocol] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // The view's own layout changes are only announced with this on, and they are how a row
+        // appearing, disappearing or moving gets reported.
+        postsFrameChangedNotifications = true
+        frameChangedObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: self,
+            queue: .main
+        ) { [weak self] _ in
+            self?.reportTheAnchorScreenFrame()
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        if let frameChangedObserver {
+            NotificationCenter.default.removeObserver(frameChangedObserver)
+        }
+        for observer in windowObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        // The deferred reports below hold this view weakly, so a box torn down before its last report
+        // ran would leave a stale frame behind. This is the report that cannot be missed.
+        onAnchorScreenFrameChanged?(nil)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observeTheWindowTheViewIsIn()
+        reportTheAnchorScreenFrame()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        reportTheAnchorScreenFrame()
+    }
+
+    /// Watches the window this box stands in, so the window moving or resizing under a view whose own
+    /// frame has not changed still reports a new screen frame.
+    private func observeTheWindowTheViewIsIn() {
+        for observer in windowObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+
+        guard let window else {
+            windowObservers = []
+            return
+        }
+
+        let notificationNames: [Notification.Name] = [
+            NSWindow.didMoveNotification,
+            NSWindow.didResizeNotification,
+            .kikiPanelDidReposition
+        ]
+        windowObservers = notificationNames.map { notificationName in
+            NotificationCenter.default.addObserver(
+                forName: notificationName,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reportTheAnchorScreenFrame()
+            }
+        }
+    }
+
+    /// Reads the frame one run loop turn from now: these callbacks can arrive inside a SwiftUI update
+    /// pass, and reporting through the manager publishes a change of its own.
+    private func reportTheAnchorScreenFrame() {
+        DispatchQueue.main.async { [weak self] in
+            self?.readAndReportTheAnchorScreenFrame()
+        }
+    }
+
+    private func readAndReportTheAnchorScreenFrame() {
+        // A box SwiftUI has not laid out yet is not a place on screen, and reporting one would fly the
+        // cursor to the window's corner.
+        guard let window, bounds.width > 0, bounds.height > 0 else {
+            onAnchorScreenFrameChanged?(nil)
+            return
+        }
+        onAnchorScreenFrameChanged?(window.convertToScreen(convert(bounds, to: nil)))
+    }
 }
