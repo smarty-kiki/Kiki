@@ -7,14 +7,10 @@ final class KikiCommandSocketClient {
 
     private var receiveBuffer = Data()
 
-    /// Writes are serialised because the Ctrl-C handler comes in on its own queue and can land in
-    /// the middle of a command being sent.
+    /// Serialised: the Ctrl-C handler writes from its own queue.
     private let writeLock = NSLock()
 
-    /// Fails when nothing is listening.
-    ///
-    /// A socket file left behind by a process that is gone answers `ECONNREFUSED` here, which is
-    /// the same answer as "not running" — so a stale file needs no case of its own.
+    /// A stale socket file answers `ECONNREFUSED`, the same as "not running", so it needs no case.
     init?(socketPath: String) {
         let pathBytes = Array(socketPath.utf8)
         guard pathBytes.count <= KikiCommandProtocol.maximumSocketPathByteCount else { return nil }
@@ -25,8 +21,7 @@ final class KikiCommandSocketClient {
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            // The path was measured against the limit above, and `sockaddr_un()` zero-initialises,
-            // so it and its NUL terminator fit.
+            // Measured above; `sockaddr_un()` zero-initialises, so it fits with its NUL.
             destination.copyBytes(from: pathBytes)
         }
 
@@ -40,8 +35,7 @@ final class KikiCommandSocketClient {
             return nil
         }
 
-        // The app dying mid-write would otherwise raise SIGPIPE, whose default action is to kill
-        // this process — turning a lost connection into a crash with no message.
+        // The app dying mid-write would otherwise raise SIGPIPE, which by default kills this process.
         var noSigPipe: Int32 = 1
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
@@ -69,25 +63,19 @@ final class KikiCommandSocketClient {
 
     // MARK: - Receiving
 
-    /// How a read ended.
-    ///
-    /// A wait that ran out and a connection the app closed are different things to the person
-    /// watching — the second means Kiki went away mid-reply — so they are not collapsed into one
-    /// answer. Being displaced by another terminal is not a third case here: the app says so with
-    /// a `superseded` message before it closes, so that arrives as an ordinary event.
+    /// A wait that ran out and a connection the app closed are not collapsed: the second means Kiki
+    /// went away mid-reply. Displacement arrives as an ordinary `superseded` event.
     enum ReadOutcome {
         case event(KikiCommandEvent)
         case timedOut
         case disconnected
     }
 
-    /// The next message, waiting up to `timeoutSeconds` for it.
     func readNextEvent(timeoutSeconds: Double) -> ReadOutcome {
         while true {
             if let lineBytes = takeNextLineBytes() {
                 guard let event = try? KikiCommandProtocol.makeDecoder().decode(KikiCommandEvent.self, from: lineBytes) else {
-                    // A line this build cannot read is skipped rather than fatal: a newer app may
-                    // have added a type, and the ones this build does know still arrive on their own.
+                    // Unreadable line: skipped, not fatal — a newer app may have added a type.
                     continue
                 }
                 return .event(event)
@@ -112,8 +100,7 @@ final class KikiCommandSocketClient {
             let pollResult = poll(&descriptorSet, 1, timeoutMilliseconds)
             if pollResult > 0 { return true }
             if pollResult == 0 { return false }
-            // A signal interrupted the wait. Retrying is right because the Ctrl-C handler ends the
-            // process on its own; treating `EINTR` as a timeout would cut a reply short.
+            // EINTR: the Ctrl-C handler ends the process itself, so retry — a timeout would cut it short.
             if errno != EINTR { return false }
         }
     }

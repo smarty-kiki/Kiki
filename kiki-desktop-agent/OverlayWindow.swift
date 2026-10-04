@@ -1,8 +1,5 @@
 //
-//  OverlayWindow.swift
-//  kiki-desktop-agent
-//
-//  System-wide transparent overlay for the purple cursor: one window per display.
+//  OverlayWindow.swift — the transparent overlay for the purple cursor, one window per display.
 //
 
 import AppKit
@@ -20,13 +17,12 @@ class OverlayWindow: NSWindow {
 
         self.isOpaque = false
         self.backgroundColor = .clear
-        self.level = .screenSaver  // Always on top, above submenus and popups
-        self.ignoresMouseEvents = true  // Click-through
+        self.level = .screenSaver  // Above submenus and popups
+        self.ignoresMouseEvents = true
         self.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         self.isReleasedWhenClosed = false
         self.hasShadow = false
 
-        // Appears even when the app is not active.
         self.hidesOnDeactivate = false
 
         self.setFrame(screen.frame, display: true)
@@ -46,18 +42,14 @@ class OverlayWindow: NSWindow {
     }
 }
 
-// Cursor-like triangle shape (equilateral)
 struct Triangle: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         let size = min(rect.width, rect.height)
         let height = size * sqrt(3.0) / 2.0
 
-        // Top vertex
         path.move(to: CGPoint(x: rect.midX, y: rect.midY - height / 1.5))
-        // Bottom left vertex
         path.addLine(to: CGPoint(x: rect.midX - size / 2, y: rect.midY + height / 3))
-        // Bottom right vertex
         path.addLine(to: CGPoint(x: rect.midX + size / 2, y: rect.midY + height / 3))
         path.closeSubpath()
         return path
@@ -78,25 +70,16 @@ struct NavigationBubbleSizePreferenceKey: PreferenceKey {
     }
 }
 
-/// The buddy's behavioral mode: following the cursor, flying to an element, or arrived and
-/// pointing at one.
 enum BuddyNavigationMode {
-    /// Following the mouse cursor with a spring.
     case followingCursor
-    /// Flying toward a detected element.
     case navigatingToTarget
-    /// Arrived, pointing at it with a speech bubble.
     case pointingAtTarget
-    /// Flying toward the menu bar icon the pointer was left resting on.
     case navigatingToStatusItemIcon
-    /// Arrived at the icon and disappeared into it. No amount of moving the pointer reaches this
-    /// one; only the waking flight undoes it.
+    /// Moving the pointer does not reach it; only the waking flight undoes it.
     case mergedIntoStatusItemIcon
-    /// Flying back out of the icon, to the position beside the pointer where following resumes.
     case wakingFromStatusItemIcon
 
-    /// Whether a timer is driving the buddy frame by frame, which is what rules out the implicit
-    /// position and rotation animations everywhere else: they would fight it for the same frame.
+    /// Whether a timer is driving the buddy frame by frame, so the implicit position and rotation animations are off.
     var isFlightInProgress: Bool {
         self == .navigatingToTarget
             || self == .navigatingToStatusItemIcon
@@ -104,9 +87,6 @@ enum BuddyNavigationMode {
     }
 }
 
-// SwiftUI view for the purple glowing cursor pointer, one per screen. The view checks whether the
-// cursor is on THIS screen and only shows the buddy triangle when it is; during a voice
-// interaction the triangle is replaced by a waveform, spinner or streaming text bubble.
 struct CursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
@@ -120,8 +100,7 @@ struct CursorView: View {
         self.isFirstAppearance = isFirstAppearance
         self.companionManager = companionManager
 
-        // Seeded from the current mouse location so the buddy does not flash
-        // at (0,0) before onAppear fires.
+        // Seeded from the mouse location so the buddy does not flash at (0,0) before onAppear.
         let mouseLocation = NSEvent.mouseLocation
         let localX = mouseLocation.x - screenFrame.origin.x
         let localY = screenFrame.height - (mouseLocation.y - screenFrame.origin.y)
@@ -140,123 +119,85 @@ struct CursorView: View {
 
     // MARK: - Buddy Navigation State
 
-    /// Whether the buddy is following the cursor, flying to a target, or arrived and pointing.
     @State private var buddyNavigationMode: BuddyNavigationMode = .followingCursor
 
-    /// The cursor-like up-left tilt the triangle holds whenever it is not flying, which is also the
-    /// orientation it lands on a target in.
+    /// The up-left tilt the triangle holds whenever it is not flying, and lands on a target in.
     private static let restingTriangleRotationDegrees = -35.0
 
-    /// Rest at `restingTriangleRotationDegrees`; faces the direction of travel while flying.
     @State private var triangleRotationDegrees: Double = CursorView.restingTriangleRotationDegrees
 
-    /// Where the triangle's tip sits relative to the point `.position(cursorPosition)` places the
-    /// view at, with the resting rotation applied. The tip, not the frame centre, has to land on an
-    /// element: `Triangle` draws it `height / 1.5` above the centroid, and the resting tilt swings
-    /// it up and to the left.
+    /// Where the tip sits relative to the view's `.position(...)`: the tip, not the frame centre, is what lands on an element.
     private static let triangleTipOffsetFromFrameCenter: CGPoint = {
         let triangleFrameEdgeLength: CGFloat = 16
         let triangleHeight = triangleFrameEdgeLength * sqrt(3.0) / 2.0
         let tipOffsetBeforeRotation = CGPoint(x: 0, y: -(triangleHeight / 1.5))
         let restingRotationRadians = CursorView.restingTriangleRotationDegrees * .pi / 180
-        // Positive angles rotate clockwise in SwiftUI's y-down space, so the standard
-        // rotation matrix applies unchanged.
+        // Positive angles rotate clockwise in SwiftUI's y-down space, so the standard matrix applies.
         return CGPoint(
             x: tipOffsetBeforeRotation.x * cos(restingRotationRadians) - tipOffsetBeforeRotation.y * sin(restingRotationRadians),
             y: tipOffsetBeforeRotation.x * sin(restingRotationRadians) + tipOffsetBeforeRotation.y * cos(restingRotationRadians)
         )
     }()
 
-    /// Speech bubble text shown when pointing at a detected element.
     @State private var navigationBubbleText: String = ""
     @State private var navigationBubbleOpacity: Double = 0.0
     @State private var navigationBubbleSize: CGSize = .zero
 
-    /// The cursor position when navigation started, for detecting a move large enough to cancel the
-    /// return flight.
+    /// Where the cursor was when navigation started, for the move that cancels the return flight.
     @State private var cursorPositionWhenNavigationStarted: CGPoint = .zero
 
-    /// Drives the frame-by-frame bezier flight. Invalidated when the flight ends or the view goes away.
     @State private var navigationAnimationTimer: Timer?
 
-    /// Grows to ~1.3x at the midpoint of the arc and shrinks back to 1.0x on landing.
     @State private var buddyFlightScale: CGFloat = 1.0
-
-    /// The bubble's pop-in entrance: springs from 0.5 to 1.0 as the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
 
-    /// True while flying back to the cursor after pointing — the only flight a mouse movement cancels.
+    /// True while flying back to the cursor after pointing.
     @State private var isReturningToCursor: Bool = false
 
-    /// True while the user's pointer is actually in Kiki's hand.
-    ///
-    /// Narrower than the red, and deliberately separate from it: a press needs the pointer standing
-    /// on the element, because the press is something the user watches happen to *their* mouse, while
-    /// a scroll does not — a scroll carries its point on the event exactly as a press does, and lands
-    /// on whatever sits under that point regardless of where the pointer is. It stays true across the
-    /// dwell between two stops of one run, so it is not simply "the pointer is locked" — that lock
-    /// ends the moment a carry lands.
+    /// True while the user's pointer is actually in Kiki's hand, across the dwell between two stops of a run.
+    /// Narrower than the red: a press needs it on the element (the user watches their mouse), a scroll not.
     @State private var isHoldingTheUsersPointerForTheAction: Bool = false
 
-    /// Whether Kiki is about to do something where the cursor is standing, which is what the red
-    /// means: red is a drawing of "Kiki will act here", and it is read from the manager's own answer
-    /// rather than kept here, because a second copy of that answer is a second answer — and the one
-    /// drawn is the one the user plans around.
+    /// Whether Kiki is about to do something where the cursor is standing — what the red means. Read
+    /// from the manager rather than kept here: a second copy would be a second answer.
     ///
-    /// Nil is a stop Kiki will only point at, and nil is also what the manager writes when the tour
-    /// ends under the cursor, so the red leaves with the intention rather than with the flight.
+    /// Nil is a stop Kiki will only point at, and what the manager writes when a tour ends.
     private var isAboutToPerformAnAction: Bool {
         companionManager.pointingTarget?.actionToPerformOnArrival != nil
     }
 
-    /// How the user is told Kiki is about to act where the cursor is standing.
     private var cursorColor: Color {
         isAboutToPerformAnAction ? DS.Colors.overlayCursorClickRed : DS.Colors.overlayCursorPurple
     }
 
-    /// Whether the user's own hands are being watched, which is what the record dot replaces the
-    /// triangle for. Read from the manager, because the recorder lives there and the panel says the
-    /// same thing.
     private var isRecordingWhatTheUserIsDoing: Bool {
         companionManager.recordedActionsPhase == .recordingWhatTheUserIsDoing
     }
 
-    /// How far below and to the right of the pointer the buddy sits while following it, applied to
-    /// the two positions it takes up *around* a pointer: following it, and flying home to it. The
-    /// first leg of a pointer-carrying flight is the exception: aiming it here would draw as a pause
-    /// rather than a reach for the mouse, since the buddy already stands here.
+    /// How far below-right of the pointer the buddy sits when *around* it — following or flying home; a carrying flight's first leg aims at the pointer itself.
     static let followingOffsetFromPointer = CGPoint(x: 35, y: 25)
 
-    /// How long the triangle takes to fade between purple and red. Only the colour is on this clock —
-    /// the mouse changes hands at the two moments the flight does, not a quarter of a second later.
+    /// How long the triangle takes to fade purple↔red. Only the colour is on this clock; the mouse changes hands with the flight itself.
     static let cursorClickColourFadeDuration: Double = 0.28
 
-    /// How long each leg of a pointer-carrying flight takes. Shorter than an ordinary flight's
-    /// `0.6...1.4`, because getting to a click is two legs — out to the user's pointer, then on to
-    /// the element — and both must fit inside `CompanionManager.pointingTourArrivalTimeoutSeconds`
-    /// (3.0s), which ends an overrun silently without posting the click and also sizes the tour's
-    /// stall watchdog.
+    /// Shorter than an ordinary flight's `0.6...1.4`: reaching a click is two legs and both must fit
+    /// inside `CompanionManager.pointingTourArrivalTimeoutSeconds` (3.0s), which drops an overrun silently.
     private static let pointerCarryingFlightDuration: ClosedRange<Double> = 0.45...1.0
 
-    /// The height of the display whose top-left corner is the origin of the Accessibility API's screen
-    /// space — the primary display. Read fresh rather than cached, since the arrangement can change.
+    /// The height of the display whose top-left corner is the Accessibility origin. Read fresh, not cached: the arrangement can change.
     private var primaryScreenHeightInPoints: CGFloat {
         NSScreen.screens.first?.frame.maxY ?? 0
     }
 
     // MARK: - Onboarding Video Layout
 
-    // The frame is the clip's own shape — `kiki-intro.mp4` is 1280x720 and this is 320x180, both
-    // 16:9 — so `.resizeAspectFill` scales it to fit and crops nothing. Any other shape crops the
-    // edges away, and the burned-in subtitles sit low enough to be the first thing cut.
+    // The frame is the clip's own shape so `.resizeAspectFill` fits without cropping; any other shape cuts the burned-in subtitles.
     private let onboardingVideoPlayerWidth: CGFloat = 320
     private let onboardingVideoPlayerHeight: CGFloat = 180
 
     private let fullWelcomeMessage = "嗨！我是 Kiki"
 
-    /// Bubble phrases for an arrival the user was only meant to look at, which is most pointing:
-    /// the cursor is answering "where is it?". Inviting someone to look is never wrong, not even
-    /// when they are about to click the thing anyway.
+    /// The default pool, for an arrival the user was only meant to look at.
     private let navigationLookPhrases = [
         "看这里！",
         "在这儿！",
@@ -264,46 +205,35 @@ struct CursorView: View {
         "就是这个！"
     ]
 
-    /// For an arrival the model described as something to operate with one press, tagged
-    /// [CLICK:...]. See `CompanionManager.PointingBubbleInvitation`.
+    /// For [CLICK:...].
     private let navigationClickPhrases = [
         "点这里！",
         "点这个！",
         "就点它！"
     ]
 
-    /// For an arrival that takes two presses — a file to open, a word to select — tagged
-    /// [DOUBLECLICK:...]. The wording says which gesture this is because the two look identical on
-    /// screen, and 「点这里！」 over a file about to open describes the wrong one.
+    /// For [DOUBLECLICK:...]. One pool per gesture: they look identical until they happen, so only the wording says which is coming.
     private let navigationDoubleClickPhrases = [
         "双击这里！",
         "双击它！",
         "在这里双击！"
     ]
 
-    /// For an arrival that takes three presses — a whole paragraph to select — tagged
-    /// [TRIPLECLICK:...]. Same reason again: 「双击这里！」 over a paragraph about to be selected three
-    /// times over would be naming a gesture that is not the one coming.
+    /// For [TRIPLECLICK:...], for the double-click pool's reason.
     private let navigationTripleClickPhrases = [
         "三击这里！",
         "三击它！",
         "在这里三击！"
     ]
 
-    /// For an arrival where the answer is in the element's context menu, tagged [RIGHTCLICK:...].
-    /// The wording is here for the same reason as the double-click pool: the gestures look identical
-    /// until they happen, so the bubble is the only thing saying which button is about to go down.
+    /// For [RIGHTCLICK:...]: the bubble is the only thing saying which button goes down.
     private let navigationRightClickPhrases = [
         "右键这里！",
         "右键点它！",
         "在这里点右键！"
     ]
 
-    /// For an arrival where the answer is past the edge of what is on screen, tagged [SCROLLUP:...]
-    /// and its three siblings. One pool per direction for the same reason the two press pools are
-    /// separate: the four look identical on screen until the content moves, so the bubble is the only
-    /// thing saying which way it is about to go. 「帮你往下滚！」 states the direction too, since a
-    /// pool picked by the wrong branch would read as a scroll the user did not ask for.
+    /// For [SCROLLUP:...] and its three siblings, for the press pools' reason: only the bubble says which way it goes.
     private let navigationScrollUpPhrases = [
         "往上滚！",
         "这就往上翻！",
@@ -328,31 +258,24 @@ struct CursorView: View {
         "帮你往右滚！"
     ]
 
-    /// For an arrival that is the beginning of a movement rather than the whole gesture — a drag,
-    /// tagged [DRAG:...]. The bubble says what is happening rather than where the pointer is, because
-    /// a drag is not over when the cursor lands: the phrase stays up for the length of the carry.
+    /// For [DRAG:...]. A drag is not over when the cursor lands, so the phrase stays up for the carry.
     private let navigationDragPhrases = [
         "帮你拖过去！",
         "这就拖过去！",
         "拖着它走！"
     ]
 
-    /// For an arrival where Kiki is about to type, tagged [TYPE:...]. The words being typed are
-    /// deliberately not in the bubble — a paragraph of Chinese where a two-word phrase goes would
-    /// say less than the pool does, and what the user needs to read at a glance is that the keyboard
-    /// is about to be used at all.
+    /// For [TYPE:...]. Deliberately not naming the words — what matters at a glance is that the keyboard is being used at all.
     private let navigationTypingPhrases = [
         "帮你打字！",
         "这就打上去！",
         "我来输入！"
     ]
 
-    /// The phrase pool an arrival draws from, chosen by what the model's tag asked for.
+    /// The pool an arrival draws from, chosen by the tag.
     ///
-    /// A combination's pool is built here rather than kept as a stored array, because the one thing
-    /// that makes it worth saying is *which* combination it is — and the name is written the one way
-    /// `ElementKeyboard.phraseForPressingKey` writes it, so the bubble, the report sentence and the
-    /// terminal all say ⌘S the same way round.
+    /// A combination's is built rather than stored: it must say which combination, written the one way
+    /// `ElementKeyboard.phraseForPressingKey` writes it, so bubble, report and terminal all say ⌘S alike.
     private func phrases(
         for pointingBubbleInvitation: CompanionManager.PointingBubbleInvitation
     ) -> [String] {
@@ -386,7 +309,6 @@ struct CursorView: View {
             // Nearly transparent, which helps compositing.
             Color.black.opacity(0.001)
 
-            // Welcome speech bubble (first launch only)
             if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
                 Text(welcomeText)
                     .font(.system(size: 11, weight: .medium))
@@ -414,8 +336,7 @@ struct CursorView: View {
                     }
             }
 
-            // Always in the view tree so the opacity animation works reliably; nothing is
-            // visible without a player. allowsHitTesting(false) prevents it from taking clicks.
+            // Always in the view tree so the opacity animation works reliably; nothing shows without a player.
             OnboardingVideoPlayerView(player: companionManager.onboardingVideoPlayer)
                 .frame(width: onboardingVideoPlayerWidth, height: onboardingVideoPlayerHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -426,13 +347,10 @@ struct CursorView: View {
                     y: cursorPosition.y + 18 + (onboardingVideoPlayerHeight / 2)
                 )
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
-                // Drives the fade in both directions — the video fades out by this same
-                // modifier — so this one duration is what both ends of the clip take, and
-                // anything waiting on the fade-out has to wait this long.
+                // One duration drives the fade both ways (the video fades out through this same modifier), so a fade-out wait is this long.
                 .animation(.easeInOut(duration: 1.0), value: companionManager.onboardingVideoOpacity)
                 .allowsHitTesting(false)
 
-            // The "按住 control + option 然后介绍你自己" prompt, streamed after the video ends.
             if isCursorOnThisScreen && companionManager.showOnboardingPrompt && !companionManager.onboardingPromptText.isEmpty {
                 Text(companionManager.onboardingPromptText)
                     .font(.system(size: 11, weight: .medium))
@@ -460,8 +378,6 @@ struct CursorView: View {
                     }
             }
 
-            // Shown once the buddy arrives at a detected element: a scale-bounce from 0.5x
-            // with a bright initial glow that settles.
             if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty {
                 Text(navigationBubbleText)
                     .font(.system(size: 11, weight: .medium))
@@ -495,8 +411,7 @@ struct CursorView: View {
                     }
             }
 
-            // The voice, drawn as light around the cursor rather than as a separate indicator: what
-            // it is measuring is the sound coming out of Kiki, and the cursor is where Kiki is.
+            // The voice, drawn as light around the cursor.
             CursorVoiceGlowView(
                 voiceLoudnessMeter: companionManager.voiceLoudnessMeter,
                 cursorColor: cursorColor,
@@ -508,8 +423,7 @@ struct CursorView: View {
                     ? cursorOpacity : 0
             )
 
-            // Purple triangle cursor — idle or responding. Following uses a spring; navigation must
-            // carry no implicit animation, since the bezier timer drives the position at 60fps.
+            // Following uses a spring; navigation takes no implicit animation, since the bezier timer drives the position at 60fps.
             Triangle()
                 .fill(cursorColor)
                 .frame(width: 16, height: 16)
@@ -529,15 +443,13 @@ struct CursorView: View {
                     buddyNavigationMode.isFlightInProgress ? nil : .easeInOut(duration: 0.3),
                     value: triangleRotationDegrees
                 )
-                // Taken and given back as a fade rather than a cut, so the pointer changing hands
-                // reads as the buddy taking hold of it. Both moments happen while it is moving.
+                // A fade, so the hand-over reads as the buddy taking hold of it.
                 .animation(
                     .easeInOut(duration: CursorView.cursorClickColourFadeDuration),
                     value: isAboutToPerformAnAction
                 )
 
-            // Red record dot — replaces the triangle while the user's own actions are being recorded,
-            // in the triangle's own place beside the pointer.
+            // Red record dot, in the triangle's own place beside the pointer.
             Circle()
                 .fill(DS.Colors.overlayCursorClickRed)
                 .frame(width: 12, height: 12)
@@ -546,7 +458,6 @@ struct CursorView: View {
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
 
-            // Cursor waveform — replaces the triangle while listening
             CursorWaveformView(
                 audioPowerLevel: companionManager.currentAudioPowerLevel,
                 isOnScreen: buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening
@@ -556,7 +467,6 @@ struct CursorView: View {
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
-            // Cursor spinner — shown while the AI is processing.
             CursorSpinnerView(
                 isOnScreen: buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing
             )
@@ -580,7 +490,6 @@ struct CursorView: View {
 
             startTrackingCursor()
 
-            // Welcome only on first appearance, and only if the cursor starts on this screen.
             if isFirstAppearance && isCursorOnThisScreen {
                 withAnimation(.easeIn(duration: 2.0)) {
                     self.cursorOpacity = 1.0
@@ -596,9 +505,7 @@ struct CursorView: View {
         .onDisappear {
             timer?.invalidate()
             navigationAnimationTimer?.invalidate()
-            // Whether the overlay thinks it is holding the pointer and whether `PointerCarrier`
-            // actually is are different questions, and the second is the one that matters: a view
-            // that goes away while the pointer is detached leaves a mouse that nothing hands back.
+            // The second matters: a view going away while the pointer is detached leaves a mouse nothing hands back.
             releaseTheUsersPointerIfHoldingIt()
             PointerCarrier.releaseThePointerIfCarrying()
             companionManager.tearDownOnboardingVideo()
@@ -610,68 +517,42 @@ struct CursorView: View {
             case .cursorFlyingToIcon(let iconScreenFrame):
                 startMergingIntoStatusItemIcon(iconScreenFrame: iconScreenFrame)
             case .cursorRestingInIcon:
-                // Landing is this view's own doing and it has already finished. A view built after
-                // the fact — a display change rebuilds them all — never gets here, since the
-                // manager ends the visit before it rebuilds.
+                // Landing is this view's own doing and finished; a rebuilt view (a display change) never lands here.
                 break
             case .cursorWakingFromIcon:
                 startWakingFromStatusItemIcon()
             }
         }
-        // Keyed on the flight the manager has asked for rather than on where it goes: two stops of
-        // one tour can name the same point, and keyed on the location the second of them was never
-        // flown to — no bubble, no arrival, and an action that quietly never happened. The manager
-        // bumps this only for a flight, so withdrawing the press of the stop the cursor is standing
-        // on still moves nothing.
+        // Bumped only for a flight, not a location: two stops can name one point, and keyed on the location the second is never flown to — no bubble, no arrival.
         .onChange(of: companionManager.pointingFlightRequestCount) { _ in
-            // Fly the buddy to the detected element so it points at it. Read as the target whole
-            // rather than as the two fields the flight needs: a newer flight that landed between the
-            // change and this callback is the one to fly, and the fields of one target are the only
-            // answer that is internally consistent.
+            // Read as the target whole: a newer flight that landed before this callback is the one to fly.
             guard let pointingTarget = companionManager.pointingTarget else { return }
 
-            // Only navigate if the target is on THIS screen
             guard screenFrame.contains(CGPoint(x: pointingTarget.displayFrame.midX, y: pointingTarget.displayFrame.midY))
                   || pointingTarget.displayFrame == screenFrame else {
-                // The target is on another screen: a pointing tour moving between displays takes it
-                // out from under this screen's buddy, which would otherwise stay parked in
-                // `.pointingAtTarget` on an element no longer pointed at — and that mode is always
-                // visible, so both screens would show a buddy.
+                // On another screen: this one's buddy would otherwise stay parked in `.pointingAtTarget` — two buddies shown.
                 standDownNavigationForOtherScreen()
                 return
             }
 
             startNavigatingToElement(screenLocation: pointingTarget.screenLocation)
         }
-        // A drag is drawn rather than flown: the manager posts the movement step by step, and the view
-        // that owns the display the drag is on follows it. Nothing else moves the triangle while that
-        // runs — the flight that brought the cursor here is over, and its own arrival deliberately stays
-        // open until the drag is done — so this is the only writer of `cursorPosition` during one.
-        //
-        // Only the view whose screen the drag is on: both ends of a drag are resolved against one
-        // screenshot, so it never leaves that display, and a view on another display is hidden anyway.
+        // A drag is drawn rather than flown — the manager posts the movement step by step — and this is the only writer of `cursorPosition` while one runs, the flight's arrival left open.
         .onChange(of: companionManager.screenLocationOfTheDragInFlight) { dragScreenLocation in
             guard let dragScreenLocation, screenFrame.contains(dragScreenLocation) else { return }
             cursorPosition = convertScreenPointToSwiftUICoordinates(dragScreenLocation)
         }
         .onChange(of: companionManager.buddyReturnHomeRequestCount) { _ in
-            // A count rather than the `shouldReturnBuddyToCursorAfterPointing` flag beside it: a tour
-            // the user cut off writes `false` into a flag it never set to `true`, so an `.onChange` on
-            // the flag saw no change and the buddy stayed frozen in `.pointingAtTarget` — a mode that
-            // skips cursor tracking — for the rest of the session. A count cannot fail to change.
+            // A count, not the flag: a cut-off tour writes `false` into a flag it never set, so `.onChange` sees nothing and the buddy stays frozen in `.pointingAtTarget` — skipping cursor tracking.
             guard buddyNavigationMode != .followingCursor else { return }
             startFlyingBackToCursor()
         }
     }
 
-    /// Whether the buddy triangle should be visible on this screen: the cursor is here during
-    /// following, or this is the screen navigating or pointing. While another screen is
-    /// navigating the buddy is hidden here, so only one is ever visible at a time.
+    /// Only one buddy is ever visible at a time, so a screen another view is navigating to hides this one's.
     private var buddyIsVisibleOnThisScreen: Bool {
         switch buddyNavigationMode {
         case .followingCursor:
-            // Another screen's view is the one navigating — hide this one's to avoid a
-            // duplicate buddy.
             if companionManager.pointingTarget != nil {
                 return false
             }
@@ -680,17 +561,14 @@ struct CursorView: View {
              .wakingFromStatusItemIcon:
             return true
         case .mergedIntoStatusItemIcon:
-            // It is not on the screen any more. It is the icon.
+            // Off the screen entirely — it is the icon.
             return false
         }
     }
 
     // MARK: - Cursor Tracking
 
-    /// Tracks the mouse for as long as the overlay is up, one timer per display. Both writes below
-    /// are guarded on the value having changed: a `@State` write marks the view dirty whether or not
-    /// the value differs, so an unguarded tick re-evaluates this whole body sixty times a second on
-    /// every display with the mouse still.
+    /// One timer per display. Both writes are guarded on a change: a `@State` write marks the view dirty whether or not the value differs, so an unguarded tick re-evaluates the body 60 times a second.
     private func startTrackingCursor() {
         timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { _ in
             let mouseLocation = NSEvent.mouseLocation
@@ -699,8 +577,7 @@ struct CursorView: View {
                 self.isCursorOnThisScreen = isCursorNowOnThisScreen
             }
 
-            // Forward flight and pointing are not interrupted by mouse movement — they complete.
-            // Only the return flight is cancelled by it, so the buddy snaps to following.
+            // Mouse movement interrupts only the return flight; forward flight and pointing complete.
             if self.buddyNavigationMode == .navigatingToTarget && self.isReturningToCursor {
                 let currentMouseInSwiftUI = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
                 let distanceFromNavigationStart = hypot(
@@ -728,18 +605,14 @@ struct CursorView: View {
         }
     }
 
-    /// Converts a macOS screen point (AppKit, bottom-left origin) to SwiftUI coordinates (top-left
-    /// origin) relative to this screen's overlay window.
+    /// AppKit screen point (bottom-left origin) to SwiftUI coordinates (top-left origin) local to this window.
     private func convertScreenPointToSwiftUICoordinates(_ screenPoint: CGPoint) -> CGPoint {
         let x = screenPoint.x - screenFrame.origin.x
         let y = (screenFrame.origin.y + screenFrame.height) - screenPoint.y
         return CGPoint(x: x, y: y)
     }
 
-    /// The other direction: a SwiftUI point in this overlay back to a macOS screen point. Needed
-    /// because the buddy's position is only known in SwiftUI coordinates while the pointer and the
-    /// click live in AppKit's, so carrying the mouse along an arc means converting every frame. The
-    /// two are exact inverses: an error here offsets where the mouse and the click end up.
+    /// The other direction — a carry converts every frame; the buddy is in SwiftUI coordinates, the pointer in AppKit's.
     private func convertSwiftUICoordinatesToScreenPoint(_ swiftUIPoint: CGPoint) -> CGPoint {
         let x = swiftUIPoint.x + screenFrame.origin.x
         let y = (screenFrame.origin.y + screenFrame.height) - swiftUIPoint.y
@@ -748,16 +621,11 @@ struct CursorView: View {
 
     // MARK: - Element Navigation
 
-    /// Starts animating the buddy toward a detected UI element location.
     private func startNavigatingToElement(screenLocation: CGPoint) {
-        // For as long as the cursor is in the icon's hands nothing may be flown anywhere — and this
-        // is where every such request arrives: a tour stop, the onboarding demo's own triggers, a
-        // fresh tag on a reply. While it is in the icon there is no cursor to send; while it is on
-        // its way back out there is one, but it is already flying somewhere.
+        // While the cursor is in the icon's hands none may fly: there is no cursor to send in, and one already flying out.
         guard !companionManager.isNotTakingInputBecauseOfTheStatusItemIcon else { return }
 
-        // Don't interrupt welcome animation. Nothing is going to fly, so anything the
-        // pointer is being held for is not going to happen either.
+        // Don't interrupt the welcome animation: nothing is going to fly, so nothing the pointer is held for will happen either.
         guard !showWelcome || welcomeText.isEmpty else {
             releaseTheUsersPointerIfHoldingIt()
             return
@@ -765,8 +633,7 @@ struct CursorView: View {
 
         let targetInSwiftUI = convertScreenPointToSwiftUICoordinates(screenLocation)
 
-        // Place the triangle so its tip — not the center of its 16×16 frame — lands on the element,
-        // by offsetting the frame by the negative of the tip's own offset.
+        // Offset by the negative of the tip's own offset, so the tip — not the frame's centre — lands on the element.
         let offsetTarget = CGPoint(
             x: targetInSwiftUI.x - CursorView.triangleTipOffsetFromFrameCenter.x,
             y: targetInSwiftUI.y - CursorView.triangleTipOffsetFromFrameCenter.y
@@ -778,20 +645,16 @@ struct CursorView: View {
             y: max(20, min(offsetTarget.y, screenFrame.height - 20))
         )
 
-        // Recorded so a mouse move large enough to cancel the return flight can be detected.
+        // Recorded so a big enough mouse move can cancel the return flight.
         let mouseLocation = NSEvent.mouseLocation
         cursorPositionWhenNavigationStarted = convertScreenPointToSwiftUICoordinates(mouseLocation)
 
         buddyNavigationMode = .navigatingToTarget
         isReturningToCursor = false
 
-        // What this flight does was decided by the manager before it published the location, and it
-        // is two questions rather than one. A stop Kiki is only going to point at is a plain arc and
-        // stays purple; a stop it is going to act on turns red on the way, and then the action's own
-        // answer decides whether the user's pointer comes along.
+        // Red-and-carrying is the manager's decision, made before it published: a point-only stop stays a plain purple arc.
         guard companionManager.pointingTarget?.actionToPerformOnArrival != nil else {
-            // The run, if there was one, ends here: this stop will not be acted on, so the pointer
-            // goes back to the user before the flight rather than after it.
+            // This stop is not acted on, so any run ends here: the pointer goes back before the flight, not after.
             releaseTheUsersPointerIfHoldingIt()
             animateBezierFlightArc(to: clampedTarget) {
                 guard self.buddyNavigationMode == .navigatingToTarget else { return }
@@ -800,13 +663,10 @@ struct CursorView: View {
             return
         }
 
-        // Asked rather than assumed, so that an action which genuinely needs nothing carried has
-        // one place to say so. Both kinds say yes today, a scroll for a reason of its own —
-        // `carriesTheUsersPointer` has it.
+        // Asked rather than assumed — `carriesTheUsersPointer` is where an action says what it needs.
         guard companionManager.pointingTarget?.actionToPerformOnArrival?.carriesTheUsersPointer ?? false
         else {
-            // Red, but the pointer stays where it is: nothing about this action is waiting on the
-            // pointer, and the user is free to keep using it while Kiki works.
+            // Red, but the pointer stays: nothing about this action waits on it, and the user keeps it.
             animateBezierFlightArc(to: clampedTarget) {
                 guard self.buddyNavigationMode == .navigatingToTarget else { return }
                 self.startPointingAtElement()
@@ -815,14 +675,10 @@ struct CursorView: View {
         }
 
         if isHoldingTheUsersPointerForTheAction {
-            // Already holding it from the stop before: no flight out to the pointer and nothing to
-            // fade in, just on to the next element with the mouse still in hand. This is what makes
-            // a run of presses read as one gesture.
+            // Already holding it: no flight out to the pointer, just on to the next element — a run of presses reads as one gesture.
             carryTheMouseAlongAnArc(to: clampedTarget, endingOn: screenLocation)
         } else {
-            // The colour starts turning as the flight leaves rather than when it lands, so the grab
-            // lands on a triangle already plainly red. Nothing is held yet: for the whole of this
-            // leg the mouse is still the user's, and the red means "about to", not "already".
+            // The colour turns as the flight leaves, so the grab lands on a plainly red triangle; nothing is held yet — red means "about to".
             isHoldingTheUsersPointerForTheAction = true
             flyToWhereTheUsersPointerIsStanding {
                 guard self.buddyNavigationMode == .navigatingToTarget else { return }
@@ -831,10 +687,7 @@ struct CursorView: View {
         }
     }
 
-    /// Flies the buddy to wherever the user's pointer happens to be, the first leg of a
-    /// pointer-carrying run: the buddy goes to the mouse, and only then does the mouse move with it.
-    /// A pointer on another display is the one case with nothing to fly to — the arc cannot leave
-    /// this window — so the grab that follows warps it here instead.
+    /// The first leg of a pointer-carrying run: a pointer on another display has nothing to fly to — the arc cannot leave this window — so the grab warps it here.
     private func flyToWhereTheUsersPointerIsStanding(then onArrival: @escaping () -> Void) {
         let mouseLocation = NSEvent.mouseLocation
         guard screenFrame.contains(mouseLocation) else {
@@ -842,9 +695,7 @@ struct CursorView: View {
             return
         }
 
-        // The pointer itself, not the spot the buddy parks in while following it: aiming this leg at
-        // the offset position would aim it where the buddy already stands and draw as a pause.
-        // Landing on the pointer is what this leg is for.
+        // The pointer itself, not the spot the buddy parks in — the offset position would draw as a pause.
         let pointerInSwiftUI = convertScreenPointToSwiftUICoordinates(mouseLocation)
 
         animateBezierFlightArc(
@@ -855,15 +706,11 @@ struct CursorView: View {
         }
     }
 
-    /// Carries the user's pointer along the arc the buddy is about to fly: the pointer is taken and
-    /// the arc begins in the same breath, so the fade to red, the grab and the start of the movement
-    /// are one moment. Taking hold always warps the pointer under the cursor rather than flying to it,
-    /// which recovers a pointer pushed aside during a dwell and one on another display alike.
+    /// Carries the user's pointer along the arc the buddy is about to fly. Taking hold always warps,
+    /// never flies — recovering a pointer pushed aside during a dwell and one on another display.
     ///
-    /// `endingOn` is where the pointer is left, deliberately not the arc's own destination: the arc
-    /// lands the *frame centre* on a target clamped inside the screen's edges, while the click is
-    /// posted on the element itself, and an app that hit-tests against the pointer would act on a
-    /// neighbour.
+    /// `endingOn` is where the pointer is left, not the arc's destination: the arc lands the frame
+    /// centre on a clamped target, the click on the element itself.
     private func carryTheMouseAlongAnArc(
         to swiftUIPosition: CGPoint,
         endingOn screenLocation: CGPoint
@@ -889,7 +736,7 @@ struct CursorView: View {
         }
     }
 
-    /// Puts the pointer where the buddy currently is — the per-frame half of a carry.
+    /// The per-frame half of a carry.
     private func moveThePointerUnder(swiftUIPosition: CGPoint) {
         PointerCarrier.carryThePointer(
             toAppKitScreenLocation: convertSwiftUICoordinatesToScreenPoint(swiftUIPosition),
@@ -897,31 +744,23 @@ struct CursorView: View {
         )
     }
 
-    /// Gives the pointer back to the user, fading the colour back as it goes.
-    ///
-    /// Idempotent, because every teardown path calls it and they overlap. It must never leave the
-    /// pointer detached — nothing in the system hands it back on its own.
+    /// Gives the pointer back to the user, fading the colour as it goes. Idempotent: every teardown path calls it, and it must never leave the pointer detached.
     private func releaseTheUsersPointerIfHoldingIt() {
         guard isHoldingTheUsersPointerForTheAction else { return }
         isHoldingTheUsersPointerForTheAction = false
 
-        // Handed back now, while the colour takes its own quarter of a second to leave: the red is
-        // the cursor's own state and fades out over the journey home, but the pointer is the user's
-        // again the moment the run is over — and that journey is a leg they may be moving the mouse
-        // through, which a delayed hand-back would be dragging around behind them.
+        // Handed back now, though the colour takes a quarter of a second to leave: the run is over, and the way home is the user's leg.
         PointerCarrier.releaseThePointer(
             atAppKitScreenLocation: NSEvent.mouseLocation,
             primaryScreenHeightInPoints: primaryScreenHeightInPoints
         )
     }
 
-    /// Animates the buddy along a quadratic bezier arc to the destination. The triangle rotates to
-    /// face its direction of travel each frame, scales up at the midpoint, and the glow intensifies.
+    /// Animates the buddy along a quadratic bezier arc, rotating it to face its direction of travel.
     ///
-    /// The two optional parameters are for the pointer-carrying flights: `durationRange` lets a
-    /// carrying leg be quicker so two still fit inside the arrival timeout, and `onEachFrame` keeps
-    /// the pointer under the cursor. The last frame deliberately does not call it — that branch snaps
-    /// the buddy onto its destination, where a carrying caller places the pointer instead.
+    /// `durationRange` and `onEachFrame` serve the pointer-carrying flights: quicker legs so two fit the
+    /// arrival timeout, and a frame hook keeping the pointer under the cursor — except on the last frame,
+    /// where the buddy snaps onto its destination and the caller places the pointer.
     private func animateBezierFlightArc(
         to destination: CGPoint,
         durationRange: ClosedRange<Double> = 0.6...1.4,
@@ -937,7 +776,6 @@ struct CursorView: View {
         let deltaY = endPosition.y - startPosition.y
         let distance = hypot(deltaX, deltaY)
 
-        // Flight duration scales with distance, clamped to the caller's range.
         let flightDurationSeconds = min(
             max(distance / 800.0, durationRange.lowerBound),
             durationRange.upperBound
@@ -971,7 +809,6 @@ struct CursorView: View {
             // Smoothstep easeInOut.
             let t = linearProgress * linearProgress * (3.0 - 2.0 * linearProgress)
 
-            // Quadratic bezier.
             let oneMinusT = 1.0 - t
             let bezierX = oneMinusT * oneMinusT * startPosition.x
                         + 2.0 * oneMinusT * t * controlPoint.x
@@ -991,52 +828,38 @@ struct CursorView: View {
             // +90° because the tip points up at 0° rotation while atan2 returns 0° for rightward.
             self.triangleRotationDegrees = atan2(tangentY, tangentX) * (180.0 / .pi) + 90.0
 
-            // Scale pulse, peaking at the midpoint of the flight.
+            // Scale pulse, peaking mid-flight.
             let scalePulse = sin(linearProgress * .pi)
             self.buddyFlightScale = 1.0 + scalePulse * 0.3
         }
     }
 
-    /// Transitions to pointing mode — shows a speech bubble with a bouncy scale-in entrance and
-    /// variable-speed character streaming.
     private func startPointingAtElement() {
         buddyNavigationMode = .pointingAtTarget
 
-        // Back to the resting angle now that we have arrived, which is the orientation
-        // `triangleTipOffsetFromFrameCenter` describes.
+        // Back to the resting angle, the orientation `triangleTipOffsetFromFrameCenter` assumes.
         triangleRotationDegrees = CursorView.restingTriangleRotationDegrees
 
-        // Starts small for the scale-bounce entrance.
         navigationBubbleText = ""
         navigationBubbleOpacity = 1.0
         navigationBubbleSize = .zero
         navigationBubbleScale = 0.5
 
-        // A pointing tour keeps the buddy on the element until the narration has finished with it,
-        // so the hold-and-return below is skipped: this arrival releases the narration, and the next
-        // stop's flight replaces this bubble when it lands.
+        // A pointing tour keeps the buddy on the element until the narration is done with it: the hold-and-return below is skipped; this arrival releases the narration instead.
         let isPointingTourStop = companionManager.isPointingTourActive
         if isPointingTourStop {
-            // The narration may have run out while this flight was in the air, in which case there
-            // is nothing left to point at and the buddy goes home.
+            // The narration may have run out while this flight was in the air: nothing left to point at.
             if companionManager.shouldReturnBuddyToCursorAfterPointing {
                 startFlyingBackToCursor()
                 return
             }
-            // This is where the press is posted and where the manager works out whether another
-            // one follows it — asked of the manager rather than tracked here, because only it
-            // knows what the tour has left.
+            // Where the press is posted — asked of the manager, not tracked here: only it knows what the tour has left.
             companionManager.buddyDidArriveAtPointingTarget()
         }
 
-        // The pointer is deliberately *not* handed back on arrival: the cursor stays red while it
-        // dwells on the element it has just pressed, and the red is the whole of what says the mouse
-        // is not the user's yet. The hand-back belongs to the two moments a run really ends — the
-        // flight home, and the next flight that is not going to press anything.
+        // The pointer is deliberately *not* handed back on arrival: the cursor stays red while it dwells on the element it just pressed; only the two moments a run really ends hand it back.
 
-        // Custom bubble text from the manager (the onboarding demo) if there is one, otherwise a
-        // random phrase from the pool for the invitation the model's tag carried. The default is
-        // the pool for a plain look, which is what an arrival with nothing behind it is.
+        // The manager's own text (the onboarding demo), otherwise a random phrase from the tag's invitation pool; a plain look's by default.
         let pointerPhrase = companionManager.pointingTarget?.bubbleText
             ?? phrases(for: companionManager.pointingTarget?.bubbleInvitation ?? .lookAtElement)
                 .randomElement()
@@ -1044,7 +867,6 @@ struct CursorView: View {
 
         streamNavigationBubbleCharacter(phrase: pointerPhrase, characterIndex: 0) {
             guard !isPointingTourStop else { return }
-            // All characters streamed — hold, then fly back.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
                 guard self.buddyNavigationMode == .pointingAtTarget else { return }
                 self.navigationBubbleOpacity = 0.0
@@ -1056,8 +878,7 @@ struct CursorView: View {
         }
     }
 
-    /// Streams the navigation bubble text one character at a time with variable delays
-    /// (30–60ms) for a natural "speaking" rhythm.
+    /// Streams the bubble text a character at a time, for a natural speaking rhythm.
     private func streamNavigationBubbleCharacter(
         phrase: String,
         characterIndex: Int,
@@ -1087,11 +908,8 @@ struct CursorView: View {
         }
     }
 
-    /// Flies the buddy back to the current cursor position after pointing is done.
     private func startFlyingBackToCursor() {
-        // The pointer is given back before the flight rather than after it, so the colour fades
-        // back over the journey home — and because the flight ends with the buddy following the
-        // pointer again, which it cannot do while holding it.
+        // Given back before the flight, not after: the colour fades over the way home, and a buddy still holding the pointer cannot follow it.
         releaseTheUsersPointerIfHoldingIt()
 
         let mouseLocation = NSEvent.mouseLocation
@@ -1111,7 +929,6 @@ struct CursorView: View {
         }
     }
 
-    /// Cancels an in-progress navigation because the user moved the cursor.
     private func cancelNavigationAndResumeFollowing() {
         navigationAnimationTimer?.invalidate()
         navigationAnimationTimer = nil
@@ -1122,25 +939,18 @@ struct CursorView: View {
         finishNavigationAndResumeFollowing()
     }
 
-    /// Returns the buddy to normal cursor-following mode after navigation completes.
     private func finishNavigationAndResumeFollowing() {
         resetBuddyToFollowingMode()
         companionManager.clearDetectedElementLocation()
     }
 
-    /// Parks this screen's buddy back into cursor-following because the target it was flying to or
-    /// pointing at belongs to another screen — what a pointing tour does when it moves between
-    /// displays. The manager's target is deliberately left alone: the other screen's buddy is using
-    /// it, and clearing it here would strand that flight.
+    /// Parks this screen's buddy back into cursor-following because the target is another screen's; the manager's target is left alone — clearing it would strand that flight.
     private func standDownNavigationForOtherScreen() {
         guard buddyNavigationMode != .followingCursor else { return }
         resetBuddyToFollowingMode()
     }
 
-    /// Drops the navigation animation state without touching the manager's target. All three ways a
-    /// navigation can end arrive here — completing, being cancelled by the user moving the pointer,
-    /// and standing down for another display — so this is where the pointer is handed back: a run cut
-    /// off partway has no arrival of its own to release it.
+    /// Drops the navigation state without touching the manager's target. Every way a navigation can end arrives here, so this is where the pointer is handed back — a cut-off run has no arrival.
     private func resetBuddyToFollowingMode() {
         releaseTheUsersPointerIfHoldingIt()
         navigationAnimationTimer?.invalidate()
@@ -1156,19 +966,12 @@ struct CursorView: View {
 
     // MARK: - Visiting The Status Item Icon
 
-    /// Flies the buddy to the menu bar icon the pointer was left resting on.
-    ///
-    /// Only the view whose screen holds the icon flies, the same match on screen frame the pointing
-    /// tour uses: the icon sits in one display's menu bar, and every other screen's view is happily
-    /// following the pointer and has nothing to merge into.
+    /// Flies the buddy to the icon. Only the screen holding it flies; the others are following the pointer, with nothing to merge into.
     private func startMergingIntoStatusItemIcon(iconScreenFrame: CGRect) {
         let iconCentreOnScreen = CGPoint(x: iconScreenFrame.midX, y: iconScreenFrame.midY)
         guard screenFrame.contains(iconCentreOnScreen) else { return }
 
-        // The icon's centre, with neither the triangle-tip offset nor the screen-edge clamp that
-        // `startNavigatingToElement` applies: this is a landing on the icon itself rather than a tip
-        // resting on an element, and the clamp's 20pt margin would hold the buddy a whole margin
-        // below the menu bar, short of the icon it is meant to disappear into.
+        // The icon's centre, with neither the tip offset nor the screen-edge clamp: its 20pt margin would hold the buddy short of the icon.
         let targetInSwiftUI = convertScreenPointToSwiftUICoordinates(iconCentreOnScreen)
 
         buddyNavigationMode = .navigatingToStatusItemIcon
@@ -1180,8 +983,7 @@ struct CursorView: View {
         }
     }
 
-    /// Landed: the manager is told, so the icon can take on the cursor's colour, and the cursor
-    /// itself fades out where it stands.
+    /// The manager is told on landing, so the icon can take on the cursor's colour.
     private func settleIntoStatusItemIcon() {
         buddyNavigationMode = .mergedIntoStatusItemIcon
         triangleRotationDegrees = CursorView.restingTriangleRotationDegrees
@@ -1192,9 +994,7 @@ struct CursorView: View {
         }
     }
 
-    /// Comes back out where it stands, for the two cases the manager ends a visit by itself — the
-    /// overlay going away, and a display change rebuilding this view. It is a recovery rather than
-    /// the waking gesture: no flight, just the cursor back beside the pointer and following it.
+    /// Comes back out where it stands, for the two cases the manager ends a visit by itself — the overlay going away, a display change rebuilding this view. A recovery, not a flight.
     private func resumeFollowingFromStatusItemIcon() {
         guard buddyNavigationMode == .mergedIntoStatusItemIcon
                 || buddyNavigationMode == .navigatingToStatusItemIcon
@@ -1207,17 +1007,11 @@ struct CursorView: View {
         }
     }
 
-    /// The waking flight: fade in where the cursor disappeared, fly to the position beside the
-    /// pointer it would have been following from, and hand it back to following on landing.
-    ///
-    /// Only the view that flew into the icon has anything to bring out — every other screen's view
-    /// has been following the pointer throughout.
+    /// The waking flight: fade in where the cursor disappeared, fly beside the pointer, resume following on landing. Only the view that flew in has anything to bring out.
     private func startWakingFromStatusItemIcon() {
         guard buddyNavigationMode == .mergedIntoStatusItemIcon else { return }
 
-        // Where the pointer is now, not where it was when the waking wait began: the flight was
-        // committed a moment ago and the standing position is defined relative to the pointer, so
-        // the cursor lands beside wherever the user has got to.
+        // Now, not when the waking wait began: the standing spot is relative to the pointer, so the cursor lands beside wherever the user got to.
         let pointerInSwiftUI = convertScreenPointToSwiftUICoordinates(NSEvent.mouseLocation)
         let standingPosition = CGPoint(
             x: pointerInSwiftUI.x + CursorView.followingOffsetFromPointer.x,
@@ -1249,13 +1043,11 @@ struct CursorView: View {
         Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
             guard currentIndex < self.fullWelcomeMessage.count else {
                 timer.invalidate()
-                // Hold the text for 2 seconds, then fade it out
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                     self.bubbleOpacity = 0.0
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                     self.showWelcome = false
-                    // Start the onboarding video right after the welcome text disappears
                     self.companionManager.setupOnboardingVideo()
                 }
                 return
@@ -1271,33 +1063,24 @@ struct CursorView: View {
 // MARK: - Cursor Voice Glow
 
 /// The light around the cursor while Kiki is speaking, which widens and narrows with the voice.
-///
-/// A view of its own for where the invalidation falls: the level it reads arrives with the audio,
-/// tens of times a second, and everything else in the cursor would be re-evaluated that often with
-/// it if the level were read from up there.
-///
-/// The rise and the fall are this view's own animation rather than a smoothed value, which is what
-/// lets two sources report at two different rates: a syllable widens the glow at once, and the
-/// silent moment between two syllables only takes it part of the way back down.
+/// A view of its own because the level arrives tens of times a second: anything else reading it would
+/// be re-evaluated that often. The rise and fall are the view's own animation rather than a smoothed
+/// value, so two sources may report at two different rates.
 private struct CursorVoiceGlowView: View {
 
     @ObservedObject var voiceLoudnessMeter: VoiceLoudnessMeter
-    /// The cursor's colour as it stands rather than a colour of the glow's own: the light around the
-    /// cursor is the cursor's light, so it turns red with the triangle on a flight that is going to
-    /// press or carry something.
+    /// The cursor's colour as it stands, so the glow turns red with the triangle on a flight that is going to press or carry.
     let cursorColor: Color
     let cursorPosition: CGPoint
     let flightScale: CGFloat
     let buddyNavigationMode: BuddyNavigationMode
     let opacity: Double
 
-    /// The glow's diameter at its widest, and the diameter it never goes below. Together they are
-    /// the whole range the voice moves it through.
+    /// The whole range the voice moves the glow's diameter through.
     private static let widestGlowDiameter: CGFloat = 52
     private static let narrowestGlowDiameter: CGFloat = 16
 
-    /// Long enough that the glow swells rather than jumps with each syllable, short enough that it
-    /// is never still moving when the syllable after it arrives.
+    /// Long enough that the glow swells rather than jumps with a syllable, short enough to be still before the next one arrives.
     private static let glowRiseAndFallDuration: Double = 0.12
 
     private var glowDiameter: CGFloat {
@@ -1312,10 +1095,7 @@ private struct CursorVoiceGlowView: View {
             .fill(cursorColor)
             .frame(width: glowDiameter, height: glowDiameter)
             .blur(radius: 10)
-            // The level and the cursor's own fade as one number: a silence draws nothing whatever
-            // the cursor is doing, and the peak is deliberately below the triangle's own brightness
-            // — the glow is a reading of the voice, and a cursor outshone by its own light is the
-            // wrong trade.
+            // Level and opacity as one number: a silence draws nothing. The peak stays deliberately below the triangle's brightness.
             .opacity(0.55 * voiceLoudnessMeter.loudness * opacity)
             .position(cursorPosition)
             .animation(
@@ -1324,9 +1104,7 @@ private struct CursorVoiceGlowView: View {
                     : nil,
                 value: cursorPosition
             )
-            // Keyed on the colour rather than on the reason for it, and on the triangle's own clock:
-            // the two changing on two clocks is a button that is two colours for a quarter of a
-            // second, at the moment the user is watching to find out what Kiki is about to press.
+            // On the triangle's own clock: two clocks would show two colours for a quarter of a second, at the moment the user is watching to learn what Kiki is about to press.
             .animation(.easeInOut(duration: CursorView.cursorClickColourFadeDuration), value: cursorColor)
             .animation(.easeOut(duration: Self.glowRiseAndFallDuration), value: voiceLoudnessMeter.loudness)
             .allowsHitTesting(false)
@@ -1335,16 +1113,14 @@ private struct CursorVoiceGlowView: View {
 
 // MARK: - Cursor Waveform
 
-/// The purple waveform that replaces the triangle cursor while the user holds push-to-talk and speaks.
+/// The purple waveform that replaces the cursor while push-to-talk is held.
 private struct CursorWaveformView: View {
     let audioPowerLevel: CGFloat
     /// Whether the waveform is the shape actually being drawn on this screen.
     ///
     /// The timeline is paused when it is not: a `TimelineView` keeps to its schedule whatever its
-    /// `opacity` is, so this view — which cross-fades with the triangle rather than being inserted and
-    /// removed — re-evaluated its body and committed a full-screen transparent window to the render
-    /// server 36 times a second per display for as long as the app ran. Bar heights come from the
-    /// timeline's date, so unpausing resumes mid-phase.
+    /// `opacity` is, so an unpaused, cross-faded one commits a full-screen transparent window 36 times a
+    /// second per display. Bar heights come from the date, so unpausing resumes mid-phase.
     let isOnScreen: Bool
 
     private let barCount = 5
@@ -1382,16 +1158,13 @@ private struct CursorWaveformView: View {
 
 // MARK: - Cursor Spinner
 
-/// The purple spinner that replaces the triangle cursor while the AI is processing a voice input.
+/// The purple spinner that replaces the cursor while the AI is processing a voice input.
 private struct CursorSpinnerView: View {
     /// Whether the spinner is the shape actually being drawn on this screen.
     ///
-    /// The timeline is paused when it is not. The rotation cannot be a `repeatForever` animation:
-    /// `rotationEffect` is *animatable*, so the interpolation is SwiftUI's own rather than
-    /// CoreAnimation's — every frame the attribute graph recomputed the animator and committed a
-    /// transaction, on a view permanently in the tree that had no idea whether it could be seen.
-    /// There is one per display. The angle comes from the timeline's date, so unpausing resumes
-    /// mid-turn.
+    /// The timeline is paused when it is not, and the rotation cannot be `repeatForever`: `rotationEffect`
+    /// is *animatable*, so every frame the attribute graph recomputes the animator and commits a
+    /// transaction — per display, on a view permanently in the tree.
     let isOnScreen: Bool
 
     /// One full turn.
@@ -1417,8 +1190,7 @@ private struct CursorSpinnerView: View {
         }
     }
 
-    /// Where the turn has got to at a given moment, in degrees. Taken from the absolute time rather
-    /// than a frame count, so pausing is a break in the drawing rather than a jump.
+    /// Where the turn has got to, in degrees. From the absolute time, not a frame count, so pausing is a break, not a jump.
     private func rotationDegrees(at timelineDate: Date) -> Double {
         let secondsIntoTheTurn = timelineDate.timeIntervalSinceReferenceDate
             .truncatingRemainder(dividingBy: rotationPeriodSeconds)
@@ -1426,14 +1198,10 @@ private struct CursorSpinnerView: View {
     }
 }
 
-// Manager for overlay windows — creates one per screen so the cursor
-// buddy seamlessly follows the cursor across multiple monitors.
+// One overlay window per screen, so the buddy follows the cursor across monitors.
 @MainActor
 class OverlayWindowManager {
-    /// The overlay window covering each display, keyed by display ID. Keyed on the ID rather than
-    /// kept in a flat array because a display change has to tell "already covered" apart from "new",
-    /// and the display ID is the only thing about a screen that survives a re-plug — the `NSScreen`
-    /// instance does not.
+    /// Keyed by display ID, the only thing about a screen that survives a re-plug; a display change must tell "already covered" from "new".
     private var overlayWindowsByDisplayID: [CGDirectDisplayID: OverlayWindow] = [:]
     var hasShownOverlayBefore = false
 
@@ -1455,23 +1223,16 @@ class OverlayWindowManager {
         }
     }
 
-    /// Rebuilds the overlay to match the current display configuration — a monitor plugged in,
-    /// unplugged, resized, or moved.
-    ///
-    /// Overlay windows are otherwise built only when the overlay is shown, so a display connected
-    /// while the app is running would never get one: no cursor, no waveform or bubble, and no view to
-    /// receive a pointing animation aimed at that screen.
-    ///
-    /// A screen still connected with an unchanged frame keeps its window, so a change does not restart
-    /// the other screens' flights or the onboarding video, and a repeated call is harmless.
+    /// Rebuilds the overlay when the display configuration changes — else windows exist only while the
+    /// overlay is shown, so a display plugged in at runtime would never get one. Unchanged screens keep
+    /// their windows, flights and video.
     func refreshOverlaysForDisplayConfigurationChange(
         onScreens screens: [NSScreen],
         companionManager: CompanionManager
     ) {
         let connectedDisplayIDs = Set(screens.map { $0.displayID })
 
-        // Displays that are gone lose their window. Clearing the content view is what runs the
-        // hosted view's `onDisappear`, which is where the pointer is released.
+        // Gone displays lose their window; clearing the content view runs `onDisappear`, where the pointer is released.
         let disconnectedDisplayIDs = overlayWindowsByDisplayID.keys.filter { !connectedDisplayIDs.contains($0) }
         for displayID in disconnectedDisplayIDs {
             guard let window = overlayWindowsByDisplayID.removeValue(forKey: displayID) else { continue }
@@ -1480,14 +1241,12 @@ class OverlayWindowManager {
         }
 
         for screen in screens {
-            // Already covered by a window of the right size — leave it alone.
             if let existingWindow = overlayWindowsByDisplayID[screen.displayID],
                existingWindow.frame == screen.frame {
                 continue
             }
 
-            // Either a display never covered, or one resized or moved. The hosted view bakes in
-            // this screen's frame when it is built, so both cases need a fresh window.
+            // Never covered, or resized or moved: the hosted view bakes in this screen's frame when built, so both need a fresh window.
             if let staleWindow = overlayWindowsByDisplayID.removeValue(forKey: screen.displayID) {
                 staleWindow.orderOut(nil)
                 staleWindow.contentView = nil
@@ -1504,8 +1263,7 @@ class OverlayWindowManager {
         }
     }
 
-    /// Builds the overlay window covering one screen. Shared by the initial show and the rebuild
-    /// after a display change so the two can't drift apart.
+    /// Builds the overlay window covering one screen — shared by the initial show and the display-change rebuild.
     private func makeOverlayWindow(
         for screen: NSScreen,
         isFirstAppearance: Bool,
@@ -1534,7 +1292,6 @@ class OverlayWindowManager {
         overlayWindowsByDisplayID.removeAll()
     }
 
-    /// Fades out overlay windows over `duration` seconds, then removes them.
     func fadeOutAndHideOverlay(duration: TimeInterval = 0.4) {
         let windowsToFade = Array(overlayWindowsByDisplayID.values)
         overlayWindowsByDisplayID.removeAll()
@@ -1560,8 +1317,6 @@ class OverlayWindowManager {
 
 // MARK: - Onboarding Video Player
 
-/// NSViewRepresentable wrapping an AVPlayerLayer so HLS video plays inside SwiftUI. The custom
-/// NSView subclass keeps the player layer sized to the view's bounds.
 private struct OnboardingVideoPlayerView: NSViewRepresentable {
     let player: AVPlayer?
 

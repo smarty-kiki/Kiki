@@ -2,12 +2,9 @@
 //  DeepSeekAPI.swift
 //  kiki-desktop-agent
 //
-//  DeepSeek chat client with streaming and image input.
-//
 
 import Foundation
 
-/// Errors raised before a DeepSeek request can be sent.
 enum DeepSeekAPIError: LocalizedError {
     case missingAPIKey
 
@@ -21,11 +18,10 @@ enum DeepSeekAPIError: LocalizedError {
 
 /// Client for DeepSeek's chat completions API.
 ///
-/// DeepSeek speaks the OpenAI chat-completions dialect rather than Anthropic's, so this is a
-/// sibling of `OpenAIAPI`: the system prompt is an ordinary `system` message, images are
-/// `image_url` blocks holding a base64 `data:` URL, and streamed text arrives as
-/// `choices[].delta.content`. Every request carries a screenshot per display so Kiki can
-/// point at things, so the configured model has to accept image input — a text-only model
+/// DeepSeek speaks the OpenAI chat-completions dialect, so this is a sibling of `OpenAIAPI`: the
+/// system prompt is an ordinary `system` message, images are `image_url` blocks holding a base64
+/// `data:` URL, and streamed text arrives as `choices[].delta.content`. Every request carries a
+/// screenshot per display, so the configured model has to accept image input — a text-only model
 /// makes every request fail with HTTP 400.
 class DeepSeekAPI {
     private static let tlsWarmupLock = NSLock()
@@ -33,27 +29,19 @@ class DeepSeekAPI {
 
     private static let chatCompletionsURL = URL(string: "https://api.deepseek.com/chat/completions")!
 
-    /// The model used unless the user picks another one in the settings panel. Handles text
-    /// and image input through the same route, which is what keeps pointing working.
+    /// Handles text and image input through the same route, which is what keeps pointing working.
     static let defaultModel = "deepseek-flash"
 
-    /// Sent as `max_tokens`. A ceiling, not a request for a long answer — the model still
-    /// stops when its reply is done — set to the models' own output limit rather than a small
-    /// number because a reply cut off at the cap loses the `[POINT:...]` tag, which silently
-    /// disables pointing for that turn.
+    /// Sent as `max_tokens`: a ceiling at the models' own output limit, not a request for length —
+    /// a reply cut off at the cap loses the `[POINT:...]` tag, silently disabling pointing.
     private static let maximumOutputTokens = 393_216
 
-    /// Sent as `max_tokens` for a compression call. A summary is meant to be short, but the four
-    /// things it must keep can be a paragraph each, so the ceiling is far above the length the
-    /// summary should ever reach.
+    /// Sent as `max_tokens` for a compression call; far above the length a summary should reach.
     private static let maximumCompressionOutputTokens = 8_192
 
-    /// The instructions the compression call runs under.
-    ///
-    /// The list of what has to survive is the whole point of the call. A summary that drops what
-    /// went wrong is worse than no summary at all: it teaches the model to walk into the same
-    /// dead end again on the next step, and to keep walking into it, because the record of the
-    /// first time is gone.
+    /// The instructions the compression call runs under. A summary that drops what went wrong is
+    /// worse than no summary at all: it teaches the model to walk into the same dead end again on
+    /// the next step, because the record of the first time is gone.
     private static let conversationCompressionSystemPrompt = """
     You compress a stretch of your own past work into a short summary that you will read back \
     later, in place of the record it replaces.
@@ -76,8 +64,7 @@ class DeepSeekAPI {
     private let apiKeyStore: DeepSeekAPIKeyStore
     private let session: URLSession
 
-    /// The DeepSeek model to send requests to. Read when each request is built, so changing
-    /// it from the settings panel takes effect on the next turn.
+    /// Read when each request is built, so changing it takes effect on the next turn.
     var model: String
 
     init(apiKeyStore: DeepSeekAPIKeyStore, model: String = DeepSeekAPI.defaultModel) {
@@ -85,10 +72,9 @@ class DeepSeekAPI {
         self.apiKeyStore = apiKeyStore
         self.model = model
 
-        // `.default` rather than `.ephemeral` so TLS session tickets are cached: an ephemeral
-        // session does a full handshake per request, which surfaces as transient -1200
-        // (errSSLPeerHandshakeFail) errors with large image payloads. Caching is cleared
-        // below so no response or credential reaches disk.
+        // `.default` rather than `.ephemeral` so TLS session tickets are cached; an ephemeral session
+        // handshakes per request, which surfaces as transient -1200 (errSSLPeerHandshakeFail) errors
+        // with large image payloads.
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 120
         config.timeoutIntervalForResource = 300
@@ -97,15 +83,12 @@ class DeepSeekAPI {
         config.httpCookieStorage = nil
         self.session = URLSession(configuration: config)
 
-        // Pre-establishes the TLS connection, so the first real call with its large image
-        // payload does not pay for a cold handshake.
+        // Pre-establishes the TLS connection so the first real call does not pay for a cold handshake.
         warmUpTLSConnectionIfNeeded()
     }
 
-    /// The MIME type of image data, read off its first bytes. Screen captures are JPEG and
-    /// pasted images are PNG; DeepSeek sniffs the real format anyway, but not lying is honest.
+    /// The MIME type of image data, read off its first bytes.
     private func detectImageMediaType(for imageData: Data) -> String {
-        // PNG's signature starts 89 50 4E 47.
         if imageData.count >= 4 {
             let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47]
             let firstFourBytes = [UInt8](imageData.prefix(4))
@@ -149,11 +132,9 @@ class DeepSeekAPI {
 
     /// Send a vision request to DeepSeek with streaming.
     ///
-    /// `onTextChunk` is awaited on the main actor after each chunk, because the caller cuts
-    /// the reply into speech segments as it arrives and cannot do that without awaiting.
-    /// Reading the stream therefore pauses for as long as the caller takes, so the caller
-    /// must only await work that was already going to be needed. Returns the accumulated
-    /// text and the total duration.
+    /// `onTextChunk` is awaited on the main actor after each chunk, because the caller cuts the
+    /// reply into speech segments as it arrives. Reading the stream pauses for as long as the caller
+    /// takes, so the caller must only await work that was already going to be needed.
     func analyzeImageStreaming(
         images: [(data: Data, label: String)],
         systemPrompt: String,
@@ -163,8 +144,7 @@ class DeepSeekAPI {
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
 
-        // Read per request rather than cached: a key pasted into the settings panel while
-        // the app is already running has to be picked up on the next turn, with no restart.
+        // Read per request: a key pasted while the app is running is picked up on the next turn.
         guard let apiKey = apiKeyStore.apiKey else {
             throw DeepSeekAPIError.missingAPIKey
         }
@@ -175,8 +155,6 @@ class DeepSeekAPI {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // DeepSeek shares OpenAI's ordering rules: the system prompt is the first message
-        // rather than a separate top-level field.
         var messages: [[String: Any]] = []
 
         messages.append([
@@ -189,10 +167,8 @@ class DeepSeekAPI {
             messages.append(["role": "assistant", "content": assistantResponse])
         }
 
-        // Each label sits after its image so the model reads the caption as describing the
-        // shot above it, which is what makes the pixel dimensions usable for coordinate
-        // math. Images are legal only in `user` messages — one in the system prompt or a
-        // history turn makes DeepSeek reject the whole request.
+        // Each label follows its image so the model reads it as describing the shot above — which
+        // makes the pixel dimensions usable; images are legal only in `user` messages.
         var contentBlocks: [[String: Any]] = []
         for image in images {
             contentBlocks.append([
@@ -251,15 +227,14 @@ class DeepSeekAPI {
         var accumulatedResponseText = ""
 
         for try await line in byteStream.lines {
-            // Comment/keep-alive lines start with a colon and are skipped by this same guard.
+            // Keep-alive lines start with a colon and are skipped by this same guard.
             guard line.hasPrefix("data: ") else { continue }
             let jsonString = String(line.dropFirst(6)) // Drop "data: " prefix
 
             guard jsonString != "[DONE]" else { break }
 
-            // Hybrid models stream their chain of thought separately, under
-            // `delta.reasoning_content`. Only `delta.content` is the answer to speak, so
-            // the other field is deliberately ignored.
+            // Hybrid models stream their chain of thought under `delta.reasoning_content`; only
+            // `delta.content` is the answer to speak, so the other field is deliberately ignored.
             guard let jsonData = jsonString.data(using: .utf8),
                   let eventPayload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
                   let choices = eventPayload["choices"] as? [[String: Any]],
@@ -270,10 +245,8 @@ class DeepSeekAPI {
             }
 
             accumulatedResponseText += textChunk
-            // The whole reply so far, not the delta: the caller's segmenter is written
-            // against a growing document, which is what the tag parsing, the tidy passes and
-            // the sentence scan all take. It re-does that work per chunk so that there is
-            // exactly one implementation of it.
+            // The whole reply so far, not the delta: the caller's segmenter works on a growing
+            // document, re-doing the parse per chunk so there is exactly one implementation.
             await onTextChunk(accumulatedResponseText)
         }
 
@@ -285,19 +258,12 @@ class DeepSeekAPI {
 
     /// Compresses a stretch of a conversation into a short summary of it.
     ///
-    /// Not streamed: nothing is spoken from a summary and nothing is shown arriving, so a stream
-    /// would buy progress nobody asked to watch.
-    ///
-    /// - Parameter existingSummary: What everything compressed before was compressed into, which
-    ///   this call folds the new stretch into. Folding rather than summarising the two separately
-    ///   is what keeps one summary of the whole past rather than a chain of summaries of its
-    ///   parts, each one a summary of a summary.
+    /// Not streamed: nothing is spoken from a summary and nothing is shown arriving. `existingSummary`
+    /// is folded in, which keeps one summary of the whole past rather than a chain of summaries.
     func summarizeConversation(
         compressing conversationToCompress: String,
         foldingIn existingSummary: String?
     ) async throws -> String {
-        // Read per request for the same reason the streaming call does: a key saved while the app
-        // is running has to be picked up without a restart.
         guard let apiKey = apiKeyStore.apiKey else {
             throw DeepSeekAPIError.missingAPIKey
         }

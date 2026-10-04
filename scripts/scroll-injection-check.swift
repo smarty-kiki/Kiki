@@ -29,8 +29,7 @@
 //
 //  Accessibility permission is required to post events at all, and it is judged
 //  against the process responsible for this one — running from a terminal means
-//  the TERMINAL needs the grant, not this binary. If neither recording window
-//  sees anything, that grant is the first thing to check.
+//  the TERMINAL needs the grant, not this binary.
 //
 //  Usage:
 //      swiftc -O scripts/scroll-injection-check.swift -o /tmp/scroll-injection-check
@@ -44,13 +43,9 @@ import ApplicationServices
 // MARK: - Coordinate conversion
 
 /// The screen the events are aimed at, and the one number the two coordinate
-/// spaces differ by.
-///
-/// `CGEvent`'s `location`, `CGWarpMouseCursorPosition` and the Accessibility API
-/// all use one space: origin at the **top-left** corner of the primary display,
-/// y increasing downward. AppKit uses the bottom-left corner of that same
-/// display with y increasing upward. Only the primary display's height
-/// separates them, which is what this carries.
+/// spaces differ by: `CGEvent`'s `location` and the Accessibility API measure
+/// from the primary display's top-left with y down, AppKit from that display's
+/// bottom-left with y up, and only its height separates the two.
 struct ScreenSpace {
     let primaryScreenHeightInPoints: CGFloat
 
@@ -65,8 +60,7 @@ struct ScreenSpace {
 // MARK: - The two recording windows
 
 /// A view that writes down every scroll it is handed, so "where did it land" is
-/// answered by the receiving side rather than by the posting side. Nothing here
-/// moves: the only thing this window can report is that it was the one chosen.
+/// answered by the receiving side rather than by the posting side.
 final class ScrollRecordingView: NSView {
     struct ReceivedScroll {
         let scrollingDeltaX: CGFloat
@@ -96,9 +90,8 @@ final class ScrollRecordingView: NSView {
         ))
     }
 
-    /// A borderless window refuses key status by default. The probe needs exactly
-    /// one window that is deliberately **not** key, so that "the key window got
-    /// it" stays separable from "the window under the pointer got it".
+    /// A borderless window refuses key status by default; this one is keyable so
+    /// the right window can be key while the left is not.
     final class KeyableWindow: NSWindow {
         override var canBecomeKey: Bool { true }
     }
@@ -106,9 +99,8 @@ final class ScrollRecordingView: NSView {
 
 // MARK: - The window that can really scroll
 
-/// A document taller and wider than its clip view, flipped so that the clip
-/// view's `bounds.origin` runs the same way the reader does: (0, 0) at the
-/// top-left, growing down and to the right.
+/// A document taller and wider than its clip view, flipped so `bounds.origin`
+/// runs the way the reader does: (0, 0) at the top-left, growing down and right.
 final class FlippedDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
@@ -116,8 +108,7 @@ final class FlippedDocumentView: NSView {
 // MARK: - Running one trial
 
 /// What one ownership trial saw. Both counts are reported rather than one
-/// verdict, because "the other window got it" and "nobody got it" are different
-/// findings and a single boolean cannot hold both.
+/// verdict: "the other window got it" and "nobody got it" are different findings.
 struct OwnershipTrialOutcome {
     let name: String
     let pointerWasOver: String
@@ -144,8 +135,7 @@ final class ScrollInjectionCheck {
     private let scrollingCenterInAccessibilitySpace: CGPoint
 
     /// One screenful the way the app defines it: 80% of the display's edge, so
-    /// that a scroll leaves a fifth of the previous view on screen and the
-    /// reader can tell where they were.
+    /// that a scroll leaves a fifth of the previous view on screen.
     private let oneScreenfulInPoints: CGFloat
 
     private static let settlingSeconds: TimeInterval = 0.15
@@ -157,7 +147,6 @@ final class ScrollInjectionCheck {
         let screenFrame = primaryScreen.frame
         self.oneScreenfulInPoints = screenFrame.height * 0.8
 
-        // Two small windows high up, far apart, and one wide window below them.
         // Nothing overlaps, so "which window" is never a question about z-order.
         let leftFrameInAppKitCoordinates = NSRect(
             x: screenFrame.minX + screenFrame.width * 0.06,
@@ -252,9 +241,8 @@ final class ScrollInjectionCheck {
         leftWindow.orderFrontRegardless()
         rightWindow.orderFrontRegardless()
         scrollingWindow.orderFrontRegardless()
-        // The key window is made the *right* one and the pointer is parked over
-        // the *left* one, so the three candidate rules have three different
-        // answers and no two of them can be mistaken for each other.
+        // The key window is the *right* one and the pointer starts over the
+        // *left*, so the three candidate rules cannot be mistaken for each other.
         rightWindow.makeKey()
         print("左窗口 \(NSStringFromRect(leftWindow.frame))（AppKit 坐标）")
         print("右窗口 \(NSStringFromRect(rightWindow.frame))")
@@ -266,16 +254,13 @@ final class ScrollInjectionCheck {
     // MARK: - 归属
 
     /// Parks the pointer over one window, names the other in the event's point,
-    /// and reports which of the two recorded the scroll.
-    ///
-    /// The two trials that matter are the first and the second, and they are
-    /// chosen so that the three candidate rules give three different pairs:
+    /// and reports which of the two recorded the scroll. The first two trials of
+    /// the four are the ones that matter: A parts from B on the first row, B
+    /// from C on the second.
     ///
     ///   | 指针在 | 事件点在 | A（事件自带点） | B（指针所在） | C（key 窗口）|
     ///   |   左   |    右    |       右        |      左      |      右      |
     ///   |   左   |    左    |       左        |      左      |      右      |
-    ///
-    /// A and B part company on the first row; B and C on the second.
     private func runOwnershipTrials() async {
         print("\n════════ 一、滚轮事件落到哪个窗口 ════════")
         print("（指针停在一个窗口上，事件自带的点写在另一个里。key window 始终是右边那个。）")
@@ -407,14 +392,13 @@ final class ScrollInjectionCheck {
     /// What the sign means, read off a real scroll view rather than guessed at.
     ///
     /// A flipped document runs the same way the reader does, so "the content
-    /// moved down" is `bounds.origin.y` growing. This is the definition the app
-    /// needs: `[SCROLLDOWN:…]` has to reveal what is currently below the fold,
-    /// whatever sign that turns out to require.
+    /// moved down" is `bounds.origin.y` growing — the definition the app needs,
+    /// since `[SCROLLDOWN:…]` has to reveal what is below the fold, whatever
+    /// sign that turns out to require.
     ///
-    /// Every direction is measured from the middle of the document. Started from
-    /// an edge, the first two directions are answered by the clamp rather than
-    /// by the sign — "the document did not move" is what both "it scrolled the
-    /// other way" and "there was nothing left to reveal" look like.
+    /// Every direction is measured from the middle of the document: started from
+    /// an edge, "it scrolled the other way" and "there was nothing left to
+    /// reveal" both look like "the document did not move".
     private func runDirectionOnARealScrollView() async {
         print("\n════════ 三、在一个真的 NSScrollView 上，哪个符号是往下 / 往右 ════════")
         print("（文档已翻转：(0,0) 在左上角，origin.y 变大 = 内容往下走。每个方向都从文档中间起测。）")
@@ -439,10 +423,9 @@ final class ScrollInjectionCheck {
 
     /// Re-centres the document so every direction has room to move in.
     ///
-    /// The sign used here is the one section three is measuring, which would be
-    /// circular if the read-back were not printed: the row reports the position
-    /// it actually started from, so a centring that failed is visible as a start
-    /// near an edge rather than silently explaining a zero.
+    /// The sign used here is the one section three is measuring, so the row
+    /// prints the position it actually started from: a centring that failed shows
+    /// up as a start near an edge rather than silently explaining a zero.
     private func moveTheDocumentToTheMiddle() async {
         CGWarpMouseCursorPosition(scrollingCenterInAccessibilitySpace)
         try? await Task.sleep(nanoseconds: UInt64(Self.settlingSeconds * 1_000_000_000))
@@ -466,9 +449,8 @@ final class ScrollInjectionCheck {
 
     // MARK: - Posting
 
-    /// Builds and posts one scroll exactly the way `ElementScroller` will: pixel
-    /// units, HID source, `wheelCount` derived from whether the horizontal wheel
-    /// carries anything, and the point written onto the event.
+    /// Builds and posts one scroll the way `ElementScroller` will: pixel units,
+    /// HID source, and the point written onto the event.
     private func postScroll(vertical: Int32, horizontal: Int32, at point: CGPoint?) async {
         guard let source = CGEventSource(stateID: .hidSystemState),
               let event = CGEvent(

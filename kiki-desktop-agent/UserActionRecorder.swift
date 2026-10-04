@@ -2,9 +2,9 @@
 //  UserActionRecorder.swift
 //  kiki-desktop-agent
 //
-//  Watches the mouse while the user is recording a run of their own actions, and reduces what it
-//  sees to the actions Kiki performs again afterwards. Also owns the shortcut that starts and ends
-//  a recording, which it has to watch for at all times because that is what ends one.
+//  Watches the mouse while the user records a run of their own actions, and reduces what it sees to
+//  the actions Kiki performs again afterwards. Also owns the shortcut that starts and ends a
+//  recording, watched at all times because that same press is what ends one.
 //
 
 import AppKit
@@ -12,11 +12,9 @@ import Combine
 import CoreGraphics
 import Foundation
 
-/// One thing the user did, as the action that would do it again.
-///
-/// The action is stored as the value the arrival performs rather than as a description of a mouse
-/// event, so a recording replays through the same code a tag or a terminal command reaches and
-/// there is no translation layer to get the two out of step.
+/// One thing the user did, as the action that would do it again: stored as the value the arrival
+/// performs rather than as a description of a mouse event, so a recording replays through the same code
+/// a tag or a terminal reaches, with no translation layer to get the two out of step.
 struct RecordedUserAction {
     let action: ElementActionOnArrival
     /// Where it happened, in the global screen space `CGEvent` reports — the same space a terminal
@@ -26,10 +24,8 @@ struct RecordedUserAction {
     let dragDestinationGlobalScreenPoint: CGPoint?
 }
 
-/// The recorder.
-///
-/// Listen-only, so the shortcut and everything the user does with the mouse still reach the app
-/// underneath — Kiki is watching a recording, not intercepting one.
+/// The recorder. Listen-only, so the shortcut and everything the user does with the mouse still reach
+/// the app underneath — Kiki is watching a recording, not intercepting one.
 final class UserActionRecorder: ObservableObject {
 
     /// Fires once for each press of the shortcut. A press and not a click, because the shortcut has
@@ -42,33 +38,24 @@ final class UserActionRecorder: ObservableObject {
     /// pressed without the front app receiving a character.
     private static let shortcutModifierFlags: CGEventFlags = [.maskShift, .maskAlternate]
 
-    /// How far the pointer has to travel while the button is down for the gesture to be a drag
-    /// rather than a click.
-    ///
-    /// A few points, because a click is never perfectly still: a hand resting on a mouse moves it
-    /// by a point or two between the press and the release, and calling that a drag would replay
-    /// every click in the recording as a movement to the same place.
+    /// How far the pointer has to travel while the button is down for the gesture to be a drag rather
+    /// than a click. A few points, because a click is never perfectly still — a hand resting on a mouse
+    /// drifts a point or two, and calling that a drag would replay every click as a movement to the
+    /// same place.
     private static let pointsOfMovementThatMakeAPressADrag: CGFloat = 3
 
-    /// The longest gap between two wheel events that still counts as one scroll.
-    ///
-    /// A trackpad reports a scroll as a stream of small events and a wheel as one per notch, and
-    /// what a recording wants is the gesture rather than the stream: without this, one flick of two
-    /// fingers becomes forty recorded scrolls.
+    /// The longest gap between two wheel events that still counts as one scroll. A trackpad reports a
+    /// scroll as a stream of small events and a wheel as one per notch; a recording wants the gesture
+    /// rather than the stream, so without this one flick of two fingers becomes forty recorded scrolls.
     private static let secondsThatSeparateTwoScrollEvents: TimeInterval = 0.15
 
     /// What a line of a line-based wheel is worth in points, which is the unit a scroll is replayed
-    /// in.
-    ///
-    /// A trackpad reports its deltas in points, and a wheel that clicks from notch to notch reports
-    /// the same field in lines — the two cannot be told apart downstream, so the conversion has to
-    /// happen here.
+    /// in: a trackpad reports points and a wheel that clicks from notch to notch reports lines, in the
+    /// same field and indistinguishable downstream — so the conversion has to happen here.
     private static let pointsPerLineOfALineBasedWheel: CGFloat = 10
 
-    /// How many actions one recording can hold.
-    ///
-    /// A recording is replayed in a loop, so its length is how long the user waits for the loop to
-    /// come round. Well past any run of steps a person performs on purpose.
+    /// How many actions one recording can hold. A recording is replayed in a loop, so its length is
+    /// how long the user waits for the loop to come round — well past any run of steps done on purpose.
     private static let mostActionsInOneRecording = 200
 
     // MARK: - State
@@ -81,23 +68,21 @@ final class UserActionRecorder: ObservableObject {
     private var pressInProgress: PressInProgress?
     private var scrollInProgress: ScrollInProgress?
 
-    /// A press that has not been recorded yet, because the system may still be counting it.
-    ///
-    /// The count is the system's own — the `mouseEventClickState` it puts on each press, raised for
-    /// a press that continues the one before — so what makes two presses one double click is the
-    /// same judgement the app underneath will make when they are replayed.
+    /// A press that has not been recorded yet, because the system may still be counting it. The count is
+    /// the system's own — the `mouseEventClickState` raised for a press that continues the one before —
+    /// so two presses become one double click by the same judgement the app underneath will make on
+    /// replay.
     private struct PressInProgress {
         let isTheRightButton: Bool
         let pointWhereTheButtonWentDown: CGPoint
-        /// The furthest the pointer travelled while the button was down, which is what says
-        /// whether this is a drag. Tracked as it moves rather than measured between the press and
-        /// the release, so a drag that comes back to where it started is still a drag.
+        /// The furthest the pointer travelled while the button was down, which is what says whether this
+        /// is a drag. Tracked as it moves, so a drag that returns to where it started is still a drag.
         var furthestPointsTravelled: CGFloat = 0
         var highestClickState: Int
     }
 
-    /// A run of wheel events that has not been recorded yet, for the same reason a press has not:
-    /// the gesture is only over once nothing more arrives.
+    /// A run of wheel events that has not been recorded yet, for the same reason a press has not: the
+    /// gesture is only over once nothing more arrives.
     private struct ScrollInProgress {
         var verticalPoints: CGFloat
         var horizontalPoints: CGFloat
@@ -113,8 +98,8 @@ final class UserActionRecorder: ObservableObject {
 
     func start() {
         // Never restart a running tap, for the same reason the push-to-talk monitor does not: the
-        // permission poller calls start() every few seconds, and a fresh tap would drop the press
-        // and scroll in progress.
+        // permission poller calls start() every few seconds, and a fresh tap would drop the press and
+        // scroll in progress.
         guard globalEventTap == nil else { return }
 
         let monitoredEventTypes: [CGEventType] = [
@@ -197,13 +182,13 @@ final class UserActionRecorder: ObservableObject {
     }
 
     /// Ends the recording and hands back what it holds, with whatever gesture was still in progress
-    /// included — the user's last action before the shortcut is as much part of the recording as
-    /// the ones before it.
+    /// included — the user's last action before the shortcut is as much part of the recording as those
+    /// before it.
     @discardableResult
     func stopRecording() -> [RecordedUserAction] {
         // Settled before the flag goes down, because settling is what records them: `append` drops
-        // everything that arrives once the recording has ended, so the other order loses the very
-        // gesture this is here to keep.
+        // everything arriving once the recording has ended, so the other order loses the very gesture
+        // this keeps.
         settleThePressInProgress()
         settleTheScrollInProgress()
         isRecordingWhatTheUserIsDoing = false
@@ -223,9 +208,8 @@ final class UserActionRecorder: ObservableObject {
             return Unmanaged.passUnretained(event)
         }
 
-        // The shortcut is watched for whether or not a recording is running, because the same press
-        // is what starts one, what ends one and what ends a replay. Everything else is dropped the
-        // moment it arrives when no recording is running.
+        // The shortcut is watched whether or not a recording is running, because the same press starts
+        // one, ends one and ends a replay. Everything else is dropped on arrival while none runs.
         if eventType == .flagsChanged {
             handleTheModifiersChanging(event)
             return Unmanaged.passUnretained(event)
@@ -378,15 +362,12 @@ final class UserActionRecorder: ObservableObject {
 
     /// How far one wheel event moved, in points.
     ///
-    /// **A trackpad's movement is in the point delta, and the delta beside it is not the same
-    /// number.** Measured on a real flick, `deltaAxis1` is that movement divided by about ten and
-    /// rounded to a whole number — one event of the run held `delta1 = -2` beside `pointDelta1 =
-    /// -26` — so a recording read from it replays every flick at a tenth of the distance covered.
-    /// `fixedPtDeltaAxis1` is the same approximation with its fraction kept, and is no better.
-    ///
-    /// Read as doubles rather than as the integers the fields are named for: a trackpad reports
-    /// fractions of a point, and reading them as integers would turn a slow scroll into no scroll at
-    /// all and drop the rest of it on the floor.
+    /// A trackpad's movement is in the point delta, never the plain delta beside it: measured on a real
+    /// flick, `deltaAxis1` held -2 while `pointDelta1` held -26 — the movement divided by about ten and
+    /// rounded — so a recording read from it would replay every flick at a tenth of the distance
+    /// covered. `fixedPtDeltaAxis1` is the same approximation with its fraction kept, and is no better.
+    /// Both fields are read as doubles, because a trackpad reports fractions of a point: read as
+    /// integers, a slow scroll becomes no scroll at all.
     private static func pointsOfMovement(ofTheWheelEvent event: CGEvent) -> (vertical: CGFloat, horizontal: CGFloat) {
         guard event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0 else {
             let pointsPerLine = pointsPerLineOfALineBasedWheel
@@ -402,11 +383,9 @@ final class UserActionRecorder: ObservableObject {
         )
     }
 
-    /// A run of wheel events goes out as one scroll along the axis it moved the most, in the
-    /// direction it moved it.
-    ///
-    /// One axis rather than two: a scroll Kiki makes goes one way, so a diagonal flick of two
-    /// fingers is recorded as the movement the user would name if asked which way they scrolled.
+    /// A run of wheel events goes out as one scroll along the axis it moved the most, in the direction
+    /// it moved it: a scroll Kiki makes goes one way, so a diagonal flick of two fingers is recorded
+    /// as the movement the user would name if asked which way they scrolled.
     private func settleTheScrollInProgress() {
         guard let scroll = scrollInProgress else { return }
         scrollInProgress = nil
@@ -440,11 +419,10 @@ final class UserActionRecorder: ObservableObject {
         recordedUserActions.append(recordedUserAction)
     }
 
-    /// Which press a run of presses amounts to.
-    ///
-    /// The count is the system's, and a fourth press of a run is reported as a fourth: there is no
-    /// gesture beyond three, so anything at or above three is the three-press one. The right button
-    /// has no counted variant, so a run of right presses is one right click.
+    /// Which press a run of presses amounts to. The count is the system's, and a fourth press is
+    /// reported as a fourth: there is no gesture beyond three, so anything at or above three is the
+    /// three-press one. The right button has no counted variant, so a run of right presses is one right
+    /// click.
     private static func clickKind(forThePress press: PressInProgress) -> ElementClickKind {
         guard !press.isTheRightButton else { return .rightClick }
         switch press.highestClickState {

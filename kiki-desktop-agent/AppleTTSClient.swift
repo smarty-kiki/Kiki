@@ -1,85 +1,68 @@
 //  AppleTTSClient.swift
 //  kiki-desktop-agent
 //
-//  Text-to-speech backed by Apple's on-device AVSpeechSynthesizer. Runs entirely
-//  locally: no API key, no network round trip, no per-character cost.
+//  Text-to-speech backed by Apple's on-device AVSpeechSynthesizer: no API key, no network, no cost.
 
 import AVFoundation
 import Foundation
 
-/// Speaks the reply one speech segment at a time, synthesising each segment while the model is
-/// still writing the rest of it.
+/// Speaks the reply one speech segment at a time, synthesising each while the model is still writing
+/// the rest: synthesis and playback are separate calls, so only playback sits in front of the voice.
 ///
-/// Synthesis and playback are separate calls: a segment's text is handed here the moment it can no
-/// longer change, so the audio is produced inside the window the user is already spending on the
-/// model, and only playback is left in front of the voice.
+/// `write(_:toBufferCallback:)` is driven strictly serially — a second `write()` disowns the first's
+/// callbacks, including the zero-length closing buffer that alone marks a segment complete.
 ///
-/// `write(_:toBufferCallback:)` is driven strictly serially — a second `write()` begun while the
-/// first is running disowns the first one's callbacks, including the zero-length closing buffer that
-/// is the only thing that would have marked it complete.
-///
-/// There is deliberately no pause API: `pauseSpeaking`/`continueSpeaking` leave the synthesizer
-/// silent for the rest of the utterance while reporting `isPaused == false`. The pacing they were
-/// used for lives in `CompanionManager`, which withholds the next segment instead.
+/// There is deliberately no pause API: `pauseSpeaking`/`continueSpeaking` leave the synthesizer silent
+/// for the rest of the utterance while reporting `isPaused == false`. `CompanionManager` withholds the
+/// next segment instead.
 @MainActor
 final class AppleTTSClient {
 
     // MARK: - What the caller hears about
 
-    /// Reports a word as it is reached, in UTF-16 offsets within the segment's own text.
-    ///
-    /// Taken from the playback position rather than the synthesizer, so they are accurate to the
-    /// polling interval below. `CompanionManager` adds the segment's start offset.
+    /// Reports a word as it is reached, in UTF-16 offsets within the segment's own text, taken from the
+    /// playback position rather than the synthesizer. `CompanionManager` adds its start offset.
     var onSpokenCharacterRange: (@MainActor (NSRange) -> Void)?
 
-    /// Reports that the segment handed to `speakPreparedSegment` has been heard in full.
-    ///
-    /// This is what releases the rest of the reply: the next segment is withheld until it arrives, so
-    /// a segment whose audio never ends strands everything after it.
+    /// Reports that the segment handed to `speakPreparedSegment` has been heard in full. The next
+    /// segment is withheld until it arrives, so audio that never ends strands the rest of the reply.
     var onPlaybackFinished: (@MainActor () -> Void)?
 
-    /// Reports that audio of the current reply has actually reached the output, once per reply.
-    ///
-    /// This is the difference between asking the voice to speak and hearing it: only the playback
-    /// position knows the node has rendered.
+    /// Reports that audio of the current reply has actually reached the output, once per reply: only
+    /// the playback position knows the node has rendered, not the scheduling of it.
     var onFirstSoundHeard: (@MainActor () -> Void)?
 
-    /// Reports how loud the audio being rendered is, from 0 to 1, once per playback tick, and zero
-    /// once the segment is over.
-    ///
-    /// The raw measurement rather than a smoothed one: how a glow rises and falls over a pause
-    /// between two syllables is the glow's business, and the two things that ever speak for Kiki
-    /// report here at rates of their own.
+    /// Reports how loud the audio being rendered is, from 0 to 1, once per tick and zero once the
+    /// segment is over — the raw measurement, since the glow's rise and fall is the drawing's own.
     var onVoiceLoudness: (@MainActor (CGFloat) -> Void)?
 
-    /// Whether a segment is currently being played. False between segments, which is why
-    /// `CompanionManager` schedules the transient cursor hide off its own `isSpeakingReply`.
+    /// False between segments, which is why `CompanionManager` schedules the transient cursor hide off
+    /// its own `isSpeakingReply`.
     var isPlaying: Bool { currentlyPlayingSegment != nil }
 
     // MARK: - Configuration
 
-    /// Optional Info.plist key naming an exact voice to speak with. When it is absent, or names a
-    /// voice this machine doesn't have installed, we fall back to the best voice for the language
-    /// the user actually speaks.
+    /// Optional Info.plist key naming an exact voice to speak with. Absent, or naming a voice this
+    /// machine does not have, the best voice for the user's own language is used.
     private static let preferredVoiceIdentifierInfoPlistKey = "AppleTTSVoiceIdentifier"
 
-    /// How often the playback position is read while a segment plays. The pointing tour is driven by
-    /// the words this reports, so it is the resolution at which a tour trigger fires.
+    /// How often the playback position is read while a segment plays: the words it reports drive the
+    /// pointing tour, so this is the resolution a tour trigger fires at.
     private static let playbackPositionPollingIntervalSeconds: TimeInterval = 0.02
 
     /// How many consecutive nil readings of the playback position write a playback off.
     ///
-    /// `playerTime(forNodeTime:)` returns nil only while the node is not playing, which after `play()`
-    /// has been called means the audio fell over rather than that it finished. A segment nothing ever
-    /// reports finished is a reply that never continues, so this turns it into a late end.
+    /// `playerTime(forNodeTime:)` returns nil only while the node is not playing, so after `play()` it
+    /// means the audio fell over — and a segment that never reports finished is a reply that never
+    /// continues, so this turns it into a late end.
     private static let consecutiveMissingPlaybackReadingsBeforeGivingUp = 25
 
     // MARK: - Synthesis
 
     private let speechSegmentSynthesizer = SpeechSegmentSynthesizer()
 
-    /// Every segment handed over for synthesis, in the order they were handed over, and kept after
-    /// playback because `speakPreparedSegment(segmentIndex:)` finds one by its index.
+    /// Every segment handed over for synthesis, in order — kept after playback because
+    /// `speakPreparedSegment(segmentIndex:)` finds one by its index.
     private var preparedSpeechSegments: [PreparedSpeechSegment] = []
 
     // MARK: - Playback
@@ -88,21 +71,17 @@ final class AppleTTSClient {
     private let playbackPlayerNode = AVAudioPlayerNode()
     private var isPlaybackEngineRunning = false
 
-    /// Whether any audio of the current reply has reached the output.
-    ///
-    /// What makes `onFirstSoundHeard` once per reply. Both teardown calls clear it: clearing it early
-    /// costs nothing — the next tick that sees the node render reports again — while clearing it too
-    /// late costs the caller the report entirely.
+    /// Whether any audio of the current reply has reached the output, which is what makes
+    /// `onFirstSoundHeard` once per reply. Clearing it early costs nothing — the next tick that sees
+    /// the node render reports again — while clearing it too late costs the caller the report.
     private var hasHeardTheFirstSoundOfTheCurrentReply = false
 
     /// The format the player node is connected to the mixer with: the voice's own output format,
     /// which is not knowable until the first buffer of audio exists.
     private var connectedPlaybackAudioFormat: AVAudioFormat?
 
-    /// What the tap below most recently measured, read by the polling timer.
-    ///
-    /// The measurement itself happens on the render thread, and the poll is what carries it to the
-    /// main actor — so the audio thread is written to and never written from.
+    /// What the tap below most recently measured, read by the polling timer — written on the render
+    /// thread and carried by that poll to the main actor.
     private let playbackLoudnessMeasurement = PlaybackLoudnessMeasurement()
 
     private var playbackHeadPollingTimer: Timer?
@@ -123,9 +102,8 @@ final class AppleTTSClient {
 
     // MARK: - The public surface
 
-    /// Hands one speech segment over to be synthesised, and returns immediately.
-    ///
-    /// The text is final by the time it arrives here, which is why it is never revisited.
+    /// Hands one speech segment over to be synthesised and returns immediately; its text is final by
+    /// the time it arrives here.
     func prepareSpeechSegment(spokenText: String, segmentIndex: Int) {
         let preparedSegment = speechSegmentSynthesizer.beginSynthesizing(
             spokenText: spokenText,
@@ -134,17 +112,16 @@ final class AppleTTSClient {
         preparedSpeechSegments.append(preparedSegment)
     }
 
-    /// Plays a segment that was handed over earlier, waiting for its synthesis if it has not
-    /// finished. Synthesis runs at roughly six times real time, so every segment but the first is
-    /// usually long finished before the cursor is ready to move on.
+    /// Plays a segment that was handed over earlier, waiting for its synthesis if it has not finished.
+    /// Synthesis runs at roughly six times real time, so every segment but the first is usually ready.
     func speakPreparedSegment(segmentIndex: Int) async {
         guard let speechSegment = preparedSpeechSegments.first(where: { $0.segmentIndex == segmentIndex }) else {
             return
         }
 
         while !speechSegment.isSynthesisComplete {
-            // The reply may have been replaced while this was waiting, in which case the segment
-            // is gone from the list and there is nothing left to play.
+            // The reply may have been replaced while this was waiting: the segment is then gone from
+            // the list and there is nothing left to play.
             guard preparedSpeechSegments.contains(where: { $0 === speechSegment }) else { return }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -152,27 +129,24 @@ final class AppleTTSClient {
         guard preparedSpeechSegments.contains(where: { $0 === speechSegment }) else { return }
 
         guard let synthesizedAudio = speechSegment.synthesizedAudio else {
-            // Synthesis completed without producing any audio. Reporting the segment as finished
-            // is the only safe direction: the reply is released on that report, so waiting
-            // forever for audio that will never exist would strand everything after it.
+            // Synthesis completed without producing audio. Reporting the segment finished is the only
+            // safe direction — waiting for audio that will never exist would strand the rest.
             onPlaybackFinished?()
             return
         }
 
         startPlaybackEngineIfNeeded(withAudioFormat: synthesizedAudio.audioFormat)
 
-        // Stopping the node is what keeps the next segment from being heard early: it drops
-        // anything scheduled and resets the node's timeline, so the frame numbers the word marks
-        // were measured in start at zero again for this segment.
+        // Stopping the node drops anything scheduled and resets its timeline, so this segment's
+        // word-mark frames are counted from zero rather than keeping the last segment's.
         playbackPlayerNode.stop()
-        // The previous segment's last reading outlives its audio, and the first tick of this one
-        // would report it as though it were this segment's opening syllable.
+        // The previous segment's last reading outlives its audio, and would be reported as this
+        // segment's opening syllable.
         playbackLoudnessMeasurement.reset()
         for audioBuffer in synthesizedAudio.audioBuffers {
-            // Written out in full rather than as `scheduleBuffer(_:)`, because that shorthand is
-            // ambiguous inside an `async` function: AVFoundation also publishes a one-argument
-            // `async` overload that suspends until the buffer has played, and the compiler picks
-            // it — scheduling one buffer, waiting out its whole length, then scheduling the next.
+            // Written out in full rather than as `scheduleBuffer(_:)`, which inside an `async` function
+            // is ambiguous: AVFoundation also publishes a one-argument `async` overload that suspends
+            // until the buffer has played, and the compiler picks it — one buffer at a time, waited out.
             playbackPlayerNode.scheduleBuffer(audioBuffer, at: nil, options: [], completionHandler: nil)
         }
 
@@ -187,10 +161,8 @@ final class AppleTTSClient {
         startPlaybackHeadPollingTimer()
     }
 
-    /// Stops the audio immediately, without touching what has been prepared.
-    ///
-    /// A new reply and a new interaction both call it, and both follow it with
-    /// `discardPreparedSegments()`.
+    /// Stops the audio immediately, without touching what has been prepared; both callers follow it
+    /// with `discardPreparedSegments()`.
     func stopPlayback() {
         stopPlaybackHeadPollingTimer()
         currentlyPlayingSegment = nil
@@ -204,10 +176,8 @@ final class AppleTTSClient {
         onVoiceLoudness?(0)
     }
 
-    /// Drops every segment that has not been played, and abandons the one being synthesised.
-    ///
-    /// The synthesizer can still deliver buffers for a `write()` that has been stopped, so every
-    /// callback checks the generation it was started under before touching a segment.
+    /// Drops every segment that has not been played, and abandons the one being synthesised. A stopped
+    /// `write()` can still deliver buffers, so callbacks check their generation before touching one.
     func discardPreparedSegments() {
         preparedSpeechSegments = []
         hasHeardTheFirstSoundOfTheCurrentReply = false
@@ -217,24 +187,19 @@ final class AppleTTSClient {
 
     // MARK: - The playback engine
 
-    /// Connects the player node and starts the engine, once per reply.
-    ///
-    /// Called as soon as the first buffer of audio exists, which is during the model's own
-    /// generation window: the engine takes about 10 ms to start and starting it also opens the
+    /// Connects the player node and starts the engine, once per reply — as soon as the first buffer
+    /// exists, during the model's own generation window: starting takes about 10 ms and also opens the
     /// output device, so neither cost lands when the first word is due.
     private func startPlaybackEngineIfNeeded(withAudioFormat audioFormat: AVAudioFormat) {
         if let connectedPlaybackAudioFormat, connectedPlaybackAudioFormat != audioFormat {
-            // The voice is pinned, so every segment of every reply comes out in the same format.
-            // Reconnecting on a difference is the cheap answer to a case that should not arise,
-            // and it beats scheduling buffers into a mismatched connection, which fails silently.
+            // The voice is pinned, so this should not arise; reconnecting is the cheap answer, and it
+            // beats scheduling buffers into a mismatched connection, which fails silently.
             disconnectThePlaybackGraph()
         }
 
-        // An engine that has stopped is not something this object is told about in time: the output
-        // device changing under it takes it down, and the notification that means that arrives after
-        // the fact, if at all. So the flag is checked against the engine itself, here, where the next
-        // thing to happen is a buffer going into it — scheduling into a stopped engine fails
-        // silently, which would be the rest of the reply going quiet with no fault reported anywhere.
+        // Checked against the engine itself, where the next thing to happen is a buffer going into it:
+        // a hardware change stops the engine, the notification that means it arrives after the fact if
+        // at all, and scheduling into a stopped engine fails silently — the reply just goes quiet.
         if isPlaybackEngineRunning, !playbackEngine.isRunning {
             print("TTS: the playback engine had stopped, rebuilding it before this segment")
             disconnectThePlaybackGraph()
@@ -250,29 +215,22 @@ final class AppleTTSClient {
         }
 
         // The connection outlives a stopped engine — `stop()` halts the render thread and leaves the
-        // graph attached — so a remembered format says nothing about whether the engine is running,
-        // and scheduling into a stopped one fails silently. Every reply begins by stopping the engine,
-        // so this cannot be skipped on a matching format.
+        // graph attached — so a remembered format says nothing about whether the engine is running.
         guard !isPlaybackEngineRunning else { return }
 
         do {
             try playbackEngine.start()
             isPlaybackEngineRunning = true
         } catch {
-            // Reported rather than swallowed, but not fatal to the reply:
-            // `handlePlaybackHeadTick` finds no playback position, runs out its missing readings
-            // and ends the segment, which releases the rest of it.
+            // Reported rather than swallowed, but not fatal: `handlePlaybackHeadTick` finds no position,
+            // runs out its missing readings and ends the segment, which releases the rest of the reply.
             print("TTS playback engine failed to start: \(error)")
         }
     }
 
-    /// Takes the player node and the engine down to where they stand before the first segment of a
-    /// reply, so that what happens next is the connect and the start rather than a schedule into a
-    /// graph that has gone.
-    ///
-    /// A tap is installed by the connect below and goes with the connection it was made for, so one
-    /// exists exactly while a format is remembered — which is what makes removing it safe at both
-    /// call sites.
+    /// Takes the player node and the engine down to where they stand before a reply's first segment,
+    /// so what happens next is the connect and the start rather than a schedule into a graph that has
+    /// gone. A tap goes with its connection, so removing it is safe exactly while a format is remembered.
     private func disconnectThePlaybackGraph() {
         playbackPlayerNode.stop()
         playbackPlayerNode.removeTap(onBus: 0)
@@ -281,21 +239,17 @@ final class AppleTTSClient {
         connectedPlaybackAudioFormat = nil
     }
 
-    /// Puts a tap on the player node that measures the audio as it is rendered.
-    ///
-    /// Installed and removed with the connection it is installed on, so there is never more than
-    /// one. The block runs on the render thread, and the only thing it touches is the measurement
-    /// it was handed — which is what lets the value cross to the main actor without a lock on the
-    /// side that reads it.
+    /// Puts a tap on the player node that measures the audio as it is rendered — installed and removed
+    /// with its connection, so there is never more than one. The block runs on the render thread and
+    /// touches only the lock-protected measurement it was handed.
     private func installPlaybackLoudnessTap() {
         let loudnessMeasurement = playbackLoudnessMeasurement
         playbackPlayerNode.installTap(onBus: 0, bufferSize: 512, format: nil) { buffer, _ in
             let frameCount = Int(buffer.frameLength)
             guard frameCount > 0, let channelData = buffer.floatChannelData else { return }
 
-            // The node's output is one lane per channel, but the stride is asked for rather than
-            // assumed: reading an interleaved buffer as if it were not would measure one channel
-            // in `channelCount` and hear a different signal.
+            // The stride is asked for rather than assumed: reading an interleaved buffer as if it
+            // were not would measure one channel in `channelCount`.
             let samplesBetweenFrames = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
             var sumOfSquares: Float = 0
             for frameIndex in 0..<frameCount {
@@ -336,8 +290,6 @@ final class AppleTTSClient {
         playbackHeadPollingTimer = nil
     }
 
-    /// Reports every word the playback position has reached, and ends the segment once its audio
-    /// has been played through.
     private func handlePlaybackHeadTick() {
         guard currentlyPlayingSegment != nil else {
             stopPlaybackHeadPollingTimer()
@@ -360,10 +312,8 @@ final class AppleTTSClient {
         let playedFrameCount = playbackTime.sampleTime
         guard playedFrameCount >= 0 else { return }
 
-        // The tap's latest reading, which is this tick's answer to how loud the voice is right now.
-        // Read here rather than off the playback position because the position says where the voice
-        // is, not how it sounds — and at one tick per 20 ms the reading is never stale by more than
-        // the buffer it came out of.
+        // The tap's latest reading, not a value derived from the position: the position says where the
+        // voice is, not how it sounds.
         onVoiceLoudness?(
             VoiceLoudness.loudness(fromRootMeanSquare: playbackLoudnessMeasurement.rootMeanSquare)
         )
@@ -379,9 +329,8 @@ final class AppleTTSClient {
             }
         }
 
-        // The word marks carry the frame their word starts at, in the same timeline the playback
-        // position is counted in — the node was stopped before this segment's buffers were
-        // scheduled, which is what puts both at zero.
+        // The word marks and the playback position share one timeline, both starting at zero because
+        // the node was stopped before this segment's buffers were scheduled.
         while nextWordMarkIndexToReport < wordMarksBeingPlayed.count,
               wordMarksBeingPlayed[nextWordMarkIndexToReport].startFrame <= playedFrameCount {
             onSpokenCharacterRange?(wordMarksBeingPlayed[nextWordMarkIndexToReport].characterRange)
@@ -408,10 +357,8 @@ final class AppleTTSClient {
     // MARK: - The voice
 
     /// Picks the voice to speak with: an explicit Info.plist identifier if it resolves, otherwise the
-    /// highest-quality voice installed for the user's language.
-    ///
-    /// macOS ships only "compact" voices by default, so ranking by quality is what picks up the better
-    /// "enhanced" and "premium" ones where the user has downloaded them.
+    /// highest-quality voice installed for the user's language — macOS ships only "compact" voices by
+    /// default, so ranking by quality is what picks up the "enhanced" and "premium" ones.
     private static func resolveVoice() -> AVSpeechSynthesisVoice? {
         if let preferredVoiceIdentifier = AppBundleConfiguration.stringValue(forKey: preferredVoiceIdentifierInfoPlistKey),
            let preferredVoice = AVSpeechSynthesisVoice(identifier: preferredVoiceIdentifier) {
@@ -420,10 +367,9 @@ final class AppleTTSClient {
 
         let installedVoices = AVSpeechSynthesisVoice.speechVoices()
 
-        // Locale.preferredLanguages, never Locale.current: Locale.current is resolved against the
-        // app bundle's own localizations, and this bundle ships no .lproj at all, so it always
-        // resolves to English — which would pick an English voice on a Chinese Mac.
-        // Locale.preferredLanguages reads the system's AppleLanguages list directly.
+        // Locale.preferredLanguages, never Locale.current: Locale.current resolves against the app
+        // bundle's own localizations, and this bundle ships no .lproj at all, so it always resolves to
+        // English — which would pick an English voice on a Chinese Mac.
         let currentLanguageCode = Locale.preferredLanguages.first
             .flatMap { Locale(identifier: $0).language.languageCode?.identifier }
         let voicesForCurrentLanguage = installedVoices.filter { installedVoice in
@@ -442,13 +388,9 @@ final class AppleTTSClient {
 
 // MARK: - How loud the audio being played is
 
-/// The level of the audio passing through the player node, written from the render thread and read
-/// from the main actor.
-///
-/// The tap that fills it runs on the render thread, where a lock held for the length of a poll is
-/// not an option, so the two directions are kept to the width of one `Float` under a lock that is
-/// held for two instructions at a time. `nonisolated` puts the whole class outside the target's
-/// default main-actor isolation, which is what lets the render thread touch it at all.
+/// The level of the audio passing through the player node, written from the render thread and read from
+/// the main actor under a lock held for two instructions — the render thread cannot hold one for the
+/// length of a poll. `nonisolated` is what lets that thread touch it at all.
 private nonisolated final class PlaybackLoudnessMeasurement {
 
     private let lock = NSLock()
@@ -467,8 +409,7 @@ private nonisolated final class PlaybackLoudnessMeasurement {
         lock.unlock()
     }
 
-    /// Called before a segment is played, so what the last one measured cannot be read as this
-    /// one's opening.
+    /// Called before a segment is played, so the last one's reading cannot be read as this one's.
     func reset() {
         lock.lock()
         mostRecentRootMeanSquare = 0
@@ -478,15 +419,12 @@ private nonisolated final class PlaybackLoudnessMeasurement {
 
 // MARK: - One segment, from its text to its audio
 
-/// A single speech segment: its audio as it is produced, and the word positions inside it once it
-/// is finished.
+/// A single speech segment: its audio as it is produced, and the word positions inside it once it is
+/// finished — a mark records the frames already produced when the word was reported, which is where
+/// that word starts in the finished audio.
 ///
-/// `nonisolated` on purpose. `write(_:toBufferCallback:)` answers with one buffer per few tens of
-/// milliseconds of speech, so a hop to the main actor per buffer would put hundreds of hops on the
-/// thread drawing the overlay's waveform.
-///
-/// A word mark records the frames already produced when the word was reported, which is that word's
-/// position in the finished audio.
+/// `nonisolated` on purpose: `write(_:toBufferCallback:)` answers one buffer per few tens of
+/// milliseconds, and a main-actor hop per buffer would land on the thread drawing the overlay.
 private nonisolated final class PreparedSpeechSegment {
 
     struct SynthesizedAudio {
@@ -521,7 +459,6 @@ private nonisolated final class PreparedSpeechSegment {
         return didFinishSynthesis
     }
 
-    /// Everything playback needs, or nil while the synthesis is still running.
     var synthesizedAudio: SynthesizedAudio? {
         lock.lock()
         defer { lock.unlock() }
@@ -534,10 +471,8 @@ private nonisolated final class PreparedSpeechSegment {
         )
     }
 
-    /// Records a produced buffer, and reports the first one's format out loud.
-    ///
-    /// The frame count is advanced here rather than at the word mark, so a word reported after
-    /// this buffer carries the position the buffer ended at — which is where that word begins.
+    /// The frame count is advanced here, so a word mark arrives carrying the position this buffer
+    /// ended at — which is where that word begins.
     func appendAudioBuffer(_ audioBuffer: AVAudioPCMBuffer) {
         lock.lock()
         accumulatedAudioBuffers.append(audioBuffer)
@@ -568,12 +503,9 @@ private nonisolated final class PreparedSpeechSegment {
 
 /// Owns the `AVSpeechSynthesizer` and runs it, one segment at a time.
 ///
-/// A type of its own because of where the work lands: the synthesizer's callbacks arrive on a queue
-/// of its own, off the main actor, and the state they touch has to be off it with them.
-/// `nonisolated` puts the whole class outside the default main-actor isolation.
-///
-/// The queue below enforces serialisation rather than the caller, because a second segment arriving
-/// while the first is still synthesising is the ordinary case for a reply of more than one segment.
+/// A type of its own because its callbacks arrive on a queue of its own, off the main actor, and the
+/// state they touch has to go with them — `nonisolated` puts the class outside the default isolation.
+/// The queue below serialises rather than the caller, since a second segment mid-synthesis is ordinary.
 private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynthesizerDelegate {
 
     private let speechSynthesizer = AVSpeechSynthesizer()
@@ -582,8 +514,8 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
     /// The voice every segment is spoken with. Set once, before the first segment.
     var voice: AVSpeechSynthesisVoice?
 
-    /// Reports the format of the first buffer of the first segment — the playback engine has
-    /// nothing to connect with until the voice's own audio exists.
+    /// Reports the first buffer's format — the playback engine has nothing to connect with until the
+    /// voice's own audio exists.
     var onFirstAudioBufferProduced: ((AVAudioFormat) -> Void)?
 
     private var currentGeneration = 0
@@ -593,9 +525,8 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
     /// Drained in the order they were handed over, which is the order they are spoken in.
     private var queuedSegmentsWaitingForSynthesis: [PreparedSpeechSegment] = []
 
-    /// True between a `write()` being started and its zero-length closing buffer arriving. That
-    /// buffer is the only signal there is that the synthesizer has finished with the previous
-    /// segment, and it is what starts the next queued one.
+    /// True between a `write()` being started and its zero-length closing buffer arriving — the only
+    /// signal that the synthesizer has finished, and what starts the next queued segment.
     private var isSynthesisInFlight = false
 
     override init() {
@@ -606,11 +537,9 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
     /// Queues one segment for synthesis and returns immediately. The returned segment is filled in as
     /// the audio is produced; the caller polls `isSynthesisComplete` rather than being called back.
     ///
-    /// A segment handed over while another is still being synthesised waits in the queue rather than
-    /// starting a second `write()`, and that is the whole reason the queue exists. A second `write()`
-    /// disowns every callback the first one was still owed, the zero-length closing buffer included —
-    /// and a segment that never reports itself complete is one `speakPreparedSegment` waits on with no
-    /// deadline at all.
+    /// A segment handed over mid-synthesis waits in the queue, and that is the whole reason the queue
+    /// exists: a second `write()` disowns the first one's callbacks, the zero-length closing buffer
+    /// included, and a segment that never reports complete is one `speakPreparedSegment` waits on forever.
     func beginSynthesizing(spokenText: String, segmentIndex: Int) -> PreparedSpeechSegment {
         let segment = PreparedSpeechSegment(
             segmentIndex: segmentIndex,
@@ -631,9 +560,8 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
 
     /// Starts the oldest queued segment's `write()`, unless one is already running.
     ///
-    /// The generation is bumped when a `write()` begins rather than when a segment is handed over,
-    /// so it counts `write()` calls: a segment that is only queued has no callbacks to disown yet,
-    /// and bumping for it would orphan the segment already being synthesised.
+    /// The generation is bumped when a `write()` begins, not when a segment is queued, so it counts
+    /// `write()` calls: bumping for a merely queued segment would orphan the one being synthesised.
     private func startNextQueuedSynthesisIfSynthesizerIsFree() {
         lock.lock()
         guard !isSynthesisInFlight, !queuedSegmentsWaitingForSynthesis.isEmpty else {
@@ -661,8 +589,8 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
             self.lock.unlock()
             guard isStillTheCurrentGeneration else { return }
 
-            // Synthesis is finished by a buffer of length zero rather than by a callback of its
-            // own, and that same buffer is what frees the synthesizer for the next segment.
+            // Synthesis is finished by a buffer of length zero, not a callback of its own — and that
+            // same buffer frees the synthesizer for the next segment.
             guard pcmBuffer.frameLength > 0 else {
                 segment.markSynthesisComplete()
                 self.finishSynthesisInFlight()
@@ -672,7 +600,6 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
         }
     }
 
-    /// Marks the synthesizer free and hands it whatever has been queued since.
     private func finishSynthesisInFlight() {
         lock.lock()
         isSynthesisInFlight = false
@@ -681,17 +608,15 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
         startNextQueuedSynthesisIfSynthesizerIsFree()
     }
 
-    /// Abandons the synthesis in flight and makes its late callbacks land nowhere.
-    ///
-    /// Stopping the synthesizer does not promise that it will stop delivering, so the generation bump
-    /// is what disowns the callbacks already on their way.
+    /// Abandons the synthesis in flight and makes its late callbacks land nowhere: stopping the
+    /// synthesizer does not promise it will stop delivering, so the generation bump disowns the
+    /// callbacks already on their way.
     func cancelSynthesisInFlight() {
         lock.lock()
         currentGeneration += 1
         activeSynthesis = nil
-        // A stopped `write()` never delivers the closing buffer that would otherwise have cleared
-        // this, so leaving it set would make every later segment queue behind a synthesis that no
-        // longer exists.
+        // A stopped `write()` never delivers the closing buffer that would have cleared this, so
+        // leaving it set would make every later segment queue behind a synthesis that is gone.
         queuedSegmentsWaitingForSynthesis = []
         isSynthesisInFlight = false
         lock.unlock()
@@ -709,9 +634,8 @@ private nonisolated final class SpeechSegmentSynthesizer: NSObject, AVSpeechSynt
         let active = activeSynthesis
         lock.unlock()
 
-        // The utterance is the identity that matters here, not the generation: the synthesizer hands
-        // the utterance back with every callback, so a late word from a replaced segment cannot be
-        // mistaken for this one's.
+        // The utterance is the identity here, not the generation: a late word from a replaced segment
+        // cannot be mistaken for this one's.
         guard let active, active.utterance === utterance else { return }
         active.segment.appendWordMark(characterRange: characterRange)
     }

@@ -8,11 +8,11 @@
 //  Why this exists: `ElementClicker` posts its events at `.cghidEventTap`, and
 //  both the file's own doc comment and `AGENTS.md` claim that leaves the pointer
 //  alone ("the click lands where the event says, not where the mouse is
-//  standing"). A user reported the pointer being dragged along by the click, and
-//  that claim is what is under test here. `CGEventCreateMouseEvent`'s
-//  `mouseCursorPosition` argument IS the cursor position — that is the same field
-//  the system reads to say where the mouse is — so an event injected at the HID
-//  layer plausibly relocates the pointer, and the only way to know is to watch it.
+//  standing"). A user reported the pointer being dragged along by the click, so
+//  that claim is under test. `CGEventCreateMouseEvent`'s `mouseCursorPosition`
+//  argument IS the cursor position — the same field the system reads to say where
+//  the mouse is — so an event injected at the HID layer plausibly relocates the
+//  pointer, and the only way to know is to watch it.
 //
 //  How it measures: it puts a target window of its own at a known rectangle,
 //  parks the cursor far away from it, and then, for each injection method, posts
@@ -51,13 +51,9 @@ import ApplicationServices
 // MARK: - Coordinate conversion
 
 /// The screen the click is aimed at, and the one number the two coordinate
-/// spaces differ by.
-///
-/// `CGEvent`'s `mouseCursorPosition`, `CGWarpMouseCursorPosition` and the
-/// Accessibility API all use one space: origin at the **top-left** corner of the
-/// primary display, y increasing downward. AppKit uses the bottom-left corner of
-/// that same display with y increasing upward. Only the primary display's height
-/// separates them, which is what this carries.
+/// spaces differ by: `CGEvent`'s `mouseCursorPosition` and the Accessibility API
+/// measure from the primary display's top-left with y down, AppKit from that
+/// display's bottom-left with y up, and only its height separates the two.
 struct ScreenSpace {
     let primaryScreenHeightInPoints: CGFloat
 
@@ -105,9 +101,8 @@ final class ClickRecordingView: NSView {
     }
 
     /// The window is borderless, and a borderless window refuses key status by
-    /// default — which is fine for receiving mouse events but would make the
-    /// window unclickable in the one sense that matters here: nothing would be
-    /// delivered. Allowing it costs nothing and removes the doubt.
+    /// default. Allowing it costs nothing and removes the doubt about whether a
+    /// click could be delivered to it at all.
     final class KeyableWindow: NSWindow {
         override var canBecomeKey: Bool { true }
     }
@@ -120,7 +115,7 @@ final class ClickRecordingView: NSView {
 ///
 /// The samples are the only evidence about the pointer, so nothing here may
 /// itself move it: `CGEvent(source: nil)` is a null event, and its `location`
-/// field is a *read* of where the cursor is standing.
+/// field is a read of where the cursor is standing.
 final class CursorPositionSampler {
     struct Sample {
         let secondsSinceSamplingBegan: TimeInterval
@@ -167,9 +162,8 @@ enum ClickInjectionMethod: String, CaseIterable {
     case sessionEventTap = "cgSessionEventTap"
     case annotatedSessionEventTap = "cgAnnotatedSessionEventTap"
     case postedToOwningProcess = "CGEventPostToPid"
-    /// ASCII only, because the summary pads this to a column and a Chinese
-    /// character is two columns wide in a terminal — the name is what the row is
-    /// found by, so it has to be the part that lines up.
+    /// ASCII only: the summary pads this to a column, a Chinese character is two
+    /// columns wide in a terminal, and the row is looked up by this name.
     case hidEventTapThenWarpBack = "cghidEventTap+warpBack"
 
     var explanation: String {
@@ -205,10 +199,10 @@ struct TrialOutcome {
     let maximumCursorDisplacementInPoints: CGFloat
     let secondsSpentDisplaced: TimeInterval
     /// Whether the pointer was still away from its parked position on the last
-    /// sample. This is what separates "jumped there and came back" from "jumped
-    /// there and stayed", and the sampling window alone cannot tell them apart:
-    /// a pointer that returns after 390 of 400 sampled milliseconds spends
-    /// almost the whole window displaced either way.
+    /// sample. This separates "jumped there and came back" from "jumped there and
+    /// stayed", which the sampling window alone cannot: a pointer that returns
+    /// after 390 of 400 sampled milliseconds spends almost the whole window
+    /// displaced either way.
     let wasStillDisplacedAtTheEndOfSampling: Bool
     let receivedClickCount: Int
     /// The click as the target saw it, in the Accessibility space, when it
@@ -316,10 +310,9 @@ final class ClickInjectionCheck {
     ///
     /// The window has only just been ordered in, and the click that brings an
     /// inactive app forward is consumed by the activation rather than delivered
-    /// to the view — so the first trial of a run is answering a different
-    /// question from every other one. The first run of this script recorded that
-    /// trial and it read as the shipping method failing to deliver, which it is
-    /// not.
+    /// to the view, so the first trial of a run answers a different question from
+    /// every other one — recorded, it reads as the shipping method failing to
+    /// deliver, which it is not.
     private func warmUpTheWindow() async {
         CGWarpMouseCursorPosition(cursorHomePointInAccessibilitySpace)
         try? await Task.sleep(nanoseconds: UInt64(Self.cursorSettlingSeconds * 1_000_000_000))
@@ -361,9 +354,8 @@ final class ClickInjectionCheck {
                 ))
             }
             // The double click is one extra trial per method rather than a
-            // repetition of the same question: what it asks is whether the two
-            // pairs still arrive as a double click, which is a property of the
-            // method and not something a repetition would sharpen.
+            // repetition: what it asks is whether the two pairs still arrive as a
+            // double click, which is a property of the method.
             let doubleClickOutcome = await runOneTrial(method: method, isDoubleClick: true)
             outcomes.append(doubleClickOutcome)
             print(String(
@@ -512,9 +504,8 @@ final class ClickInjectionCheck {
                 // An event posted straight into a process's queue was never
                 // routed by the window server, so it arrives carrying no window
                 // and AppKit has nothing to dispatch it to — which would read as
-                // "this method does not deliver" when what actually happened is
-                // that the test never said where to deliver it. These two fields
-                // are that statement.
+                // "this method does not deliver" rather than as a test that never
+                // said where to deliver. These two fields are that statement.
                 event.setIntegerValueField(
                     .mouseEventWindowUnderMousePointer,
                     value: Int64(targetWindow.windowNumber)
@@ -532,7 +523,7 @@ final class ClickInjectionCheck {
     /// The probe only ever presses the left button, but the parameter is carried because the event
     /// type and the button have to be chosen together: a `.leftMouseDown` carrying `.right`, or the
     /// reverse, is delivered to the other button's handler, so it presses the wrong button while
-    /// looking from here exactly like a click that was posted correctly.
+    /// looking from here like a click that was posted correctly.
     private func mouseEvents(
         forOneClickWithClickState clickState: Int64,
         using button: CGMouseButton,
@@ -613,9 +604,7 @@ final class ClickInjectionCheck {
 
     /// Reports how many trials did a thing rather than whether all of them did.
     /// An `allSatisfy` over five noisy trials is a verdict one outlier can
-    /// reverse, and it reverses it into the opposite of the truth — which is
-    /// exactly what the first run of this script did to the method that is
-    /// currently shipping.
+    /// reverse, and it reverses it into the opposite of the truth.
     private func printConclusion(_ outcomes: [TrialOutcome]) {
         print("\n════════ 判读 ════════")
 

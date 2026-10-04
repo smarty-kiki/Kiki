@@ -153,38 +153,23 @@ stdout 上是 Kiki 拒绝的那句话（「「删除」这种字眼的东西 Kik
 -b 带小数（比如 0.5）也一样，screenshot 和 locate 同理。
 """
 
-/// How long to wait for the app to answer the first time, which on a cold launch includes
-/// LaunchServices starting it, its own startup, and the TLS warmup handshake it does eagerly.
+/// How long to wait for the app's first answer: a cold launch through LaunchServices, plus its eager TLS warmup.
 private let applicationStartupTimeoutSeconds: Double = 15
 
-/// How long to wait between messages once a command is running. Generous, because the first
-/// message arrives only after every screen has been captured and recognised.
+/// How long to wait between messages once running; the first arrives after every screen has been captured and recognised.
 private let replyEventTimeoutSeconds: Double = 120
 
 // MARK: - Output
 
-/// The reply so far, as last printed. Kept as the text itself rather than a length so that a
-/// snapshot whose tail moved can be detected instead of printed as a suffix of the wrong string.
+/// The reply so far, as last printed — the text itself, not a length, so a snapshot whose tail moved is caught.
 private var alreadyPrintedReplyText = ""
 
-/// Something this tool is saying on its own behalf — a flag misspelled, no app found, a connection
-/// that dropped, a wait that ran out. Never anything Kiki said; that goes to stdout.
+/// A sentence this tool is saying on its own behalf — never anything Kiki said, which goes to stdout.
 private func reportProgress(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
 
-/// A sentence the app sent, printed where a pipe can read it.
-///
-/// The gestures produce no reply, so their stdout is free to carry what Kiki says about the action
-/// — 「已点击「确定」（第 1 个）。」 is the whole product of the command, and a script that wants to
-/// know where the press landed has nowhere else to read it. The two kinds of sentence are told
-/// apart by where they come from rather than by what they are: **only `event.message` may be passed
-/// here**, which is why every call site is an `if let` and none of them has a fallback string. A
-/// sentence written here would be this tool's, and every one of those goes to stderr.
-///
-/// Three subcommands have a stdout this cannot go to — `command`'s carries the reply, `screenshot`'s
-/// the JPEG and `locate`'s the coordinates — so their sentences go to stderr instead, which
-/// `printKikisSentence` is where it is decided.
+/// A sentence the app sent, printed where a pipe can read it — only `event.message` may be passed here.
 private func printWhatKikiSaid(_ message: String) {
     print(message)
     fflush(stdout)
@@ -198,8 +183,7 @@ private func printNewText(inReplyText replyTextSoFar: String) {
             fflush(stdout)
         }
     } else {
-        // The tidy pass moved the tail rather than extending it, so a suffix of the new snapshot
-        // is not the part that has not been seen. Start it on its own line instead of splicing.
+        // The tidy pass moved the tail rather than extending it, so no suffix of the new snapshot is the unseen part.
         print()
         print(replyTextSoFar, terminator: "")
         fflush(stdout)
@@ -209,17 +193,11 @@ private func printNewText(inReplyText replyTextSoFar: String) {
 
 // MARK: - Finding and starting the app
 
-/// The `Kiki.app` this tool belongs to.
 private func locateKikiApplication() -> URL? {
-    // Resolving symlinks first is required — being symlinked into `/usr/local/bin` is the normal
-    // way this binary is put on `PATH`, and `argv[0]` is then the symlink's own directory.
+    // Resolve symlinks first: the normal install is a symlink into `/usr/local/bin`.
     let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
 
-    // A copy embedded in the app — `Kiki.app/Contents/Resources/kiki` — belongs to the bundle that
-    // holds it. That is the copy a release ships, and taking it first is what keeps an installed
-    // tool from starting some other Kiki that LaunchServices happens to know about. The walk goes
-    // up through every ancestor rather than a fixed number of levels, so the tool can be moved
-    // inside the bundle without this quietly falling through to the LaunchServices guess below.
+    // A copy embedded in the app belongs to its bundle, found by walking every ancestor; an installed tool never starts another Kiki.
     var ancestorDirectoryURL = executableURL.deletingLastPathComponent()
     while ancestorDirectoryURL.pathComponents.count > 1 {
         if ancestorDirectoryURL.pathExtension == "app",
@@ -229,7 +207,7 @@ private func locateKikiApplication() -> URL? {
         ancestorDirectoryURL = ancestorDirectoryURL.deletingLastPathComponent()
     }
 
-    // Sibling of this executable: both products are built into the same `Build/Products/<config>/`.
+    // Sibling of this executable: both products land in the same `Build/Products/<config>/`.
     let siblingApplicationURL = executableURL
         .deletingLastPathComponent()
         .appendingPathComponent("Kiki.app")
@@ -237,17 +215,12 @@ private func locateKikiApplication() -> URL? {
         return siblingApplicationURL
     }
 
-    // Falls back to wherever LaunchServices knows the bundle from, for a Kiki.app that was copied
-    // somewhere else after being built.
+    // For a Kiki.app that was copied somewhere else after being built, wherever LaunchServices knows it.
     return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.smarty.kiki")
 }
 
-/// Starts the app through LaunchServices.
-///
-/// Through `open`, and never by running the executable: a process started from a terminal is
-/// judged for permissions against the terminal, so TCC would report every grant as missing.
-/// Without `-n`, an app that is already running is activated rather than started a second time —
-/// which matters, because a second copy would be a second menu bar icon.
+/// Through `open`, never by running the executable — a process started from a terminal is judged for
+/// permissions against the terminal — and without `-n`, so an already-running app is activated, not duplicated.
 @discardableResult
 private func startKikiApplication(at applicationURL: URL) -> Bool {
     let process = Process()
@@ -302,18 +275,13 @@ private func usageAndExit() -> Never {
     exit(ExitCode.success.rawValue)
 }
 
-/// Reports a problem found before anything was asked of Kiki, and ends the process.
-///
-/// Fatal rather than returned, because every call site is a diagnosis made before the request goes
-/// out: there is no answer in flight to collect and nothing to unwind. The outcomes decided *by*
-/// the conversation are returned instead, so what a subcommand can exit with is in its signature.
+/// Reports a problem found before anything was asked of Kiki, and ends the process: nothing is in flight.
 private func fail(_ message: String, code: ExitCode) -> Never {
     reportProgress(message)
     exit(code.rawValue)
 }
 
-/// A command that could not be understood. The usage goes to the same stream as the complaint,
-/// because a mistake in the arguments is exactly when the arguments are worth reading again.
+/// A command that could not be understood; the usage goes to the same stream.
 private func failWithUsage(_ message: String) -> Never {
     reportProgress(message)
     reportProgress(usageText)
@@ -322,13 +290,9 @@ private func failWithUsage(_ message: String) -> Never {
 
 // MARK: - kiki command
 
-/// Hands a request to the app and streams the reply back.
-///
-/// Returns its exit code rather than ending the process with it: the entry point is the one place
-/// the process ends, so what this command can exit with is the set of values it returns.
+/// Hands a request to the app and streams the reply back, returning its exit code.
 private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
-    // Only the arguments *before* the request are read as flags, so a request that happens to
-    // contain `--speak` is sent to Kiki as written rather than swallowed here.
+    // Only the arguments *before* the request are read as flags; a request containing `--speak` is sent as written.
     var remainingArguments = arguments
     var shouldSpeakReply = false
     while let leadingArgument = remainingArguments.first, leadingArgument.hasPrefix("-") {
@@ -346,9 +310,7 @@ private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
         return .cannotRunCommand
     }
 
-    // Ctrl-C stops the turn rather than only stopping the watching: leaving Kiki reading a reply out
-    // loud after the terminal has walked away is worse than not being able to interrupt at all.
-    // On its own queue because the main thread is blocked reading the socket.
+    // Ctrl-C stops the turn too, on its own queue: the main thread is blocked on the socket.
     let controlCSignalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
     controlCSignalSource.setEventHandler {
         client.send(.cancel)
@@ -358,8 +320,7 @@ private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
     controlCSignalSource.resume()
     signal(SIGINT, SIG_IGN)
 
-    // The app announces itself before anything is asked of it, so this is where "Kiki is reachable
-    // but cannot do this" is answered — before the command is sent, not after it fails.
+    // The app announces itself before anything is asked of it, so "cannot do this" is answered here.
     guard case .event(let readinessEvent) = client.readNextEvent(timeoutSeconds: applicationStartupTimeoutSeconds),
           readinessEvent.type == KikiCommandProtocol.MessageType.ready else {
         fail("Kiki 没有应答。它可能正在关闭，或者是不认识这条命令通道的旧构建。", code: .cannotRunCommand)
@@ -380,10 +341,8 @@ private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
         let readOutcome = client.readNextEvent(timeoutSeconds: replyEventTimeoutSeconds)
         guard case .event(let event) = readOutcome else {
             if case .disconnected = readOutcome {
-                // Not "Kiki 退出了": a disconnect with no `superseded` before it is usually the app
-                // going away, but it is also what the app does to a terminal that has stopped
-                // reading — it hangs up on a short write. That the connection ended is the whole of
-                // what this end can see.
+                // Not "Kiki 退出了": a disconnect without a `superseded` before it is usually the app
+                // going away — though a terminal that stopped reading is hung up on the same way.
                 reportProgress("和 Kiki 的连接断了，这一轮没能跑完。")
                 return .failed
             }
@@ -393,8 +352,7 @@ private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
 
         switch event.type {
         case KikiCommandProtocol.MessageType.accepted:
-            // Kiki's own sentence, but on this path even that goes to stderr: stdout here is the
-            // reply, and the reply is still arriving.
+            // Kiki's own sentence, but here even that goes to stderr: stdout is the reply.
             if let message = event.message {
                 reportProgress(message)
             }
@@ -416,14 +374,12 @@ private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
             return .failed
 
         case KikiCommandProtocol.MessageType.superseded:
-            // Sent just before the app closes this connection to hand the turn to a newer one. The
-            // hang-up that follows is not an error to report — it is the whole point of the message.
+            // Sent just before the app closes this connection to hand the turn to a newer one; the hang-up is the point.
             reportProgress("另一个终端发了新需求，这一轮被它接过去了。")
             return .failed
 
         default:
-            // `ready` can arrive twice when two connections overlap, and a newer app may send types
-            // this build has never heard of. Neither is a reason to stop reading the reply.
+            // `ready` can arrive twice, and a newer app may send types this build has never heard of; neither stops the read.
             continue
         }
     }
@@ -431,14 +387,9 @@ private func runCommandSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
 
 // MARK: - kiki click
 
-/// Turns the flags into what the app is asked for. Every way of getting them wrong is answered
-/// here, so the app is only ever asked something that could be done.
+/// Turns the flags into what the app is asked for; every way of getting them wrong is answered here.
 ///
-/// Which flags are recognized follows from the gesture rather than from a parameter beside it: the
-/// gesture already names the subcommand, and a second answer to that would be able to disagree with
-/// the first. It is a whitelist rather than a set of flags to ignore because `-b` on a press, or
-/// `--to-x` on a scroll, is a mistake in the arguments — a `kiki click -b 3` that quietly pressed
-/// once would be answering a question nobody asked.
+/// Which flags are recognized follows from the gesture: `-b` on a press is a mistake, not a flag quietly dropped.
 private func clickRequestFromArguments(
     _ arguments: ArraySlice<String>,
     gesture: String?
@@ -460,11 +411,7 @@ private func clickRequestFromArguments(
     }
 
     var valueByFlag: [String: String] = [:]
-    // The words to type or the combination to press, which is the one argument here that is neither
-    // a flag nor a flag's value. Read by position — a bare argument, wherever it stands — because it
-    // is arbitrary text and no spelling of it could be told from a value. Only the keyboard gestures
-    // look for it; for the rest a bare argument falls through and is refused as the unknown flag it
-    // has always been.
+    // The words to type or the combination to press — the one argument that is neither a flag nor a flag's value.
     var payloadArgument: String?
     var remainingArguments = arguments
     while let flag = remainingArguments.first {
@@ -489,15 +436,11 @@ private func clickRequestFromArguments(
         valueByFlag[flag] = value
     }
 
-    // Required rather than optional: a `kiki type` with nothing to type is a mistake in the
-    // arguments, and the app answers a keyboard gesture with no payload as a gesture it does not
-    // know — which reads as a version problem rather than as the typo it is.
+    // Required: a keyboard gesture with no payload is answered by the app as a gesture it does not know,
+    // which reads as a version problem.
     //
-    // What is deliberately *not* asked here is whether the words are longer than Kiki will type, or
-    // whether the combination is one it can spell or is willing to press: the limit and the table of
-    // combinations it will not press both live in `ElementKeyboard`, and a copy of either in this
-    // tool would be a second answer to a question the app already answers. Those come back as a
-    // refusal — exit 2 and a sentence — which is no worse for being decided on the other end.
+    // Whether the words are longer than Kiki will type, or the combination one it will not press, is not
+    // asked here: both live in `ElementKeyboard`, and a copy would be a second answer. Refused with exit 2.
     var typedText: String?
     var keyCombination: String?
     if isAKeyboardGesture {
@@ -533,8 +476,7 @@ private func clickRequestFromArguments(
         screenfuls = parsedScreenfuls
     }
 
-    // A drag is refused without one, so this is asked of the arguments here rather than left to the
-    // app: a request that names no destination is a mistake this end can describe better.
+    // A drag is refused without one, so a request naming no destination is a mistake this end describes.
     var dragDestinationGlobalScreenX: Double?
     var dragDestinationGlobalScreenY: Double?
     if isADraggingGesture {
@@ -599,15 +541,12 @@ private func clickRequestFromArguments(
     )
 }
 
-/// The name of the gesture the running app does not know, or nil when it knows the one this
-/// terminal is about to ask for.
+/// The name of the gesture the running app does not know, or nil when it knows the one this terminal is
+/// about to ask for.
 ///
-/// An app that does not know a gesture does not necessarily refuse it. The three clicks the
-/// `gesture` field was born with are answered correctly by every app that has the field at all,
-/// however old; a gesture added afterwards is answered by an app that predates it as whatever its
-/// own fallback says, and those fallbacks have not always been refusals. So each gesture added
-/// after the field is announced in `ready` and asked about here, and the answer for a build that
-/// does not announce it is "no" — which is what an absent field is saying.
+/// An app that does not know a gesture does not necessarily refuse it — the three clicks are answered by
+/// any app that has the `gesture` field — so each gesture added afterwards is announced in `ready` and
+/// asked about here; an absent field answers "no".
 private func gestureTheRunningKikiDoesNotKnow(
     _ gesture: String?,
     in readinessEvent: KikiCommandEvent
@@ -626,33 +565,25 @@ private func gestureTheRunningKikiDoesNotKnow(
          KikiCommandProtocol.Gesture.scrollRight:
         return readinessEvent.understandsScrolling == true ? nil : "滚动"
     case KikiCommandProtocol.Gesture.drag:
-        // The one gesture whose being unknown is not merely a different action: an app that predates
-        // it decodes the destination fields and ignores them, so the drag would arrive as a press at
-        // the starting point — and a press on a file selects it, on a folder opens it.
+        // The one whose being unknown is not merely a different action: a pre-drag app ignores the destination fields and presses at the start.
         return readinessEvent.understandsDragging == true ? nil : "拖拽"
     case KikiCommandProtocol.Gesture.typeText:
-        // Unknown here is a press too, of a kind nobody asked for: the payload field is ignored and
-        // what is left is a click at the point — which puts the insertion point somewhere and types
-        // nothing, so the user is left believing the words went in.
+        // Unknown here is a press too: the payload is ignored, so the insertion point moves and nothing is typed.
         return readinessEvent.understandsTyping == true ? nil : "输入文字"
     case KikiCommandProtocol.Gesture.pressKey:
-        // And here, unknown is a click, which is worse than for typing: the click moves the insertion
-        // point, so a ⌘S aimed at a document lands on whatever the press selected instead.
+        // And here unknown is a click: the insertion point moves, so a ⌘S lands on whatever that press selected.
         return readinessEvent.understandsPressingKeys == true ? nil : "按组合键"
     default:
-        // A gesture this build of the tool does not know either, which the switch at the bottom of
-        // this file cannot produce. Refusing is the only safe reading of a gesture nobody knows.
+        // A gesture this build of the tool does not know either; refusing is the only safe reading of one nobody knows.
         return "这个手势"
     }
 }
 
 /// The distance the running app would be unable to read, or nil when it can read this one.
 ///
-/// A separate question from `gestureTheRunningKikiDoesNotKnow`, because the fault is not the gesture
-/// and the sentence is not the same: an app that scrolls at all reads the distance as a whole number,
-/// and a fractional one makes the *whole request* undecodable — the app says nothing whatever, and
-/// this end sits out its timeout, which is indistinguishable from Kiki having gone away. Only a
-/// distance that is not whole is asked about, since such an app still reads `-b 3` correctly.
+/// A separate question from `gestureTheRunningKikiDoesNotKnow`: an app that scrolls at all reads the
+/// distance as a whole number, so a fractional one makes the *whole request* undecodable — silence, not a
+/// short scroll. Only a non-whole distance is asked about; `-b 3` such an app reads correctly.
 private func screenfulsTheRunningKikiCannotRead(
     _ clickRequest: KikiClickRequest,
     in readinessEvent: KikiCommandEvent
@@ -663,34 +594,27 @@ private func screenfulsTheRunningKikiCannotRead(
     return readinessEvent.understandsFractionalScreenfuls == true ? nil : screenfuls
 }
 
-/// Asks the app to act where this terminal says, with the gesture the subcommand that got here
-/// named, and reports what came of it. Everything else about the eleven is the same.
+/// Asks the app to act where this terminal says, with the gesture the subcommand named.
 private func runActionSubcommand(
     _ arguments: ArraySlice<String>,
     gesture: String?
 ) -> ExitCode {
     var clickRequest = clickRequestFromArguments(arguments, gesture: gesture)
-    // The subcommand is the gesture rather than a flag: they go through one parser and meet the same
-    // refusals, and the one thing that differs is what goes out at the point. Left nil for a plain
-    // `click`, which keeps its request byte for byte what it was before the others existed.
+    // The subcommand is the gesture rather than a flag: one parser, the same refusals, only the point differs.
     clickRequest.gesture = gesture
 
     guard let client = connectToKiki(applicationURL: locateKikiApplication()) else {
         return .cannotRunCommand
     }
 
-    // Control+C is deliberately not intercepted. One of these takes a moment and there is nothing
-    // to stop, while the thing `.cancel` stops is whichever turn is running — which, if the user is
-    // mid-sentence at the keyboard, is not this terminal's turn to end.
+    // Control+C is deliberately not intercepted: `.cancel` stops whichever turn is running, and a gesture displaces nothing.
 
     guard case .event(let readinessEvent) = client.readNextEvent(timeoutSeconds: applicationStartupTimeoutSeconds),
           readinessEvent.type == KikiCommandProtocol.MessageType.ready else {
         fail("Kiki 没有应答。它可能正在关闭，或者是不认识这条命令通道的旧构建。", code: .cannotRunCommand)
     }
 
-    // Asked here, before anything is sent, because the app on the other end is not necessarily the
-    // one this tool was built beside — rebuilding without restarting leaves an older Kiki listening,
-    // and that is the ordinary case rather than the rare one.
+    // Asked before anything is sent: rebuilding without restarting leaves an older Kiki listening.
     if let unknownGesture = gestureTheRunningKikiDoesNotKnow(
         clickRequest.gesture,
         in: readinessEvent
@@ -709,9 +633,8 @@ private func runActionSubcommand(
         )
     }
 
-    // `canRunCommands` is deliberately not consulted. It answers whether a *request* can be run,
-    // which needs an API key and screen recording; none of these actions needs either, and Kiki is
-    // the one that knows whether it can make one right now — it says so in its reply.
+    // `canRunCommands` is deliberately not consulted: it answers whether a *request* can be run, which no
+    // gesture needs. Whether one can be made right now is Kiki's to say in its reply.
 
     client.send(.click(clickRequest))
     return readTheOneAnswer(from: client, waitingFor: .theActionTheTerminalAskedFor)
@@ -719,11 +642,9 @@ private func runActionSubcommand(
 
 // MARK: - kiki screenshot and kiki locate
 
-/// Which request is being waited on, which is the whole of what differs between the thirteen
-/// subcommands that ask the app for one thing and stop waiting.
+/// Which request is being waited on; the whole of what differs between the thirteen subcommands.
 private enum TheAnswerBeingWaitedFor {
-    /// One of the eleven gestures. The app's sentence about the action is the whole product, so
-    /// stdout carries it.
+    /// One of the eleven gestures; the app's sentence about the action is the whole product.
     case theActionTheTerminalAskedFor
     /// `kiki screenshot`. The picture is the product and goes to stdout as bytes.
     case aPictureOfTheScreen
@@ -732,11 +653,7 @@ private enum TheAnswerBeingWaitedFor {
 }
 
 private extension TheAnswerBeingWaitedFor {
-    /// What a dropped connection means to whoever is waiting: one event read two ways, as a gesture
-    /// that did not happen or a picture that did not arrive.
-    ///
-    /// A disconnect is not proof that Kiki went away — it is also what the app does to a terminal
-    /// that has stopped reading — so it is reported as what this end can see and no more.
+    /// What a dropped connection means: the gesture did not happen, or the picture did not arrive.
     var connectionDroppedSentence: String {
         switch self {
         case .theActionTheTerminalAskedFor:
@@ -756,10 +673,7 @@ private extension TheAnswerBeingWaitedFor {
     }
 }
 
-/// Where the app's own sentence about the answer goes.
-///
-/// stdout for a gesture, where the sentence *is* the product; stderr for the two readers, whose
-/// stdout carries the picture or the points and cannot take a line of prose.
+/// stdout for a gesture; stderr for the two readers, whose stdout carries bytes.
 private func printKikisSentence(_ message: String, waitingFor answer: TheAnswerBeingWaitedFor) {
     switch answer {
     case .theActionTheTerminalAskedFor:
@@ -769,12 +683,7 @@ private func printKikisSentence(_ message: String, waitingFor answer: TheAnswerB
     }
 }
 
-/// Reads until the app answers the one thing that was asked of it, prints what it says, and reports
-/// how it went.
-///
-/// Shared because the thirteen differ in nothing else: what the answer is, and where the app's
-/// sentence about it goes. The wait is the same wait — generous, because a gesture asked for by text
-/// and either of the readers is seconds of screen capture and recognition before the first word.
+/// Reads until the app answers the one thing that was asked of it, prints what it says, and reports how it went.
 private func readTheOneAnswer(
     from client: KikiCommandSocketClient,
     waitingFor answer: TheAnswerBeingWaitedFor
@@ -792,17 +701,14 @@ private func readTheOneAnswer(
 
         switch event.type {
         case KikiCommandProtocol.MessageType.accepted:
-            // Said by the app once the request is going ahead and the screen is about to be read —
-            // the only slow part of any of these. Never promised from here: every refusal that is
-            // decidable without looking at the screen would otherwise be preceded by a claim that
-            // Kiki is looking at one.
+            // Said by the app once the request is going ahead and the screen is about to be read. Never
+            // promised from here, or a refusal decidable without looking would be preceded by a false claim.
             if let message = event.message {
                 printKikisSentence(message, waitingFor: answer)
             }
 
         case KikiCommandProtocol.MessageType.clicked:
-            // A landed action with nothing to say about itself is a success with an empty stdout,
-            // which the exit code already carries. No line is invented to fill the hole.
+            // A landed action with nothing to say is a success with an empty stdout, which the exit code carries.
             if let message = event.message {
                 printKikisSentence(message, waitingFor: answer)
             }
@@ -817,8 +723,7 @@ private func readTheOneAnswer(
                 reportProgress("Kiki 说图截到了，可是图片没能解开。")
                 return .failed
             }
-            // Written raw, because it is the product: a line of prose here would be a byte in the
-            // middle of a JPEG. Nothing else may go to stdout on this path.
+            // Raw, because it is the product: prose here would be a byte in the middle of a JPEG.
             FileHandle.standardOutput.write(jpegData)
             return .success
 
@@ -827,8 +732,7 @@ private func readTheOneAnswer(
                 printKikisSentence(message, waitingFor: answer)
             }
             for locatedPoint in event.locatedPoints ?? [] {
-                // Rounded rather than truncated: a coordinate that lands between two points is
-                // wanted at the nearer one, and the line is a thing a script reads as numbers.
+                // Rounded, not truncated: a coordinate between two points is wanted at the nearer one.
                 print("\(Int(locatedPoint.globalScreenX.rounded())) "
                     + "\(Int(locatedPoint.globalScreenY.rounded())) \(locatedPoint.screenNumber)")
             }
@@ -839,13 +743,10 @@ private func readTheOneAnswer(
             if let message = event.message {
                 printKikisSentence(message, waitingFor: answer)
             } else {
-                // A failure is never silent, and this one is the tool's to report: the app said
-                // nothing, so there is nothing of Kiki's to print.
+                // A failure is never silent, and this one is the tool's to report: the app said nothing of Kiki's.
                 reportProgress("Kiki 这一轮出错了。")
             }
-            // A refusal means nothing was attempted and nothing on the machine has changed; a
-            // failure means an event was meant to go out and did not. A script can act on those
-            // differently, so they are different exit codes.
+            // A refusal attempted nothing; a failure meant an event and it did not go out — a script acts on the difference: two codes.
             return event.isRefusal == true ? .cannotRunCommand : .failed
 
         case KikiCommandProtocol.MessageType.superseded:
@@ -858,11 +759,8 @@ private func readTheOneAnswer(
     }
 }
 
-/// Refuses a request the running app is too old to answer, and ends the process.
-///
-/// An app that does not know a request *type* ignores it in silence, so the whole wait would run out
-/// — which this end cannot tell from Kiki having gone away. That is why every request added after the
-/// socket existed is announced in `ready` and asked about before anything is sent.
+/// Refuses a request the running app is too old to answer, and ends the process: an app that does not know
+/// a request *type* ignores it in silence, so the wait runs out — which is what Kiki gone looks like.
 private func failBecauseTheRunningKikiDoesNotKnow(_ whatItDoesNotKnow: String) -> Never {
     fail(
         "正在运行的这个 Kiki 是旧版本，还不认识\(whatItDoesNotKnow)。把菜单栏里的 Kiki 退出再重新启动一次就能用。",
@@ -902,9 +800,7 @@ private func runScreenshotSubcommand(_ arguments: ArraySlice<String>) -> ExitCod
         failBecauseTheRunningKikiDoesNotKnow("截屏")
     }
 
-    // `canRunCommands` is deliberately not consulted here either. It answers whether a *request* can
-    // be run, which needs an API key and an idle Kiki; a picture needs neither, and Kiki is the one
-    // that knows whether it can take one — it says so in its reply.
+    // `canRunCommands` is deliberately not consulted here either: a picture needs no API key and no idle Kiki.
 
     client.send(.screenshot(KikiScreenshotRequest(screenNumber: screenNumber)))
     return readTheOneAnswer(from: client, waitingFor: .aPictureOfTheScreen)
@@ -918,8 +814,7 @@ private func runLocateSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
     while let argument = remainingArguments.first {
         remainingArguments = remainingArguments.dropFirst()
 
-        // The text is a bare argument rather than a flag's value, as `type` and `key` take theirs:
-        // it is arbitrary text, and no spelling of it could be told from a value for `-s`.
+        // A bare argument rather than a flag's value, as `type` and `key` take theirs: it is arbitrary text.
         if !argument.hasPrefix("-") {
             guard textToFind == nil else {
                 failWithUsage("只要一段文字：\(textToFind ?? "") 后面又多了一个 \(argument)。")
@@ -958,8 +853,7 @@ private func runLocateSubcommand(_ arguments: ArraySlice<String>) -> ExitCode {
         failBecauseTheRunningKikiDoesNotKnow("找文字")
     }
 
-    // Which occurrences are wanted is not a flag: every one of them is the answer, and an ordinal
-    // would be a second answer to a question the caller already has the whole of.
+    // Which occurrences are wanted is not a flag: every one of them is the answer.
 
     client.send(.locate(KikiLocateRequest(text: textToFind, screenNumber: screenNumber)))
     return readTheOneAnswer(from: client, waitingFor: .thePointsWhereTheTextIs)
@@ -971,8 +865,7 @@ let arguments = Array(CommandLine.arguments.dropFirst())
 
 guard let subcommand = arguments.first else { usageAndExit() }
 
-// The only place a subcommand's code becomes a process exit. Ctrl-C has a call of its own, inside
-// the signal handler, because that one does not run on this stack.
+// The only place a subcommand's code becomes a process exit; Ctrl-C has a call of its own.
 switch subcommand {
 case "command":
     exit(runCommandSubcommand(arguments.dropFirst()).rawValue)
@@ -1033,7 +926,6 @@ case "screenshot":
 case "locate":
     exit(runLocateSubcommand(arguments.dropFirst()).rawValue)
 default:
-    // Covers a subcommand that does not exist and, more usefully, one this tool is a version behind
-    // on: the usage names every subcommand this build has.
+    // Covers a subcommand that does not exist and, more usefully, one this tool is a version behind on.
     usageAndExit()
 }
