@@ -2,51 +2,53 @@
 //  DeepSeekAPIKeyStore.swift
 //  kiki-desktop-agent
 //
-//  Keychain-backed storage for the user's DeepSeek API key.
 
 import Foundation
 import Security
 
-/// Stores the DeepSeek API key the user types into the settings panel. It lives in the
-/// Keychain rather than in `UserDefaults`, an unencrypted plist in the user's home directory
-/// that any process running as this user — and any backup of it — can read. `@unchecked
-/// Sendable` because it crosses an isolation boundary, made safe by the lock around its only
-/// mutable state.
+/// Stores the key in `UserDefaults`, deliberately not the Keychain: macOS asks for the login
+/// password unless the reading build is the one the item's access control records, and this app is
+/// rebuilt constantly while the key is read on every request.
 final class DeepSeekAPIKeyStore: @unchecked Sendable {
-    /// Keychain items are addressed by a service/account pair; the bundle identifier keeps
-    /// this app's items namespaced away from every other app's entries.
-    private static let apiKeyKeychainService = Bundle.main.bundleIdentifier ?? "com.smarty.kiki"
-    private static let apiKeyKeychainAccount = "deepseek-api-key"
+    private static let apiKeyUserDefaultsKey = "deepSeekAPIKey"
 
-    /// The last value read from or written to the Keychain. Every request reads the key, so
-    /// caching it keeps the streaming path from paying a Keychain round trip on each turn.
+    private static let legacyKeychainMigrationWasTriedUserDefaultsKey = "hasTriedMigratingTheLegacyAPIKey"
+
+    /// The Keychain item the key lived in before.
+    private static let legacyAPIKeyKeychainService = Bundle.main.bundleIdentifier ?? "com.smarty.kiki"
+    private static let legacyAPIKeyKeychainAccount = "deepseek-api-key"
+
+    /// Cached because every request reads the key.
     private var cachedAPIKey: String?
 
-    /// Guards `cachedAPIKey`. The settings panel writes on the main actor while a request in
+    /// Guards `cachedAPIKey`: the settings panel writes on the main actor while a request in
     /// flight reads from a background task, and a torn read of a Swift `String` can crash.
     private let cachedAPIKeyLock = NSLock()
 
+    /// A recovered key means the key step the onboarding flag records is already done.
+    private(set) var didRecoverTheKeyFromTheLegacyKeychain = false
+
     init() {
         // Safe to assign directly: nothing else can reach this instance yet.
-        self.cachedAPIKey = Self.readAPIKeyFromKeychain()
+        if let storedAPIKey = Self.readAPIKeyFromUserDefaults() {
+            self.cachedAPIKey = storedAPIKey
+        } else if let recoveredAPIKey = Self.migrateAPIKeyOutOfTheKeychainIfOneIsThere() {
+            self.cachedAPIKey = recoveredAPIKey
+            self.didRecoverTheKeyFromTheLegacyKeychain = true
+        }
     }
 
-    /// The user's DeepSeek API key, or `nil` when they haven't entered one yet.
     var apiKey: String? {
         cachedAPIKeyLock.lock()
         defer { cachedAPIKeyLock.unlock() }
         return cachedAPIKey
     }
 
-    /// Whether a key has been saved. Drives the settings panel's status text.
     var hasAPIKey: Bool {
         apiKey != nil
     }
 
-    /// Saves `apiKey`, replacing any key stored previously. A `nil`, empty or whitespace-only
-    /// value clears the stored key instead, so emptying the field and saving reads as removal.
-    ///
-    /// - Returns: `true` when the Keychain reflects the requested change.
+    /// A `nil`, empty or whitespace-only value clears the stored key instead of saving one.
     @discardableResult
     func saveAPIKey(_ apiKey: String?) -> Bool {
         let trimmedAPIKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -55,29 +57,7 @@ final class DeepSeekAPIKeyStore: @unchecked Sendable {
             return clearAPIKey()
         }
 
-        guard let apiKeyData = trimmedAPIKey.data(using: .utf8) else {
-            return false
-        }
-
-        // `SecItemUpdate` only succeeds when a matching item already exists, so
-        // delete-then-add is the standard way to upsert. The delete matches on service and
-        // account only, so a second key overwrites the first rather than leaving a stale
-        // duplicate that would shadow this one.
-        Self.deleteAPIKeyFromKeychain()
-
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.apiKeyKeychainService,
-            kSecAttrAccount as String: Self.apiKeyKeychainAccount,
-            kSecValueData as String: apiKeyData,
-            // "After first unlock" is the least permissive accessibility that still lets a
-            // background request read the key — never readable at the login window.
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-        ]
-
-        guard SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess else {
-            return false
-        }
+        UserDefaults.standard.set(trimmedAPIKey, forKey: Self.apiKeyUserDefaultsKey)
 
         cachedAPIKeyLock.lock()
         cachedAPIKey = trimmedAPIKey
@@ -85,22 +65,38 @@ final class DeepSeekAPIKeyStore: @unchecked Sendable {
         return true
     }
 
-    /// Removes any stored key. Called when the user clears the settings field; returns `true`
-    /// when no key is left in the Keychain afterwards.
+    /// Removes any stored key, and drops the Keychain item an older build may have left.
     @discardableResult
     func clearAPIKey() -> Bool {
-        let didDeleteKeychainItem = Self.deleteAPIKeyFromKeychain()
+        UserDefaults.standard.removeObject(forKey: Self.apiKeyUserDefaultsKey)
+        Self.deleteTheLegacyAPIKeyFromTheKeychain()
+
         cachedAPIKeyLock.lock()
         cachedAPIKey = nil
         cachedAPIKeyLock.unlock()
-        return didDeleteKeychainItem
+        return true
     }
 
-    private static func readAPIKeyFromKeychain() -> String? {
+    private static func readAPIKeyFromUserDefaults() -> String? {
+        guard let storedAPIKey = UserDefaults.standard.string(forKey: apiKeyUserDefaultsKey),
+              !storedAPIKey.isEmpty else {
+            return nil
+        }
+        return storedAPIKey
+    }
+
+    /// Reads the key out of the legacy Keychain item and moves it into the settings store. This is
+    /// the one Keychain read left, so the one moment a login-password dialog can appear; a declined
+    /// dialog or a failed read is remembered as tried.
+    private static func migrateAPIKeyOutOfTheKeychainIfOneIsThere() -> String? {
+        guard !UserDefaults.standard.bool(forKey: legacyKeychainMigrationWasTriedUserDefaultsKey) else {
+            return nil
+        }
+
         let lookupQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: apiKeyKeychainService,
-            kSecAttrAccount as String: apiKeyKeychainAccount,
+            kSecAttrService as String: legacyAPIKeyKeychainService,
+            kSecAttrAccount as String: legacyAPIKeyKeychainAccount,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -108,29 +104,35 @@ final class DeepSeekAPIKeyStore: @unchecked Sendable {
         var keychainLookupResult: CFTypeRef?
         let lookupStatus = SecItemCopyMatching(lookupQuery as CFDictionary, &keychainLookupResult)
 
-        // `errSecItemNotFound` is the normal first-launch state rather than a failure, so it
-        // falls through to the same `nil`.
-        guard lookupStatus == errSecSuccess,
-              let apiKeyData = keychainLookupResult as? Data,
-              let storedAPIKey = String(data: apiKeyData, encoding: .utf8) else {
-            return nil
+        if lookupStatus == errSecSuccess,
+           let apiKeyData = keychainLookupResult as? Data,
+           let legacyAPIKey = String(data: apiKeyData, encoding: .utf8) {
+            UserDefaults.standard.set(legacyAPIKey, forKey: apiKeyUserDefaultsKey)
+            deleteTheLegacyAPIKeyFromTheKeychain()
+            print("DeepSeek key: moved out of the Keychain into the settings store")
+            return legacyAPIKey
         }
 
-        return storedAPIKey
+        // `errSecItemNotFound` is ordinary and costs nothing to look again; anything else is not
+        // worth asking about twice.
+        if lookupStatus != errSecItemNotFound {
+            print("DeepSeek key: the Keychain item was not handed over (status \(lookupStatus))")
+            UserDefaults.standard.set(true, forKey: legacyKeychainMigrationWasTriedUserDefaultsKey)
+        }
+        return nil
     }
 
-    /// The callers that don't branch on the result only care that the Keychain ends up empty.
     @discardableResult
-    private static func deleteAPIKeyFromKeychain() -> Bool {
+    private static func deleteTheLegacyAPIKeyFromTheKeychain() -> Bool {
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: apiKeyKeychainService,
-            kSecAttrAccount as String: apiKeyKeychainAccount
+            kSecAttrService as String: legacyAPIKeyKeychainService,
+            kSecAttrAccount as String: legacyAPIKeyKeychainAccount
         ]
 
         let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
 
-        // Deleting an item that was never there leaves the Keychain in the state asked for.
+        // An item that was never there is the state asked for.
         return deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound
     }
 }
