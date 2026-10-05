@@ -102,7 +102,6 @@ final class CompanionResponseOverlayManager {
     }
 
     private func startCursorTracking() {
-        // 60fps cursor tracking so the panel stays glued to the mouse
         cursorTrackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.repositionPanelNearCursor()
@@ -125,7 +124,6 @@ final class CompanionResponseOverlayManager {
         var panelOriginX = mouseLocation.x + cursorOffsetX
         var panelOriginY = mouseLocation.y - cursorOffsetY - panelSize.height
 
-        // Clamped to the visible frame of the screen the cursor is on.
         if let currentScreen = screenContainingPoint(mouseLocation) {
             let visibleFrame = currentScreen.visibleFrame
 

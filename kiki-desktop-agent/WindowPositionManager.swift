@@ -22,21 +22,19 @@ class WindowPositionManager {
     private static var hasAttemptedScreenRecordingSystemPromptDuringCurrentLaunch = false
     private static let hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey = "com.learningbuddy.hasPreviouslyConfirmedScreenRecordingPermission"
 
-    /// True when more than one display is connected. Uses AppKit's screen list, which needs
-    /// no ScreenCaptureKit shareable-content permission prompt.
+    /// Uses AppKit's screen list, which needs no ScreenCaptureKit permission prompt.
     static func currentMacHasMultipleDisplays() -> Bool {
         NSScreen.screens.count > 1
     }
 
     // MARK: - Accessibility Permission
 
-    /// Returns true if the app has Accessibility permission.
     static func hasAccessibilityPermission() -> Bool {
         AXIsProcessTrusted()
     }
 
-    /// Presents exactly one permission path per tap: the system prompt on the first attempt,
-    /// then System Settings on later ones, after macOS has already shown its one-time alert.
+    /// One path per tap: the system prompt on the first attempt, then System Settings — macOS
+    /// shows its one-time alert only once.
     @discardableResult
     static func requestAccessibilityPermission() -> PermissionRequestPresentationDestination {
         let presentationDestination = permissionRequestPresentationDestination(
@@ -58,14 +56,12 @@ class WindowPositionManager {
         return presentationDestination
     }
 
-    /// Opens System Settings to the Accessibility pane.
     static func openAccessibilitySettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
         NSWorkspace.shared.open(url)
     }
 
-    /// Reveals the running app bundle in Finder, so it can be dragged into the Accessibility
-    /// list if it doesn't appear there automatically.
+    /// Reveals the bundle in Finder so it can be dragged into the Accessibility list.
     static func revealAppInFinder() {
         guard let appURL = Bundle.main.bundleURL as URL? else { return }
         NSWorkspace.shared.activateFileViewerSelecting([appURL])
@@ -73,7 +69,6 @@ class WindowPositionManager {
 
     // MARK: - Screen Recording Permission
 
-    /// Returns true if Screen Recording permission is granted.
     static func hasScreenRecordingPermission() -> Bool {
         let hasScreenRecordingPermissionNow = CGPreflightScreenCaptureAccess()
         if hasScreenRecordingPermissionNow {
@@ -82,10 +77,8 @@ class WindowPositionManager {
         return hasScreenRecordingPermissionNow
     }
 
-    /// True when the app should proceed with session launch without showing the permission
-    /// gate again. Falls back to the last known granted state on purpose:
-    /// `CGPreflightScreenCaptureAccess()` sometimes returns a false negative for an app the
-    /// user has already approved.
+    /// Falls back to the last known granted state on purpose: `CGPreflightScreenCaptureAccess()`
+    /// sometimes returns a false negative for an app the user has already approved.
     static func shouldTreatScreenRecordingPermissionAsGrantedForSessionLaunch() -> Bool {
         shouldTreatScreenRecordingPermissionAsGrantedForSessionLaunch(
             hasScreenRecordingPermissionNow: hasScreenRecordingPermission(),
@@ -104,8 +97,7 @@ class WindowPositionManager {
         UserDefaults.standard.removeObject(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
     }
 
-    /// Prompts the system dialog for Screen Recording permission, then opens System Settings
-    /// on later attempts so the prompt and the Settings pane never appear at the same time.
+    /// The prompt and the Settings pane never appear at the same time: prompt first, then Settings.
     @discardableResult
     static func requestScreenRecordingPermission() -> PermissionRequestPresentationDestination {
         let presentationDestination = permissionRequestPresentationDestination(
@@ -126,9 +118,18 @@ class WindowPositionManager {
         return presentationDestination
     }
 
-    /// Opens System Settings to the Screen Recording pane.
     static func openScreenRecordingSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - Microphone Permission
+
+    /// There is no request half beside it: a grant already refused has no alert left to show, so
+    /// the pane is the only way back, which is what the onboarding guide's last segment uses. The
+    /// prompt half is `promptForMicrophoneIfNotDetermined` on the manager.
+    static func openMicrophoneSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -149,13 +150,10 @@ class WindowPositionManager {
 
     // MARK: - Window Positioning
 
-    /// Pins the app's main window to the right edge of the screen holding `displayID`,
-    /// vertically centered.
+    /// Pins the main window to the right edge of the screen holding `displayID`, vertically centered.
     static func pinMainWindowToRight(onDisplayID displayID: CGDirectDisplayID?) {
         guard let mainWindow = NSApp.windows.first(where: { !($0 is NSPanel) }) else { return }
 
-        // The screen matching the selected display, else the one the window is already on,
-        // else the main screen.
         let targetScreen: NSScreen
         if let displayID,
            let matchingScreen = NSScreen.screens.first(where: { $0.displayID == displayID }) {
@@ -179,8 +177,7 @@ class WindowPositionManager {
 
     // MARK: - Shrink Overlapping Windows
 
-    /// Shrinks the frontmost (non-self) app's focused window when it overlaps our app window
-    /// on the screen named by `targetDisplayID`.
+    /// Shrinks the frontmost app's focused window when it overlaps ours, on `targetDisplayID`.
     static func shrinkOverlappingFocusedWindow(targetDisplayID: CGDirectDisplayID?) {
         guard hasAccessibilityPermission() else { return }
         guard let mainWindow = NSApp.windows.first(where: { !($0 is NSPanel) }) else { return }
@@ -215,8 +212,6 @@ class WindowPositionManager {
             return
         }
 
-        // The other window's frame in AX screen coordinates (top-left origin), checked against
-        // the target screen's bounds.
         let otherRight = otherPosition.x + otherSize.width
         let ourLeft = mainWindow.frame.origin.x
 
@@ -243,7 +238,6 @@ class WindowPositionManager {
 // MARK: - NSScreen Extension
 
 extension NSScreen {
-    /// The CGDirectDisplayID for this screen.
     var displayID: CGDirectDisplayID {
         let key = NSDeviceDescriptionKey("NSScreenNumber")
         return deviceDescription[key] as? CGDirectDisplayID ?? 0

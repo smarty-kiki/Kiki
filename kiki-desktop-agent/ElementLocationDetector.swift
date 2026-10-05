@@ -2,9 +2,6 @@
 //  ElementLocationDetector.swift
 //  kiki-desktop-agent
 //
-//  Uses Claude's Computer Use API to identify the screen location of UI elements in
-//  screenshots, so the buddy can animate to the element a user asks about and point at it.
-//
 
 import AppKit
 import Foundation
@@ -41,14 +38,8 @@ class ElementLocationDetector {
 
     /// Detects the screen location of a UI element the user is asking about.
     ///
-    /// - Parameters:
-    ///   - screenshotData: JPEG or PNG screenshot data from ScreenCaptureKit
-    ///   - userQuestion: The user's voice transcript (e.g., "How do I add a project?")
-    ///   - displayWidthInPoints: The captured display's width in screen points
-    ///   - displayHeightInPoints: The captured display's height in screen points
-    ///
-    /// - Returns: A `CGPoint` in display-local macOS coordinates (bottom-left origin) if an
-    ///   element was identified, or `nil` if no element was found or detection failed.
+    /// Returns a `CGPoint` in display-local macOS coordinates (bottom-left origin), or `nil` when no
+    /// element was found or detection failed.
     func detectElementLocation(
         screenshotData: Data,
         userQuestion: String,
@@ -104,7 +95,6 @@ class ElementLocationDetector {
 
     // MARK: - Private Helpers
 
-    /// Picks the recommended Computer Use resolution whose aspect ratio is closest to the display's.
     private func bestComputerUseResolution(
         forDisplayWidth displayWidth: Int,
         displayHeight: Int
@@ -127,8 +117,7 @@ class ElementLocationDetector {
         return (width: bestWidth, height: bestHeight)
     }
 
-    /// Calls the Claude Computer Use API with a resized screenshot and user question.
-    /// Returns the raw coordinate from Claude's response in the declared resolution space, or nil.
+    /// Returns the raw coordinate in the declared resolution space, or nil.
     private func callComputerUseAPI(
         resizedScreenshotData: Data,
         userQuestion: String,
@@ -213,9 +202,8 @@ class ElementLocationDetector {
         }
     }
 
-    /// Parses the Computer Use API response to extract click coordinates: Claude returns a `tool_use`
-    /// content block with `{"action": "left_click", "coordinate": [x, y]}`, or text when it found no
-    /// element, which returns nil.
+    /// Extracts the click coordinate from a `tool_use` content block
+    /// (`{"action": "left_click", "coordinate": [x, y]}`); text instead means no element was found.
     private func parseCoordinateFromResponse(data: Data) -> CGPoint? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let contentBlocks = json["content"] as? [[String: Any]] else {
@@ -244,9 +232,8 @@ class ElementLocationDetector {
 
     /// Resizes screenshot data to the specified Computer Use resolution.
     ///
-    /// Uses `NSBitmapImageRep` rather than `NSImage.lockFocus()`, which on a Retina display creates a
-    /// bitmap at 2× the declared size — a JPEG twice as large as the resolution declared to the
-    /// Computer Use tool, and coordinates reported in the wrong scale.
+    /// `NSBitmapImageRep` rather than `NSImage.lockFocus()`, which on a Retina display makes a bitmap
+    /// at 2× the declared size — a JPEG twice the declared resolution, coordinates in the wrong scale.
     private func resizeScreenshotForComputerUse(
         originalImageData: Data,
         targetWidth: Int,
@@ -291,7 +278,7 @@ class ElementLocationDetector {
         return jpegData
     }
 
-    /// Detects MIME type by inspecting the first bytes of image data.
+    /// The MIME type, read off the first bytes.
     private func detectImageMediaType(for imageData: Data) -> String {
         if imageData.count >= 4 {
             let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47]

@@ -10,7 +10,6 @@ import AppKit
 // MARK: - Design System Namespace
 
 /// The top-level namespace for all design system tokens.
-/// Usage: `DS.Colors.background`, `DS.Colors.accent`, etc.
 enum DS {
 
     // MARK: - Color Tokens
@@ -18,55 +17,49 @@ enum DS {
     enum Colors {
 
         // ── Backgrounds ──────────────────────────────────────────────
-        // Layered surfaces from the panel's plate up to its cards.
-        // The plate is the grey one and the cards are white, so a card reads as raised; hover
-        // and pressed states step darker rather than lighter, which is the direction that reads
-        // as "under the finger" on a light surface.
+        // Hover and pressed step darker, never lighter — the direction that reads as "under the
+        // finger" on a light surface.
 
-        /// The panel's own plate — everything else sits on it.
+        /// The panel's plate — everything else sits on it.
         static let background = Color(hex: "#F1F1F5")
 
-        /// First elevation layer — used for cards and raised rows.
+        /// Cards and raised rows.
         static let surface1 = Color(hex: "#FFFFFF")
 
-        /// Second elevation layer — used for fills that should read as recessed rather than
-        /// raised, such as input fields.
+        /// Recessed fills, such as input fields.
         static let surface2 = Color(hex: "#F7F7FA")
 
-        /// Third elevation layer — used for hover backgrounds on interactive elements.
+        /// Hover backgrounds on interactive elements.
         static let surface3 = Color(hex: "#E9E9EF")
 
-        /// Fourth elevation layer — used for active/pressed states on interactive elements.
+        /// Active/pressed states on interactive elements.
         static let surface4 = Color(hex: "#DFDFE7")
 
         // ── Borders ──────────────────────────────────────────────────
 
-        /// Subtle border — used for card outlines, dividers, input field borders.
+        /// Card outlines, dividers, input field borders.
         static let borderSubtle = Color(hex: "#D9D9E1")
 
-        /// Strong border — used for focused inputs, hovered card outlines.
+        /// Focused inputs, hovered card outlines.
         static let borderStrong = Color(hex: "#B9B9C5")
 
         // ── Text ─────────────────────────────────────────────────────
 
-        /// Primary text — main body text, titles, headings.
+        /// Body text, titles, headings.
         static let textPrimary = Color(hex: "#1B1B1F")
 
-        /// Secondary text — descriptions, hints, muted labels.
+        /// Descriptions, hints, muted labels.
         static let textSecondary = Color(hex: "#55555E")
 
-        /// Tertiary text — very muted, used for section labels, timestamps, disabled text.
+        /// Section labels, timestamps, disabled text.
         static let textTertiary = Color(hex: "#7E7E88")
 
-        /// Text used on top of the accent fill (#8F46EB purple), like the primary button label.
-        /// White on #8f46eb achieves ~5.0:1 contrast — WCAG AA compliant.
-        /// White on #7b34d9 hover achieves ~6.3:1 — also WCAG AA compliant.
+        /// On top of the accent fill, like the primary button's label.
         static let textOnAccent: Color = .white
 
         // ── Purple Scale ────────────────────────────────────────────
-        // The app's purple ramp, built around the purple the cursor already wears (#bd79ff).
-        // 50–200 for tinted backgrounds and disabled states, 300–400 for the cursor and the
-        // lighter accents, 500–700 for fills and accent text, 800–950 for deep surfaces.
+        // Built around the purple the cursor already wears (#bd79ff). 50–200 tinted backgrounds,
+        // 300–400 cursor and lighter accents, 500–700 fills and accent text, 800–950 deep surfaces.
 
         static let purple50  = Color(hex: "#f8f4ff")
         static let purple100 = Color(hex: "#f1e7ff")
@@ -81,73 +74,64 @@ enum DS {
         static let purple950 = Color(hex: "#3c1870")
 
         // ── Accent (derived from the purple scale) ──────────────────
-        // The primary fill is Purple 700 — the purple the floating button already wore; hover
-        // darkens to Purple 800.
 
-        /// Accent fill — used for solid button backgrounds.
-        /// #8f46eb → ~5.0:1 contrast with white text (WCAG AA).
+        /// Accent fill — solid button backgrounds. #8f46eb on white text is ~5.0:1 (WCAG AA).
         static let accent = purple700
 
-        /// Accent hover — slightly darker purple for hover state.
-        /// #7b34d9 → ~6.3:1 contrast with white text (WCAG AA+).
+        /// Accent hover — #7b34d9 on white text is ~6.3:1 (WCAG AA+).
         static let accentHover = purple800
 
-        /// Accent text — purple used for accent-colored text, icons and status dots
-        /// on light backgrounds (links, active rows, highlighted labels).
+        /// Accent-colored text, icons and status dots on light backgrounds.
         static let accentText = purple600
 
-        /// Very subtle accent tint — used for selected item backgrounds (e.g. the card holding
-        /// the task in progress). Low opacity so it doesn't overpower.
+        /// Selected backgrounds, such as the card holding the task in progress.
         static let accentSubtle = purple500.opacity(0.10)
 
         // ── Semantic Colors ──────────────────────────────────────────
 
-        /// Destructive/error actions — delete buttons, error messages, close button hover.
+        /// Destructive/error actions — delete buttons, error messages.
         static let destructive = Color(hex: "#D93A3F")
 
         /// Destructive hover state.
         static let destructiveHover = Color(hex: "#C02F34")
 
-        /// Destructive used for text (darker than the fill for readability on light backgrounds).
+        /// Destructive for text — darker than the fill, for contrast on light backgrounds.
         static let destructiveText = Color(hex: "#C2262B")
 
-        /// Success — checkmarks, granted status, completion indicators.
-        /// Independent green so success states are visually distinct from the purple accent.
+        /// Success — checkmarks, granted status, completion indicators; a green of its own, never the
+        /// accent.
         static let success = Color(hex: "#0A7452")
 
-        /// Warning — caution messages, manual verification failure explanations.
+        /// Warning — caution messages, failed-verification explanations.
         static let warning = Color(hex: "#9C5D00")
 
-        /// Warning text — darker variant for text on light backgrounds.
+        /// Warning for text — darker, for light backgrounds.
         static let warningText = Color(hex: "#8A5200")
 
-        /// Info/feature highlight — used for prompt card headers, code highlights.
-        /// A blue rather than the purple, so informational elements stay distinct
-        /// from interactive accent-colored elements.
+        /// Info/feature highlight — prompt card headers, code highlights; a blue rather than the
+        /// purple, so informational elements stay distinct from accent-colored ones.
         static let info = Color(hex: "#1D6FD0")
 
-        /// Inline code text color — deep purple for monospace code snippets.
+        /// Monospace code snippets.
         static let codeText = Color(hex: "#7C3AED")
 
         // ── Overlay Cursor ───────────────────────────────────────────
 
-        /// The cursor/bubble color used in OverlayWindow — the triangle, the waveform bars,
-        /// the spinner's arc and the bubble fills. The accent is drawn from the same purple,
-        /// but this stays a token of its own: it is the screen overlay's colour, and it is
-        /// what the app icon draws.
+        /// The cursor/bubble color used in OverlayWindow — the triangle, the waveform bars, the
+        /// spinner's arc and the bubble fills. A token of its own: it is the screen overlay's colour,
+        /// and what the app icon draws.
         static let overlayCursorPurple = Color(hex: "#BD79FF")
 
         /// The color the cursor turns while it is carrying the user's mouse to a click.
         ///
-        /// Not decoration and not an error colour: it is the whole of how the user is told
-        /// that the pointer in their hand is Kiki's for the moment. One colour, one meaning,
-        /// which is why the bubble fills below deliberately avoid it.
+        /// Not decoration and not an error colour: it is the whole of how the user is told the
+        /// pointer in their hand is Kiki's. One colour, one meaning, which is why the bubble fills
+        /// below avoid it.
         static let overlayCursorClickRed = Color(hex: "#FF878D")
 
         // ── Overlay Response Bubble ──────────────────────────────────
-        // The bubble that follows the cursor stays dark while the panel goes light: it is read
-        // over whatever happens to be on screen rather than on the panel's plate, and dark is
-        // the fill that holds up over a white window and a black terminal alike.
+        // The bubble stays dark while the panel goes light: it is read over whatever is on screen,
+        // not on the panel's plate, and dark holds up over both a white window and a black terminal.
 
         /// The bubble's fill.
         static let responseBubbleBackground = Color(hex: "#171918")
@@ -160,32 +144,25 @@ enum DS {
 
         // ── Floating Button Gradient ─────────────────────────────────
 
-        /// The floating session button gradient colors (unchanged from original —
-        /// this gradient is intentionally distinct from the rest of the palette
-        /// to make the floating button stand out as a "jewel" on the desktop).
+        /// Outside the palette, so the floating button reads as a jewel on the desktop.
         static let floatingGradientPurple = Color(hex: "#8F46EB")
         static let floatingGradientPink = Color(hex: "#E84D9E")
         static let floatingGradientOrange = Color(hex: "#FF8C33")
 
         // ── Help Chat ──────────────────────────────────────────────
 
-        /// User message bubble background in the help chat.
-        /// Purple 900 — deep purple that's clearly distinct from the surface behind it
-        /// while keeping white text highly readable.
+        /// User bubble in the help chat. Purple 900 — deep enough for white text.
         static let helpChatUserBubble = purple900
 
-        /// Slightly lighter variant for hover/pressed states on user bubbles.
+        /// Hover/pressed variant of the user bubble.
         static let helpChatUserBubbleHover = purple800
 
-        /// Footer/backdrop behind the floating help chat.
-        /// A step greyer than the panel's plate so the chat zone reads as a distinct
-        /// docked surface even before the pill input is visible.
+        /// Footer behind the floating help chat — a step greyer than the panel's plate, so the chat
+        /// zone reads as a docked surface.
         static let helpChatBackdrop = Color(hex: "#E9E9EF")
 
         // ── Disabled State ───────────────────────────────────────────
-        // Following Material Design 3's disabled pattern:
-        // Container: onSurface at 12% opacity
-        // Content: onSurface at 38% opacity
+        // Material Design 3's disabled pattern: container at 12% onSurface, content at 38%.
 
         /// Disabled button/container background.
         static var disabledBackground: Color {
@@ -228,51 +205,44 @@ enum DS {
     // MARK: - Animation Durations
 
     enum Animation {
-        /// Quick state changes — hover in/out, press feedback.
+        /// Hover in/out, press feedback.
         static let fast: Double = 0.15
-        /// Standard transitions — content reveal, button state changes.
+        /// Content reveal, button state changes.
         static let normal: Double = 0.25
-        /// Slower, more dramatic — fade-ins, celebration screen elements.
+        /// Fade-ins, celebration screen elements.
         static let slow: Double = 0.4
     }
 
     // MARK: - State Layer Opacities
-    // Based on Material Design 3's state layer system.
-    // A "state layer" overlays the button's content color at these opacities.
+    // Material Design 3's state-layer system: the button's content color, overlaid at these opacities.
 
     enum StateLayer {
-        /// Hover: subtle highlight to indicate interactivity.
+        /// Hover — indicates interactivity.
         static let hover: Double = 0.08
-        /// Focus: keyboard navigation indicator (slightly stronger than hover).
+        /// Focus — keyboard navigation; slightly stronger than hover.
         static let focus: Double = 0.12
-        /// Pressed: active press feedback (same strength as focus).
+        /// Pressed — same strength as focus.
         static let pressed: Double = 0.12
-        /// Dragged: strongest overlay (rarely used).
+        /// Dragged — strongest.
         static let dragged: Double = 0.16
     }
 }
 
 // MARK: - Button Styles
 
-/// Primary button — the main call-to-action per screen.
-/// Accent-colored background with white text. One per view maximum.
-/// Used for: "start"/"resume", "let's go", "continue", "verify completion".
+/// Primary button — the main call-to-action per screen: accent fill, white text, one per view.
 struct DSPrimaryButtonStyle: ButtonStyle {
     var isFullWidth: Bool = true
 
     @State private var isHovered = false
 
-    // Separate state for the scale expansion so it animates on a slower,
-    // more gradual timeline (0.6s) than the background color snap (0.15s).
+    // Kept separate so the scale animates on a slower timeline (0.6s) than the background snap.
     @State private var isHoverScaleExpanded = false
 
-    // Whether the hover glow shadow is active. Builds up gradually (0.6s)
-    // on hover entry, fades out faster (0.3s) on exit.
+    // Builds up gradually (0.6s) on hover entry, fades out faster (0.3s) on exit.
     @State private var isHoverGlowActive = false
 
-    // Continuously toggles while hovered to drive a gentle breathing pulse
-    // in the glow shadow. Creates a living, organic feel — like the button
-    // is softly glowing, not just statically lit.
+    // Toggles while hovered to drive a breathing pulse in the glow shadow.
     @State private var isGlowBreathingIn = false
 
     func makeBody(configuration: Configuration) -> some View {
@@ -286,36 +256,29 @@ struct DSPrimaryButtonStyle: ButtonStyle {
                 Capsule()
                     .fill(buttonBackgroundColor(isPressed: configuration.isPressed))
             )
-            // Hover glow — builds up gradually, then gently breathes while hovered.
-            // The breathing oscillates opacity and radius on a slow 2.5s loop,
-            // creating a candle-flame-like "alive" quality rather than a static highlight.
+            // The breathing oscillates opacity and radius on a slow 2.5s loop.
             .shadow(
                 color: DS.Colors.accent.opacity(
                     isHoverGlowActive ? (isGlowBreathingIn ? 0.32 : 0.18) : 0
                 ),
                 radius: isHoverGlowActive ? (isGlowBreathingIn ? 16 : 10) : 0
             )
-            // Hover: gradually expand to 1.03. Press: snap down to 0.97.
             .scaleEffect(configuration.isPressed ? 0.97 : (isHoverScaleExpanded ? 1.03 : 1.0))
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
             .onHover { hovering in
-                // Background color — fast snap so the button feels responsive
+                // Fast snap, so the colour change feels responsive.
                 withAnimation(.easeOut(duration: 0.15)) {
                     isHovered = hovering
                 }
 
-                // Scale — slow, gradual expansion (like the button is swelling)
                 withAnimation(.easeInOut(duration: hovering ? 0.6 : 0.3)) {
                     isHoverScaleExpanded = hovering
                 }
 
-                // Glow — builds up gradually on entry, fades faster on exit
                 withAnimation(.easeInOut(duration: hovering ? 0.6 : 0.3)) {
                     isHoverGlowActive = hovering
                 }
 
-                // Breathing glow loop — gentle pulse while hovered.
-                // The 2.5s cycle keeps it feeling organic, not mechanical.
                 if hovering {
                     withAnimation(
                         .easeInOut(duration: 2.5)
@@ -324,7 +287,7 @@ struct DSPrimaryButtonStyle: ButtonStyle {
                         isGlowBreathingIn = true
                     }
                 } else {
-                    // Override the repeating animation with a finite one to stop cleanly
+                    // A finite animation overrides the repeating one, so it stops cleanly.
                     withAnimation(.easeOut(duration: 0.3)) {
                         isGlowBreathingIn = false
                     }
@@ -336,7 +299,6 @@ struct DSPrimaryButtonStyle: ButtonStyle {
 
     private func buttonBackgroundColor(isPressed: Bool) -> Color {
         if isPressed {
-            // Pressed: brighten slightly beyond hover
             return DS.Colors.accentHover.blendedWithWhite(fraction: DS.StateLayer.pressed)
         } else if isHovered {
             return DS.Colors.accentHover
@@ -346,9 +308,7 @@ struct DSPrimaryButtonStyle: ButtonStyle {
     }
 }
 
-/// Secondary button — supporting actions, less visual weight than primary.
-/// Surface-colored background with primary text. Used for: action buttons
-/// (download, open link), embedded element buttons.
+/// Secondary button — supporting actions: surface fill, primary text.
 struct DSSecondaryButtonStyle: ButtonStyle {
     var isFullWidth: Bool = true
 
@@ -385,9 +345,7 @@ struct DSSecondaryButtonStyle: ButtonStyle {
     }
 }
 
-/// Tertiary/ghost button — low-emphasis actions with subtle hover background.
-/// Transparent at rest, shows surface fill on hover. Used for: navigation
-/// links, sidebar items, medium-low emphasis actions.
+/// Tertiary/ghost button — transparent at rest, surface fill on hover.
 struct DSTertiaryButtonStyle: ButtonStyle {
     @State private var isHovered = false
 
@@ -427,8 +385,7 @@ struct DSTertiaryButtonStyle: ButtonStyle {
     }
 }
 
-/// Text button — the lowest-emphasis style: no background in any state, not even hover, and
-/// only the text color changes. For "restart", "skip", "cancel" and similar inline actions.
+/// Text button — no background in any state, not even hover; only the text colour changes.
 struct DSTextButtonStyle: ButtonStyle {
     var fontSize: CGFloat = 14
 
@@ -453,8 +410,7 @@ struct DSTextButtonStyle: ButtonStyle {
     }
 }
 
-/// Outlined button — medium emphasis, used where a border helps define
-/// the button's bounds. Used for: display selector, copy prompt.
+/// Outlined button — medium emphasis, where a border helps define the button's bounds.
 struct DSOutlinedButtonStyle: ButtonStyle {
     var isFullWidth: Bool = true
 
@@ -506,8 +462,7 @@ struct DSOutlinedButtonStyle: ButtonStyle {
     }
 }
 
-/// Destructive button — for dangerous/irreversible actions (close session, delete).
-/// Red-tinted background that intensifies on hover and press.
+/// Destructive button — dangerous/irreversible actions: red-tinted, intensifying on hover and press.
 struct DSDestructiveButtonStyle: ButtonStyle {
     @State private var isHovered = false
 
@@ -560,15 +515,14 @@ struct DSDestructiveButtonStyle: ButtonStyle {
     }
 }
 
-/// Icon-only button — compact circular button for utility actions.
-/// Used for: close button (x), send message, small toolbar actions.
+/// Icon-only button — compact circle for utility actions.
 struct DSIconButtonStyle: ButtonStyle {
     var size: CGFloat = 28
     var isDestructiveOnHover: Bool = false
     var tooltipText: String? = nil
 
-    /// Horizontal alignment of the tooltip relative to the button: `.leading` for buttons near
-    /// the left edge (tooltip extends right), `.trailing` near the right edge, else `.center`.
+    /// Where the tooltip sits horizontally: `.leading` near a window's left edge, `.trailing` near
+    /// its right, else `.center`.
     var tooltipAlignment: Alignment = .center
 
     @State private var isHovered = false
@@ -592,13 +546,12 @@ struct DSIconButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: DS.Animation.fast), value: configuration.isPressed)
             .animation(.easeOut(duration: DS.Animation.fast), value: isHovered)
             .contentShape(Circle())
-            // Cursor change via AppKit cursor rects — more reliable than NSCursor.push/pop
-            // because cursor rects are managed at the window level and don't conflict
-            // with SwiftUI's internal cursor handling.
+            // Cursor rects, not NSCursor.push/pop: window-managed, so no conflict with SwiftUI's
+            // own cursor handling.
             .overlay(PointerCursorView())
             .onHover { hovering in
                 isHovered = hovering
-                // Show the tooltip after a delay (like native tooltips), hide immediately
+                // Show after a delay, like a native tooltip; hide immediately.
                 tooltipShowWorkItem?.cancel()
                 if hovering {
                     let workItem = DispatchWorkItem {
@@ -614,9 +567,8 @@ struct DSIconButtonStyle: ButtonStyle {
                     }
                 }
             }
-            // Positioned above the button so it does not overlap it, aligned by
-            // tooltipAlignment so it cannot clip at a window edge, and hit testing off so it
-            // never interferes with the button's own hover state.
+            // Above the button so it does not overlap, aligned by tooltipAlignment so it cannot clip
+            // at a window edge, hit testing off so it never disturbs hover.
             .overlay(
                 Group {
                     if isTooltipVisible, let text = tooltipText, !text.isEmpty {
@@ -708,45 +660,35 @@ struct DSIconButtonStyle: ButtonStyle {
 // MARK: - Convenience View Extensions
 
 extension View {
-    /// Applies the primary button style (accent-colored CTA).
     func dsPrimaryButtonStyle(isFullWidth: Bool = true) -> some View {
         self.buttonStyle(DSPrimaryButtonStyle(isFullWidth: isFullWidth))
     }
 
-    /// Applies the secondary button style (surface-colored supporting action).
     func dsSecondaryButtonStyle(isFullWidth: Bool = true) -> some View {
         self.buttonStyle(DSSecondaryButtonStyle(isFullWidth: isFullWidth))
     }
 
-    /// Applies the tertiary/ghost button style (subtle hover background).
     func dsTertiaryButtonStyle() -> some View {
         self.buttonStyle(DSTertiaryButtonStyle())
     }
 
-    /// Applies the text-only button style (no background ever, just color change).
     func dsTextButtonStyle(fontSize: CGFloat = 14) -> some View {
         self.buttonStyle(DSTextButtonStyle(fontSize: fontSize))
     }
 
-    /// Applies the outlined button style (bordered, medium emphasis).
     func dsOutlinedButtonStyle(isFullWidth: Bool = true) -> some View {
         self.buttonStyle(DSOutlinedButtonStyle(isFullWidth: isFullWidth))
     }
 
-    /// Applies the destructive button style (red-tinted danger action).
     func dsDestructiveButtonStyle() -> some View {
         self.buttonStyle(DSDestructiveButtonStyle())
     }
 
-    /// Applies the icon-only button style (compact circle).
-    /// `tooltipAlignment` controls where the tooltip sits horizontally relative to the button:
-    /// `.leading` for left-edge buttons, `.trailing` for right-edge buttons, `.center` for middle.
     func dsIconButtonStyle(size: CGFloat = 28, isDestructiveOnHover: Bool = false, tooltip: String? = nil, tooltipAlignment: Alignment = .center) -> some View {
         self.buttonStyle(DSIconButtonStyle(size: size, isDestructiveOnHover: isDestructiveOnHover, tooltipText: tooltip, tooltipAlignment: tooltipAlignment))
     }
 
-    /// Attaches the shared pointing-hand cursor treatment used across interactive controls.
-    /// Disabled controls can opt out so they keep the default arrow cursor.
+    /// The shared pointing-hand cursor; disabled controls keep the arrow.
     func pointerCursor(isEnabled: Bool = true) -> some View {
         self.overlay {
             if isEnabled {
@@ -766,9 +708,8 @@ enum BuddyComposerVisualStyle {
 
 // MARK: - Pointer Cursor (AppKit Bridge)
 
-/// Uses AppKit's cursor rect system for a pointing hand. More reliable than
-/// NSCursor.push()/pop() in .onHover, because cursor rects are managed at the window level
-/// and so never conflict with SwiftUI's own cursor handling.
+/// AppKit's cursor rect system for a pointing hand. More reliable than NSCursor.push()/pop() in
+/// .onHover: cursor rects are managed at the window level and never conflict with SwiftUI.
 private class PointerCursorNSView: NSView {
     override func resetCursorRects() {
         super.resetCursorRects()
@@ -786,26 +727,25 @@ private struct PointerCursorView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        // Invalidate cursor rects when the view updates (e.g., resizes)
-        // so AppKit recalculates the cursor area.
+        // Invalidate cursor rects so AppKit recalculates them after a resize.
         nsView.window?.invalidateCursorRects(for: nsView)
     }
 }
 
 // MARK: - I-Beam Cursor (AppKit Bridge)
 
-/// The same AppKit cursor-rect approach as PointerCursorView, for an I-beam. Unlike
-/// NSCursor.push()/pop() in .onHover it cannot leave the cursor stack unbalanced when the
-/// mouse moves quickly between views.
+/// The same cursor-rect approach as PointerCursorView, for an I-beam. Unlike NSCursor.push()/pop()
+/// in .onHover, it cannot leave the cursor stack unbalanced when the mouse moves quickly between
+/// views.
 private class IBeamCursorNSView: NSView {
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: .iBeam)
     }
 
-    /// Pass through all mouse events so the TextField underneath still receives
-    /// focus, clicks, and text selection. Cursor rects are registered with the
-    /// window (via resetCursorRects) and work independently of hit testing.
+    /// Passes mouse events through so the TextField underneath still receives focus, clicks and
+    /// selection; the cursor rects are registered with the window and work independently of hit
+    /// testing.
     override func hitTest(_ point: NSPoint) -> NSView? {
         return nil
     }
@@ -817,17 +757,15 @@ struct IBeamCursorView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        // Invalidate cursor rects when the view updates (e.g., resizes)
-        // so AppKit recalculates the cursor area.
+        // Invalidate cursor rects so AppKit recalculates them after a resize.
         nsView.window?.invalidateCursorRects(for: nsView)
     }
 }
 
 // MARK: - Native Tooltip
 
-/// Uses AppKit's `NSView.toolTip` to show a tooltip on hover.
-/// SwiftUI's `.help()` conflicts with `.onHover` tracking areas, so
-/// this bridges directly to AppKit's tooltip system which works independently.
+/// Bridges to AppKit's `NSView.toolTip`, because SwiftUI's `.help()` conflicts with `.onHover`
+/// tracking areas.
 private struct NativeTooltipView: NSViewRepresentable {
     let tooltip: String
 
@@ -843,7 +781,6 @@ private struct NativeTooltipView: NSViewRepresentable {
 }
 
 extension View {
-    /// Attaches a native macOS tooltip that works even alongside `.onHover`.
     func nativeTooltip(_ text: String?) -> some View {
         if let text = text, !text.isEmpty {
             return AnyView(self.overlay(NativeTooltipView(tooltip: text)))
@@ -856,7 +793,7 @@ extension View {
 // MARK: - Color Utilities
 
 extension Color {
-    /// Create a Color from a hex string like "#FF5733" or "FF5733".
+    /// From a hex string like "#FF5733" or "FF5733".
     init(hex: String) {
         let hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "#", with: "")
@@ -871,10 +808,8 @@ extension Color {
         self.init(red: red, green: green, blue: blue)
     }
 
-    /// Returns a lighter version of this color by blending toward white.
-    /// `fraction` is 0.0 (no change) to 1.0 (pure white).
+    /// This color blended toward white; `fraction` runs 0.0 (unchanged) to 1.0 (white).
     func blendedWithWhite(fraction: Double) -> Color {
-        // Convert to NSColor to access RGB components for blending
         guard let nsColor = NSColor(self).usingColorSpace(.sRGB) else { return self }
 
         let red = nsColor.redComponent + (1.0 - nsColor.redComponent) * fraction

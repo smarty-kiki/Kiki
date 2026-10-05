@@ -100,20 +100,19 @@ private let calibrationUserPrompt = """
 
 // MARK: - Realistic-UI calibration
 
-/// The grid test above measures something narrower than it looks. It tells the
-/// model where a tile *is* — "中心在这张图里的像素坐标" — and asks it to read that
-/// point back, which it does almost perfectly. Real pointing never works that
-/// way: the model has to recognize an element on its own and decide, with no
-/// instruction, which point of it to report. On a 240-pixel-wide search field,
-/// "the center" and "the left edge where the magnifier sits" are 120 pixels
-/// apart, and nothing in the app's prompt says which one it wants.
+/// The grid test above measures something narrower than it looks: it tells the
+/// model where a tile *is* and asks it to read that point back, which it does
+/// almost perfectly. Real pointing never works that way — the model has to
+/// recognize an element on its own and decide, with no instruction, which point
+/// of it to report, and on a 240-pixel-wide search field "the center" and "the
+/// left edge where the magnifier sits" are 120 pixels apart.
 ///
 /// That difference is invisible to the grid test by construction, so this mode
 /// closes it: a mock macOS screen with four named widgets at known rectangles,
 /// asked about one widget at a time in the plain language a user would use. Each
-/// answer is then compared against the widget's center, its bounds, and its
-/// corners, which is what separates "the model points at elements accurately"
-/// from "the model points at a consistent corner of them".
+/// answer is then compared against the widget's center, its bounds and its
+/// corners, which separates "the model points at elements accurately" from "the
+/// model points at a consistent corner of them".
 private enum MockUILayout {
     static let menuBarHeight: CGFloat = 24
     static let windowRect = CGRect(x: 160, y: 60, width: 960, height: 680)
@@ -172,13 +171,12 @@ private func makeRealisticUIElements() -> [RealisticUIElement] {
 /// and converted to the bottom-left origin this context draws in by
 /// `bottomLeftY(forTopLeftY:)` at the moment of drawing. That conversion is the
 /// harness's one chance to be wrong in a way that would make every number it
-/// prints meaningless, so it lives in one place rather than being folded into
-/// each `NSRect`.
+/// prints meaningless, so it lives in one place rather than in each `NSRect`.
 ///
-/// The context is deliberately left unflipped. A flipped `NSGraphicsContext`
-/// draws AppKit text mirrored — the tiles land in the right places but every
-/// letter comes out upside down, which the model would then read as a different
-/// letter and the run would silently be garbage.
+/// The context is deliberately left unflipped: a flipped `NSGraphicsContext`
+/// draws AppKit text mirrored, so the tiles would land in the right places with
+/// every letter upside down, which the model would read as a different letter
+/// and the run would silently be garbage.
 private func renderCalibrationScreenshot(
     imageWidthInPixels: Int,
     imageHeightInPixels: Int,
@@ -206,10 +204,9 @@ private func renderCalibrationScreenshot(
 
     let imageBounds = NSRect(x: 0, y: 0, width: imageWidthInPixels, height: imageHeightInPixels)
 
-    // A plain desktop with a menu bar strip across the top. The tiles alone would
-    // calibrate just as well, but a blank page does not look like a screenshot,
-    // and the point is to measure the model's reading of a screen — not of a
-    // diagram it might approach differently.
+    // A plain desktop with a menu bar strip across the top: the tiles alone would
+    // calibrate just as well, but the point is to measure the model's reading of
+    // a screen, not of a diagram it might approach differently.
     NSColor(white: 0.93, alpha: 1).setFill()
     imageBounds.fill()
     NSColor(white: 0.85, alpha: 1).setFill()
@@ -242,8 +239,8 @@ private func renderCalibrationScreenshot(
 }
 
 private func encodeAsJPEG(_ cgImage: CGImage) -> Data? {
-    // Same encoding the app uses for its captures, so the model is looking at an
-    // image that has been through the same compression.
+    // Same encoding the app uses for its captures, so the model sees an image
+    // that has been through the same compression.
     NSBitmapImageRep(cgImage: cgImage)
         .representation(using: .jpeg, properties: [.compressionFactor: 0.8])
 }
@@ -253,11 +250,7 @@ private func encodeAsJPEG(_ cgImage: CGImage) -> Data? {
 ///
 /// Every widget is drawn from `MockUILayout`, which the element list also quotes,
 /// so a widget cannot end up somewhere other than where the results table says it
-/// is. The layout is in the model's own coordinate space — top-left origin — and
-/// converted at the moment of drawing by `convert`, for the same reason the grid
-/// renderer keeps one `bottomLeftY(forTopLeftY:)` rather than folding the flip
-/// into each rectangle. The context is deliberately unflipped: a flipped one
-/// draws AppKit text mirrored, which the model would read as different words.
+/// is. The flip and the unflipped context are the same as the grid renderer's.
 private func renderRealisticUIScreenshot(
     imageWidthInPixels: Int,
     imageHeightInPixels: Int
@@ -462,8 +455,7 @@ enum CalibrationError: LocalizedError {
 ///
 /// The one deliberate difference is `stream: false`: the app streams so it can
 /// start speaking before the reply is finished, which a calibration run has no
-/// use for, and a single JSON body is less to go wrong here. It does not change
-/// what the model answers.
+/// use for. It does not change what the model answers.
 private func requestPointingCoordinates(
     imageData: Data,
     imageLabel: String,
@@ -529,9 +521,9 @@ private func requestPointingCoordinates(
 ///
 /// The pattern is the app's own, including the case-insensitive tag name, so a
 /// tag this script can read is a tag the app can read. The label is allowed to
-/// hold an ASCII colon for the reason the app's copy gives: the model is asked to
-/// copy an element's on-screen text verbatim, and a timestamp in it is enough to
-/// make the tag unmatchable if the label stops at the colon.
+/// hold an ASCII colon for the reason the app's copy gives: the model copies an
+/// element's on-screen text verbatim, and a timestamp in it makes the tag
+/// unmatchable if the label stops at the colon.
 private func parsePointingTags(from responseText: String) -> [(coordinate: CGPoint, label: String?)] {
     let pattern = #"\[(?i:POINT|CLICK):(?:none|(\d+)\s*,\s*(\d+)(?::([^\]\s][^\]]*?))?(?::screen(\d+))?)\]"#
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
